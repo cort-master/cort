@@ -37,6 +37,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 -- CORT params
 
-INSERT INTO cort_applications VALUES('DEFAULT', '.*', 'DEFAULT');
+BEGIN
+  INSERT INTO cort_applications VALUES('DEFAULT', '.*', 'DEFAULT');
+EXCEPTION
+  WHEN DUP_VAL_ON_INDEX THEN
+    NULL;  
+END;
+/  
 
 COMMIT;

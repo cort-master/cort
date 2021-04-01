@@ -725,6 +725,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END;  
     RETURN l_rec;
   END get_build_rec;
+  
+  -- wrapper returns 'TRUE'/'FALSE' 
+  FUNCTION is_session_alive(in_session_id IN VARCHAR2)
+  RETURN VARCHAR2 --  
+  AS
+  BEGIN
+    RETURN CASE WHEN dbms_session.is_session_alive(in_session_id) THEN 'TRUE' ELSE 'FALSE' END; 
+  END is_session_alive; 
 
   -- Adds new record into CORT_BUILDS table
   FUNCTION create_build(in_application IN VARCHAR2)
@@ -737,12 +745,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
        SET status = 'STALE',
            end_time = SYSDATE
      WHERE status = 'RUNNING'
-       AND NOT EXISTS(SELECT 1
-                        FROM gv$session v
-                       WHERE v.sid = TO_NUMBER(SUBSTR(b.session_id, 1, 4),'XXXX')
-                         AND v.serial# = TO_NUMBER(SUBSTR(b.session_id, 5, 4),'XXXX')
-                         AND v.inst_id = TO_NUMBER(SUBSTR(b.session_id, 9, 4),'XXXX')
-                     );
+       AND cort_aux_pkg.is_session_alive(b.session_id) = 'FALSE';
 
     l_rec.build := gen_build_id;
     l_rec.application := in_application;

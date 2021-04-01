@@ -769,6 +769,64 @@ END;';
     );
   END create_error_table;
 
+  FUNCTION get_cort_ddl(
+    in_table_name          IN VARCHAR2, 
+    in_table_owner         IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
+    in_all_partitions      IN BOOLEAN DEFAULT TRUE,
+    in_segment_attributes  IN BOOLEAN DEFAULT FALSE,
+    in_storage             IN BOOLEAN DEFAULT FALSE,
+    in_tablespace          IN BOOLEAN DEFAULT FALSE,
+    in_size_byte_keyword   IN BOOLEAN DEFAULT FALSE
+  )
+  RETURN CLOB
+  AS
+    l_result CLOB;
+    l_xml    XMLType;
+    l_sxml   CLOB;
+    h        number;
+    tr       number;
+    ku$      sys.ku$_SubmitResults;
+  BEGIN
+    dbms_metadata.set_transform_param(dbms_metadata.session_transform,'DEFAULT', true);
+    dbms_metadata.set_transform_param(dbms_metadata.session_transform,'SEGMENT_ATTRIBUTES',in_segment_attributes);
+    dbms_metadata.set_transform_param(dbms_metadata.session_transform,'STORAGE',in_storage);
+    dbms_metadata.set_transform_param(dbms_metadata.session_transform,'TABLESPACE',in_tablespace);
+    dbms_metadata.set_transform_param(dbms_metadata.session_transform,'SIZE_BYTE_KEYWORD',in_size_byte_keyword);
+    
+    IF in_all_partitions THEN
+      l_result := dbms_metadata.get_ddl(
+                    object_type => 'TABLE',
+                    name        => in_table_name,
+                    schema      => in_table_owner
+                  );
+    ELSE
+      l_xml := xmlType(dbms_metadata.get_xml(
+                      object_type => 'TABLE',
+                      name        => in_table_name,
+                      schema      => in_table_owner
+                    ));
+      SELECT UPDATEXML(
+                 l_xml, 
+                 '//PART_LIST', XMLType('<PART_LIST>'||extract(l_xml, '//PART_LIST/PART_LIST_ITEM[1]').getClobVal()||'</PART_LIST>'),
+                 '//COMPART_LIST', XMLType('<COMPART_LIST>'||extract(l_xml, '//COMPART_LIST/COMPART_LIST_ITEM[1]').getClobVal()||'</COMPART_LIST>')
+               ) 
+        INTO l_xml 
+        FROM dual;
+      dbms_lob.createtemporary(l_result, TRUE);
+      h := dbms_metadata.openw('TABLE');
+      tr := dbms_metadata.add_transform(h, 'DDL');
+      dbms_metadata.set_transform_param(tr,'DEFAULT',true);
+      dbms_metadata.set_transform_param(tr,'SEGMENT_ATTRIBUTES',in_segment_attributes);
+      dbms_metadata.set_transform_param(tr,'STORAGE',in_storage);
+      dbms_metadata.set_transform_param(tr,'TABLESPACE',in_tablespace);
+      dbms_metadata.set_transform_param(tr,'SIZE_BYTE_KEYWORD',in_size_byte_keyword);
+      dbms_metadata.convert(h, l_xml, l_result);
+      dbms_metadata.close(h);
+    END IF;           
+    l_result := regexp_replace(l_result, 'CREATE\W', 'CREATE /*'||cort_params_pkg.gc_prefix||' OR REPLACE */ ', 1, 1);
+    RETURN l_result;
+  END get_cort_ddl;
+    
 
 END cort_pkg;
 /

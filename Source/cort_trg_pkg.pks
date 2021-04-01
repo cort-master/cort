@@ -72,7 +72,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_statement_id IN VARCHAR2,
     in_plan_id      IN NUMBER,
     in_timestamp    IN TIMESTAMP, 
-    out_other_xml   OUT NOCOPY CLOB  
+    out_other_xml   OUT NOCOPY CLOB,  
+    out_revert_ddl  OUT NOCOPY VARCHAR2
   );
 
   -- called from before DDL trigger

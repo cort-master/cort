@@ -3119,9 +3119,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     -- find all columns included into join indexes
     read_table_triggers(l_table_rec);
     -- read partitions
-    read_partitions(l_table_rec, in_read_data AND NOT g_params.keep_partitions.value_exists('PARTITION'));
+    read_partitions(l_table_rec, in_read_data);
     -- read subpartitions
-    read_subpartitions(l_table_rec, in_read_data AND NOT g_params.keep_partitions.value_exists('SUBPARTITION'));
+    read_subpartitions(l_table_rec, in_read_data);
     -- read nested tables
     read_nested_tables(l_table_rec);
 
@@ -5786,6 +5786,100 @@ end;';
 
   END read_data_source;
 
+  FUNCTION get_partitions_sql(
+    in_old_table_rec         IN gt_table_rec,
+    in_new_table_rec         IN gt_table_rec
+  )
+  RETURN CLOB
+  AS
+    l_partitions_sql        CLOB;
+    l_src_part_table_rec    gt_table_rec;  
+    l_schema                VARCHAR2(128); 
+    l_table_name            VARCHAR2(128); 
+    l_part2                 VARCHAR2(128);
+    l_dblink                VARCHAR2(128); 
+    l_part1_type            VARCHAR2(128);
+    l_object_number         VARCHAR2(128);
+  BEGIN
+    IF g_params.partitions_source.get_value IS NULL THEN -- copy from the object 
+      IF cort_comp_pkg.comp_partitioning(in_old_table_rec, in_new_table_rec) = 0 THEN
+        IF g_params.copy_subpartitions.get_bool_value AND in_old_table_rec.subpartitioning_type <> 'NONE' AND l_src_part_table_rec.subpartitioning_type <> 'NONE' THEN 
+          IF cort_comp_pkg.comp_subpartitioning(in_old_table_rec, l_src_part_table_rec) = 0 THEN
+            -- generate SQL for partitions definitions from source table
+            l_partitions_sql := cort_comp_pkg.get_partitions_sql(
+                                  in_partition_arr    => in_old_table_rec.partition_arr,
+                                  in_subpartition_arr => in_old_table_rec.subpartition_arr 
+                                );
+           ELSE
+             debug('New table has different type of subpartitioning - '||in_new_table_rec.subpartitioning_type);
+           END IF;                 
+        ELSE
+          l_partitions_sql := cort_comp_pkg.get_partitions_sql(
+                                in_partition_arr    => in_old_table_rec.partition_arr,
+                                in_subpartition_arr => l_src_part_table_rec.subpartition_arr -- <- empty collection
+                              );
+        
+        END IF;
+      ELSE
+        debug('New table has different type of partitioning - '||in_new_table_rec.partitioning_type);  
+      END IF;                    
+    ELSIF g_params.partitions_source.get_value <> '""' THEN
+      -- parsing source object name. If it is invalid the exception will be raised 
+      BEGIN
+        dbms_utility.name_resolve(
+          name          => g_params.partitions_source.get_value, 
+          context       => 0,
+          schema        => l_schema, 
+          part1         => l_table_name, 
+          part2         => l_part2,
+          dblink        => l_dblink, 
+          part1_type    => l_part1_type, 
+          object_number => l_object_number
+        );
+      EXCEPTION
+        WHEN OTHERS THEN
+          raise_error('Invalid table name specified in partition_source param'||chr(10)||sqlerrm);
+      END;
+      read_table(
+        in_table_name => l_table_name,
+        in_owner      => l_schema,
+        in_read_data  => FALSE,
+        out_table_rec => l_src_part_table_rec
+      );
+      read_table_columns(
+        io_table_rec => l_src_part_table_rec
+      );
+      -- read source partitions
+      IF cort_comp_pkg.comp_partitioning(in_new_table_rec, l_src_part_table_rec, FALSE) = 0 THEN
+        -- check that all partition key columns data types are matching
+        read_partitions(l_src_part_table_rec, FALSE);
+        IF g_params.copy_subpartitions.get_bool_value AND in_new_table_rec.subpartitioning_type <> 'NONE' AND l_src_part_table_rec.subpartitioning_type <> 'NONE' THEN 
+          IF cort_comp_pkg.comp_subpartitioning(in_new_table_rec, l_src_part_table_rec, FALSE) = 0 THEN 
+            debug('Replace subpartitions: g_params.copy_subpartitions = TRUE');
+            -- read source subpartitions
+            read_subpartitions(l_src_part_table_rec, FALSE);
+          ELSE
+            debug('partition source '||g_params.partitions_source.get_value||' has different type of subpartitioning - '||l_src_part_table_rec.subpartitioning_type);
+          END IF;    
+        END IF;
+      ELSE
+        raise_error('partition source '||g_params.partitions_source.get_value||' has different type of partitioning - '||l_src_part_table_rec.partitioning_type);  
+      END IF;  
+             
+      -- generate SQL for partitions definitions from another table
+      l_partitions_sql := cort_comp_pkg.get_partitions_sql(
+                            in_partition_arr    => l_src_part_table_rec.partition_arr,
+                            in_subpartition_arr => l_src_part_table_rec.subpartition_arr
+                          );
+                 
+    END IF;
+    
+    debug('l_partitions_sql = '||l_partitions_sql);
+   
+    RETURN l_partitions_sql;  
+   
+  END get_partitions_sql;
+  
   -- create or replace table
   PROCEDURE create_or_replace_table(
     in_job_rec       IN cort_jobs%ROWTYPE,
@@ -5893,50 +5987,6 @@ end;';
             execute_immediate('ALTER SESSION SET DEFERRED_SEGMENT_CREATION=TRUE', NULL);
           END IF;
         $END
-
-
-        IF l_old_table_rec.partitioned = 'YES' AND
-           NOT g_params.keep_partitions.is_empty
-        THEN
-          debug('Replace partitions: g_params.keep_partitions = '||g_params.keep_partitions.get_value);
-
-          -- parse partitioning types, positions
-          cort_parse_pkg.parse_partitioning(
-            io_sql_rec => l_new_sql_rec
-          );
-
-          IF l_old_table_rec.partitioning_type = l_new_sql_rec.partition_type THEN
-
-            IF l_old_table_rec.subpartitioning_type <> 'NONE' AND
-               g_params.keep_partitions.value_exists('SUBPARTITIONS') AND
-               l_old_table_rec.subpartitioning_type = l_new_sql_rec.subpartition_type
-            THEN
-              l_subpart_arr := l_old_table_rec.subpartition_arr;
-            END IF;
-
-            -- generate SQL for partitions definitions from source table
-            l_partitions_sql := cort_comp_pkg.get_partitions_sql(
-                                  in_partition_arr    => l_old_table_rec.partition_arr,
-                                  in_subpartition_arr => l_subpart_arr
-                                );
-
-            -- do not modify sql if all partitions are copied until it's known that table need to be recreated
-            IF NOT g_params.keep_partitions.value_exists('PARTITIONS') OR
-               (NOT g_params.keep_partitions.value_exists('SUBPARTITIONS') AND l_new_sql_rec.subpartition_type <> 'NONE') OR
-               l_new_sql_rec.as_select_flag
-            THEN
-              -- modify original SQL - replace partitions
-              cort_parse_pkg.replace_partitions_sql(
-                io_sql_rec       => l_new_sql_rec,
-                in_partition_sql => l_partitions_sql
-              );
-            END IF;
-
-          END IF;
-
-        ELSE
-          debug('l_old_table_rec.partitioned = '||l_old_table_rec.partitioned);
-        END IF;
 
         -- save DDL into array before any modification for TEST mode in case of CREATE AS SELECT
         l_create_ddl_arr(1) := l_new_sql_rec.original_sql;
@@ -6114,69 +6164,80 @@ end;';
                           io_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
                           io_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr
                         );
-
-            -- compare partitions
-            IF l_old_table_rec.partitioned = 'YES' AND l_new_table_rec.partitioned = 'YES'
-            THEN
-              -- if all partitiones are copied
-              IF  g_params.keep_partitions.value_exists('PARTITIONS') AND
-                 (g_params.keep_partitions.value_exists('SUBPARTITIONS') OR l_new_table_rec.subpartitioning_type = 'NONE')
-              THEN
-                -- and table is not recreated
-                IF l_result < cort_comp_pkg.gc_result_recreate THEN
-                  -- then we don't need to create and compare them
-                  l_comp_partitions := FALSE;
-                  l_comp_result := cort_comp_pkg.gc_result_nochange;
-                ELSE
-                  l_comp_partitions := TRUE;
-                  -- table is get recreated. Need to drop temp table and recreate with copied partition
-
-                  -- drop temp table
-                  apply_changes_ignore_errors(
-                    io_stmt_arr => l_drop_ddl_arr,
-                    in_echo     => FALSE,
-                    in_reverse  => TRUE
-                  );
-                  -- replace partitions
-                  cort_parse_pkg.replace_partitions_sql(
-                    io_sql_rec       => l_new_sql_rec,
-                    in_partition_sql => l_partitions_sql
-                  );
-                  -- replace DDL
-                  l_create_ddl_arr(1) := l_new_sql_rec.original_sql;
-
-                  -- reapply all changes: recraete table, comments policies and indexes
-                  apply_changes(
-                    in_frwd_alter_stmt_arr => l_create_ddl_arr,
-                    in_rlbk_alter_stmt_arr => l_drop_ddl_arr,
-                    in_echo                => FALSE
-                  );
-
-                  -- read partitions
-                  read_partitions(l_new_table_rec, FALSE);
-                  -- read subpartitions
-                  read_subpartitions(l_new_table_rec, FALSE);
-                END IF;
-              ELSE
-                l_comp_partitions := TRUE;
-              END IF;
-              IF l_comp_partitions THEN
-                -- Need to run even if we use keep_partitions to match all partitions to ech other
-                l_comp_result := cort_comp_pkg.comp_partitions(
-                                   io_source_table_rec     => l_old_table_rec,
-                                   io_target_table_rec     => l_new_table_rec,
-                                   io_source_partition_arr => l_old_table_rec.partition_arr,
-                                   io_target_partition_arr => l_new_table_rec.partition_arr,
-                                   in_partition_level      => 'PARTITION',
-                                   io_frwd_alter_stmt_arr  => l_frwd_alter_stmt_arr,
-                                   io_rlbk_alter_stmt_arr  => l_rlbk_alter_stmt_arr
-                                 );
-              END IF;
-              debug('Compare partitions - '||l_comp_result);
-              l_result := GREATEST(l_result, l_comp_result);
-            END IF;
-
           END IF;
+
+          debug('partitions_source = '||g_params.partitions_source.get_value);
+
+          IF l_new_table_rec.partitioned = 'YES' AND l_new_table_rec.partition_arr.count = 1 AND 
+             (g_params.partitions_source.get_value IS NULL  -- NULL identify copying existing partitions 
+             OR 
+             g_params.partitions_source.get_value <> '""')  -- "" disables copying partitions. Other values identify table name where partitions need to be copied from 
+          THEN
+            IF l_result > cort_comp_pkg.gc_result_alter_move THEN
+              debug('Need to retreive partitions');
+
+              -- need to replace partitions
+              l_partitions_sql := get_partitions_sql(
+                                    in_old_table_rec    => l_old_table_rec,
+                                    in_new_table_rec    => l_new_table_rec
+                                  );
+
+               debug('l_partitions_sql = '||l_partitions_sql);
+              -- compare partitions
+              IF l_partitions_sql IS NOT NULL THEN
+                -- drop temp table
+                execute_immediate(
+                  in_sql  => l_drop_ddl_arr(1),
+                  in_echo => FALSE
+                );
+                -- parse partitioning types, positions
+                cort_parse_pkg.parse_partitioning(
+                  io_sql_rec => l_new_sql_rec
+                );
+                -- replace partitions
+                cort_parse_pkg.replace_partitions_sql(
+                  io_sql_rec       => l_new_sql_rec,
+                  in_partition_sql => l_partitions_sql
+                );
+                -- replace DDL
+                l_create_ddl_arr(1) := l_new_sql_rec.original_sql;
+
+                -- reapply all changes: recraete table, comments policies and indexes
+                apply_changes(
+                  in_frwd_alter_stmt_arr => l_create_ddl_arr,
+                  in_rlbk_alter_stmt_arr => l_drop_ddl_arr,
+                  in_echo                => FALSE
+                );
+                -- read partitions
+                read_partitions(l_new_table_rec, FALSE);
+                -- read subpartitions
+                read_subpartitions(l_new_table_rec, FALSE);
+                l_comp_partitions := FALSE;    
+              ELSE
+                l_comp_partitions := TRUE;    
+              END IF;
+            ELSE
+              l_comp_partitions := FALSE;    
+            END IF;
+          ELSE
+            l_comp_partitions := l_new_table_rec.partitioned = 'YES';    
+          END IF;    
+            
+          IF l_comp_partitions THEN
+            -- Need to run even if we use keep_partitions to match all partitions to ech other
+            l_comp_result := cort_comp_pkg.comp_partitions(
+                               io_source_table_rec     => l_old_table_rec,
+                               io_target_table_rec     => l_new_table_rec,
+                               io_source_partition_arr => l_old_table_rec.partition_arr,
+                               io_target_partition_arr => l_new_table_rec.partition_arr,
+                               io_frwd_alter_stmt_arr  => l_frwd_alter_stmt_arr,
+                               io_rlbk_alter_stmt_arr  => l_rlbk_alter_stmt_arr
+                             );
+          ELSE
+            l_comp_result := 0;
+          END IF;
+          debug('Compare partitions - '||l_comp_result);
+          l_result := GREATEST(l_result, l_comp_result);
 
           IF io_sql_rec.data_filter IS NOT NULL THEN
             debug('Data filter is not null so we need to recreate table...');
@@ -6280,6 +6341,16 @@ end;';
                 in_frwd_stmt_arr  => l_frwd_alter_stmt_arr,
                 in_rlbk_stmt_arr  => l_rlbk_alter_stmt_arr
               );
+            ELSE  
+              cort_log_pkg.echo('== REVERT DDL ==');
+              FOR i IN REVERSE 1..l_rlbk_alter_stmt_arr.COUNT LOOP
+                cort_log_pkg.echo(
+                  in_text => l_rlbk_alter_stmt_arr(i)
+                );
+                cort_log_pkg.revert(
+                  in_text => l_rlbk_alter_stmt_arr(i)
+                );
+              END LOOP;
             END IF;
 
           WHEN l_result IN (cort_comp_pkg.gc_result_exchange, cort_comp_pkg.gc_result_part_exchange, cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_create_as_select, cort_comp_pkg.gc_result_cas_from_itself) THEN
@@ -6351,11 +6422,19 @@ end;';
               END IF;
 
             ELSE
+              cort_log_pkg.echo('== REVERT DDL ==');
+              FOR i IN REVERSE 1..l_drop_ddl_arr.COUNT LOOP
+                cort_log_pkg.echo(
+                  in_text => l_drop_ddl_arr(i)
+                );
+                cort_log_pkg.revert(
+                  in_text => l_drop_ddl_arr(i)
+                );
+              END LOOP;
               -- drop temp table
-              apply_changes_ignore_errors(
-                io_stmt_arr => l_drop_ddl_arr,
-                in_echo     => FALSE,
-                in_reverse  => TRUE
+              execute_immediate(
+                in_sql  => l_drop_ddl_arr(1),
+                in_echo => FALSE
               );
             END IF;
           END CASE;
@@ -6424,6 +6503,16 @@ end;';
             in_frwd_stmt_arr  => l_create_ddl_arr,
             in_rlbk_stmt_arr  => l_drop_ddl_arr
           );
+        ELSE
+          cort_log_pkg.echo('== REVERT DDL ==');
+          FOR i IN REVERSE 1..l_drop_ddl_arr.COUNT LOOP
+                cort_log_pkg.echo(
+                  in_text => l_drop_ddl_arr(i)
+                );
+                cort_log_pkg.revert(
+                  in_text => l_drop_ddl_arr(i)
+                );
+          END LOOP;
         END IF;
       END IF;
 

@@ -37,7 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   gc_use_context             CONSTANT BOOLEAN := false;
   gc_explain_plan            CONSTANT BOOLEAN := true;
-  gc_threading               CONSTANT BOOLEAN := false;
+  gc_threading               CONSTANT BOOLEAN := true;
   
 END cort_options_pkg;
 /

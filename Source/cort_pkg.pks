@@ -157,8 +157,18 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_err_table_name  IN VARCHAR2,
     in_table_owner     IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
     in_system_columns  IN arrays.gt_str_tab DEFAULT NULL
- );
+  );
 
+  FUNCTION get_cort_ddl(
+    in_table_name          IN VARCHAR2, 
+    in_table_owner         IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
+    in_all_partitions      IN BOOLEAN DEFAULT TRUE,
+    in_segment_attributes  IN BOOLEAN DEFAULT FALSE,
+    in_storage             IN BOOLEAN DEFAULT FALSE, 
+    in_tablespace          IN BOOLEAN DEFAULT FALSE,
+    in_size_byte_keyword   IN BOOLEAN DEFAULT FALSE
+  )
+  RETURN CLOB;
 
 END cort_pkg;
 /

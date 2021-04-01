@@ -34,34 +34,18 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 whenever sqlerror continue
 
-BEGIN
-  FOR X IN (SELECT * FROM user_types WHERE type_name = 'CORT_PARAMS_ARR') LOOP
-    EXECUTE IMMEDIATE 'DROP TYPE '||x.type_name||' FORCE';
-  END LOOP;
-END;
-/  
 
-BEGIN
-  FOR X IN (SELECT * FROM user_types WHERE type_name = 'CORT_PARAM_VALUE_OBJ') LOOP
-    EXECUTE IMMEDIATE 'DROP TYPE '||x.type_name||' FORCE';
-  END LOOP;
-END;
-/  
+drop type cort_params_arr force
+/
 
-BEGIN
-  FOR X IN (SELECT * FROM user_types WHERE type_name = 'CORT_PARAM_OBJ') LOOP
-    EXECUTE IMMEDIATE 'DROP TYPE '||x.type_name||' FORCE';
-  END LOOP;
-END;
-/  
+drop type cort_param_value_obj force
+/
 
+drop type cort_param_obj force
+/
 
-BEGIN
-  FOR X IN (SELECT * FROM user_types WHERE type_name = 'ARRAY') LOOP
-    EXECUTE IMMEDIATE 'DROP TYPE '||x.type_name||' FORCE';
-  END LOOP;
-END;
-/  
+drop type array force
+/
 
 
 whenever sqlerror exit failure

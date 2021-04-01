@@ -261,7 +261,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr, 
     io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr, 
-    in_partition_level      IN VARCHAR2, -- PARTITION/SUBPARTITION
     io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
     io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
   )
@@ -316,14 +315,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   -- Returns 1 if same partitiong used, for same columns/ref_constraint and partitions could be preserved. Otherwise returns 0
   FUNCTION comp_partitioning(
     in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_check_position   IN BOOLEAN DEFAULT TRUE
   )
   RETURN PLS_INTEGER;
   
   -- Returns 1 if same partitiong used, for same columns/ref_constraint and partitions could be preserved. Otherwise returns 0
   FUNCTION comp_subpartitioning(
     in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_check_position   IN BOOLEAN DEFAULT TRUE
   )
   RETURN PLS_INTEGER;
 

@@ -199,6 +199,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   RETURN cort_builds%ROWTYPE;
 
+  -- wrapper returns 'TRUE'/'FALSE' 
+  FUNCTION is_session_alive(in_session_id IN VARCHAR2)
+  RETURN VARCHAR2;  
+
   -- Adds new records into CORT_BUILDS table
   FUNCTION create_build(in_application IN VARCHAR2)
   RETURN cort_builds%ROWTYPE;

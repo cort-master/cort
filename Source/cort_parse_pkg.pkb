@@ -1148,7 +1148,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   AS
     l_search_pos                PLS_INTEGER;
     l_hint_regexp               VARCHAR2(1000);
-    l_regexp                    VARCHAR2(1000);
+    l_data_filter_regexp        VARCHAR2(1000);
+    l_data_source_regexp        VARCHAR2(1000);
     l_key_start_pos             PLS_INTEGER;
     l_key_end_pos               PLS_INTEGER;
     l_text                      CLOB;
@@ -1167,13 +1168,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     -- or 
     --#[release]FILTER= 
     -- where [release] is current release value wrapped with square brackets []. This clause is optional
+    io_sql_rec.data_filter := null;
+    io_sql_rec.data_source := null;
 
     l_hint_regexp := cort_params_pkg.gc_prefix;
 
-    l_regexp := cort_params_pkg.gc_prefix||'(\['||
-                get_regexp_const(cort_pkg.get_current_release)||'\])?('||
-                cort_params_pkg.gc_data_filter_regexp||'|'||
-                cort_params_pkg.gc_sql_regexp||')';
+    l_data_source_regexp := 
+      cort_params_pkg.gc_prefix||'(\['||
+      get_regexp_const(cort_pkg.get_current_release)||'\])?'||
+      cort_params_pkg.gc_data_source_regexp;
+
+    l_data_filter_regexp := 
+      cort_params_pkg.gc_prefix||'(\['||
+      get_regexp_const(cort_pkg.get_current_release)||'\])?'||
+      cort_params_pkg.gc_data_filter_regexp;
 
     -- find all cort hints
     l_indx := io_sql_rec.lexical_units_arr.FIRST;
@@ -1197,16 +1205,23 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
         IF io_sql_rec.lexical_units_arr(l_indx).start_position >= NVL(io_sql_rec.columns_end_pos,io_sql_rec.definition_start_pos)  
         THEN                                            
-          l_key_start_pos := REGEXP_INSTR(l_text, l_regexp, 1, 1, 0, 'i');
-          l_key_end_pos := REGEXP_INSTR(l_text, l_regexp, 1, 1, 1, 'i');
-          IF l_key_start_pos = 1 THEN
-            l_key := REGEXP_SUBSTR(l_text, l_regexp, 1, 1, 'i', 2);
-            CASE l_key
-            WHEN cort_params_pkg.gc_data_filter_regexp THEN 
-              io_sql_rec.data_filter := SUBSTR(l_text, l_key_end_pos);
-            WHEN cort_params_pkg.gc_sql_regexp THEN 
+          IF REGEXP_INSTR(l_text, l_data_source_regexp, 1, 1, 0, 'i') = 1 THEN
+            l_key_end_pos := REGEXP_INSTR(l_text, l_data_source_regexp, 1, 1, 1, 'i');
+            IF io_sql_rec.data_filter IS NULL AND io_sql_rec.data_source IS NULL THEN 
               io_sql_rec.data_source := SUBSTR(l_text, l_key_end_pos);
-            END CASE;  
+              debug('data_source = '||io_sql_rec.data_source);
+            ELSE  
+              cort_exec_pkg.raise_error('Only one definition of data source (SQL=) or data filter (FILTER=) is allowed');
+            END IF;  
+          END IF;
+          IF REGEXP_INSTR(l_text, l_data_filter_regexp, 1, 1, 0, 'i') = 1 THEN
+            l_key_end_pos := REGEXP_INSTR(l_text, l_data_filter_regexp, 1, 1, 1, 'i');
+            IF io_sql_rec.data_filter IS NULL AND io_sql_rec.data_source IS NULL THEN 
+              io_sql_rec.data_filter := SUBSTR(l_text, l_key_end_pos);
+              debug('data_filter = '||io_sql_rec.data_filter);
+            ELSE
+              cort_exec_pkg.raise_error('Only one definition of DATA_SOURCE or DATA_FILTER is allowed');
+            END IF;  
           END IF;
         END IF;    
         
@@ -1729,6 +1744,24 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_search_pos := REGEXP_INSTR(l_parse_only_sql, l_regexp, l_search_pos, 1, 1);
         io_sql_rec.partitions_start_pos := l_search_pos-1; 
         io_sql_rec.partitions_end_pos := get_closed_bracket(l_parse_only_sql, l_search_pos) + 1;
+
+        debug('io_sql_rec.partitions_start_pos = '||io_sql_rec.partitions_start_pos); 
+        debug('io_sql_rec.partitions_end_pos = '||io_sql_rec.partitions_end_pos);
+/*
+        -- parse number of defined partitions
+        io_sql_rec.partitions_count := 0;
+        l_regexp := '\s*PARTITION\W';
+        l_search_pos := REGEXP_INSTR(l_parse_only_sql, l_regexp, io_sql_rec.partitions_start_pos, 1, 1);
+        l_key_end_pos := 0;
+        WHILE l_search_pos < io_sql_rec.partitions_end_pos LOOP
+          io_sql_rec.partitions_count := io_sql_rec.partitions_count + 1;  
+          l_regexp := ',s*PARTITION\W';
+          l_key_end_pos := REGEXP_INSTR(l_parse_only_sql, l_regexp, io_sql_rec.partitions_start_pos, 1, 1);
+          exit when l_key_end_pos = 0;
+          l_search_pos := l_key_end_pos;
+        END LOOP;
+        debug('io_sql_rec.partitions_count = '||io_sql_rec.partitions_count);
+*/        
       END IF;
     END IF;
   END parse_partitioning;

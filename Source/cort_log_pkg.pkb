@@ -207,6 +207,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                 );
   END test;
 
+  PROCEDURE revert(
+    in_text  IN CLOB
+  )
+  AS
+    l_row_id       rowid;
+  BEGIN
+    l_row_id := int_log(
+                  in_log_type     => 'REVERT',
+                  in_text         => substr(in_text, 1, 4000),
+                  in_details      => in_text 
+                );
+  END revert;
+
+
   PROCEDURE echo(
     in_text      IN CLOB
   )

@@ -76,6 +76,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     subpartition_type            VARCHAR2(20),
     partitions_start_pos         PLS_INTEGER,
     partitions_end_pos           PLS_INTEGER,
+--    partitions_count             PLS_INTEGER,
     as_select_start_pos          PLS_INTEGER,
     subquery_start_pos           PLS_INTEGER,
     table_definition_start_pos   PLS_INTEGER,   -- index's table start definition (after keyword ON {CLUSTER})

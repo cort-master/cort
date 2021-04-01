@@ -59,6 +59,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_text  IN CLOB
   );
 
+  PROCEDURE revert(
+    in_text  IN CLOB
+  );
+
   PROCEDURE echo(
     in_text      IN CLOB
   );

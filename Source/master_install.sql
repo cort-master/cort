@@ -4,7 +4,7 @@ CORT - Oracle database DevOps tool
 Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
 
 www.cort.tech
-master@@cort.tech
+master@cort.tech
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -26,83 +26,108 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   Release | Author(s)         | Comments
   ----------------------------------------------------------------------------------------------------------------------  
   19.07   | Rustam Kafarov    | Simple full install script
-  21.01   | Rustam Kafarov    | included PL/SQL Utilities
+  20.00   | Rustam Kafarov    | Added requirement info and spooling
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
-   
 
--- PL/SQL utilities
-@plsql_utilities/arrays.pks
-@plsql_utilities/partition_utils.pks
-@plsql_utilities/xml_utils.pks
+SET SERVEROUTPUT ON
+SET VERIFY OFF
+SET LINESIZE 400
+WHENEVER SQLERROR EXIT
 
-@plsql_utilities/arrays.pkb
-@plsql_utilities/partition_utils.pkb
-@plsql_utilities/xml_utils.pkb
+SPOOL install.log
 
+PROMPT ..... CORT INSTALLATION .....
+PROMPT 
+PROMPT CORT main schema requires following privileges: 
+PROMPT   CREATE SESSION, CREATE TABLE, CREATE INDEX, CREATE PROCEDURE, CREATE TRIGGER, CREATE JOB, CREATE VIEW, CREATE TYPE
+PROMPT Optional privileges: 
+PROMPT   SELECT ON V_$SQLTEXT_WITH_NEWLINES (for explain plan support)
+PROMPT   SELECT ON DBA_SEGMENTS, SELECT ON DBA_CLU_COLUMNS (for creating lobs/cluster tables in different schema) 
+PROMPT 
 
-@drop_triggers.sql
+    
+@@drop_triggers.sql
+
+@@plsql_utilities/arrays.pks
+@@plsql_utilities/partition_utils.pks
+@@plsql_utilities/xml_utils.pks
+@@plsql_utilities/partition_utils.pkb
+@@plsql_utilities/xml_utils.pkb
+
 
 -- tables 
-@tables/cort_applications.sql
-@tables/cort_builds.sql
-@tables/cort_context.sql
-@tables/cort_job_control.sql
-@tables/cort_job_log.sql
-@tables/cort_jobs.sql
-@tables/cort_lob.sql
-@tables/cort_log.sql
-@tables/cort_objects.sql
-@tables/cort_params.sql
-@tables/cort_releases.sql
-@tables/cort_stat.sql
-@tables/plan_table.sql
+@@tables/cort_applications.sql
+@@tables/cort_builds.sql
+@@tables/cort_context.sql
+@@tables/cort_job_control.sql
+@@tables/cort_job_log.sql
+@@tables/cort_jobs.sql
+@@tables/cort_lob.sql
+@@tables/cort_log.sql
+@@tables/cort_objects.sql
+@@tables/cort_params.sql
+@@tables/cort_releases.sql
+@@tables/cort_stat.sql
+@@tables/cort_thread_sql.sql
+@@tables/plan_table.sql
 
 -- params
-@cort_params.sql
+@@cort_params.sql
 
 -- Types
-@cort_param_obj.tps
-@cort_param_obj.tpb
+@@cort_param_obj.tps
 
 -- Package specs
-@cort_options_pkg.pks
-@cort_log_pkg.pks
-@cort_params_pkg.pks
-@cort_exec_pkg.pks
-@cort_comp_pkg.pks
-@cort_parse_pkg.pks
-@cort_xml_pkg.pks
-@cort_aux_pkg.pks
-@cort_pkg.pks
-@cort_session_pkg.pks
-@cort_trg_pkg.pks
-@cort_job_pkg.pks
-@cort_event_exec_pkg.pks
+@@cort_options_pkg.pks
+@@cort_log_pkg.pks
+@@cort_params_pkg.pks
+@@cort_exec_pkg.pks
+@@cort_comp_pkg.pks
+@@cort_parse_pkg.pks
+@@cort_xml_pkg.pks
+@@cort_aux_pkg.pks
+@@cort_pkg.pks
+@@cort_session_pkg.pks
+@@cort_trg_pkg.pks
+@@cort_job_pkg.pks
+@@cort_event_exec_pkg.pks
+@@cort_thread_job_pkg.pks
+@@cort_thread_exec_pkg.pks
+
+-- Type bodies
+@@cort_param_obj.tpb
 
 -- Package bodies
-@cort_log_pkg.pkb
-@cort_params_pkg.pkb
-@cort_exec_pkg.pkb
-@cort_comp_pkg.pkb
-@cort_parse_pkg.pkb
-@cort_xml_pkg.pkb
-@cort_aux_pkg.pkb
-@cort_pkg.pkb
-@cort_session_pkg.pkb
-@cort_trg_pkg.pkb
-@cort_job_pkg.pkb
-@cort_event_exec_pkg.pkb
+@@cort_log_pkg.pkb
+@@cort_params_pkg.pkb
+@@cort_exec_pkg.pkb
+@@cort_comp_pkg.pkb
+@@cort_parse_pkg.pkb
+@@cort_xml_pkg.pkb
+@@cort_aux_pkg.pkb
+@@cort_pkg.pkb
+@@cort_session_pkg.pkb
+@@cort_trg_pkg.pkb
+@@cort_job_pkg.pkb
+@@cort_event_exec_pkg.pkb
+@@cort_thread_job_pkg.pkb
+@@cort_thread_exec_pkg.pkb
 
 -- Views
-@cort_recent_objects.sql
-@cort_recent_jobs.sql
+@@cort_recent_objects.sql
+@@cort_recent_jobs.sql
 
 -- Triggers
-@cort_create_trg.trg
-@cort_before_create_trg.trg
-@cort_lock_object_trg.trg
-@cort_before_xplan_trg.trg
+@@cort_create_trg.trg
+@@cort_before_create_trg.trg
+@@cort_lock_object_trg.trg
+@@cort_before_xplan_trg.trg
 
-exit
+
+SPOOL OFF
+
+PROMPT Installation completed
+PAUSE 
+EXIT 

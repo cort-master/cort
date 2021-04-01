@@ -644,7 +644,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_object_type   VARCHAR2(100);
     l_object_name   VARCHAR2(100);
     l_object_owner  VARCHAR2(100);
-    l_text_arr      arrays.gt_clob_arr;
+    l_text_arr      arrays.gt_lstr_arr;
+    l_revert_arr    arrays.gt_lstr_arr;
     l_id_arr        arrays.gt_num_arr;
     l_last_id       NUMBER;
     l_rec           cort_jobs%ROWTYPE;
@@ -693,6 +694,18 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
              AND log_type = 'TEST'
            ORDER BY log_time;
 
+          SELECT text
+            BULK COLLECT
+            INTO l_revert_arr
+            FROM cort_log
+           WHERE sid = l_rec.sid
+             AND action = 'EXPLAIN_PLAN_FOR'
+             AND job_time = l_rec.job_time
+             AND object_owner = l_object_owner
+             AND object_name = l_object_name
+             AND log_type = 'REVERT'
+           ORDER BY log_time desc;
+
           -- disable cort triggers
           cort_session_pkg.disable;
           BEGIN
@@ -707,8 +720,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             END LOOP;
 
             FORALL i IN 1..l_text_arr.COUNT
-              INSERT INTO plan_table(statement_id, plan_id, timestamp, parent_id, id, operation, depth)
-              VALUES(in_statement_id, in_plan_id, in_timestamp, 0, l_id_arr(i), SUBSTR(l_text_arr(i),1,1000), 1);
+              INSERT INTO plan_table(statement_id, plan_id, timestamp, parent_id, id, operation, depth, access_predicates)
+              VALUES(in_statement_id, in_plan_id, in_timestamp, 0, l_id_arr(i), SUBSTR(l_text_arr(i),1,1000), 1, l_revert_arr(i));
 
           EXCEPTION
             WHEN OTHERS THEN

@@ -42,7 +42,8 @@ BEGIN
       in_statement_id => :new.statement_id,
       in_plan_id      => :new.plan_id,
       in_timestamp    => :new.timestamp, 
-      out_other_xml   => :new.other_xml  
+      out_other_xml   => :new.other_xml,  
+      out_revert_ddl  => :new.access_predicates  
     );
   END IF;
   COMMIT;

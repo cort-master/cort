@@ -318,7 +318,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   BEGIN
     l_result := '<PARAMS>'||chr(10);
     FOR i IN 1..g_param_names_arr.COUNT LOOP
-      l_result := l_result||'<'||g_param_names_arr(i)||'>'||in_params_arr(g_param_names_arr(i)).get_value||'</'||g_param_names_arr(i)||'>'||chr(10);
+      l_result := l_result||'<'||g_param_names_arr(i)||'>'||dbms_xmlgen.convert(in_params_arr(g_param_names_arr(i)).get_value, dbms_xmlgen.entity_encode)||'</'||g_param_names_arr(i)||'>'||chr(10);
     END LOOP;
     l_result := l_result||'</PARAMS>';
     RETURN l_result;

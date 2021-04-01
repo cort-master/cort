@@ -563,7 +563,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_target_table_rec  IN cort_exec_pkg.gt_table_rec,
     in_source_column_arr IN arrays.gt_name_arr,
     in_target_column_arr IN arrays.gt_name_arr,
-    in_check_type        IN BOOLEAN DEFAULT FALSE
+    in_check_position    IN BOOLEAN DEFAULT TRUE
   )
   RETURN PLS_INTEGER
   AS
@@ -607,21 +607,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         ELSE
           RETURN 1;
         END IF;
-        IF l_source_column_rec.matched_column_id = l_target_column_rec.column_id AND
-           l_source_column_rec.column_id = l_target_column_rec.matched_column_id
-        THEN
-          debug('columns match each other');
-          IF in_check_type THEN
-            IF comp_data_type(l_source_column_rec, l_target_column_rec) = 1 THEN
-              debug('column types do not match each other');
-              RETURN 1;
-            END IF;
-          END IF;
-        ELSE
-          debug('source column_id/matched_column_id = '||l_source_column_rec.column_id||'/'||l_source_column_rec.matched_column_id);
-          debug('target column_id/matched_column_id = '||l_target_column_rec.column_id||'/'||l_target_column_rec.matched_column_id);
+        IF comp_data_type(l_source_column_rec, l_target_column_rec) = 1 THEN
+          debug('column types do not match each other');
           RETURN 1;
         END IF;
+        IF in_check_position THEN
+          IF l_source_column_rec.matched_column_id = l_target_column_rec.column_id AND
+             l_source_column_rec.column_id = l_target_column_rec.matched_column_id
+          THEN
+            debug('columns positions match each other');
+          ELSE
+            debug('source column_id/matched_column_id = '||l_source_column_rec.column_id||'/'||l_source_column_rec.matched_column_id);
+            debug('target column_id/matched_column_id = '||l_target_column_rec.column_id||'/'||l_target_column_rec.matched_column_id);
+            RETURN 1;
+          END IF;
+        END IF;
+          
 /*
         IF l_source_column_rec.virtual_column = l_target_column_rec.virtual_column
         THEN
@@ -709,7 +710,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   -- Returns 1 if same partitiong used, for same columns/ref_constraint and partitions could be preserved. Otherwise returns 0
   FUNCTION comp_partitioning(
     in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_check_position   IN BOOLEAN DEFAULT TRUE
   )
   RETURN PLS_INTEGER
   AS
@@ -729,7 +731,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                  in_target_table_rec  => in_target_table_rec,
                  in_source_column_arr => in_source_table_rec.part_key_column_arr,
                  in_target_column_arr => in_target_table_rec.part_key_column_arr,
-                 in_check_type        => TRUE
+                 in_check_position    => in_check_position
                );
       END CASE;
     ELSE
@@ -740,7 +742,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   -- Returns 1 if same partitiong used, for same columns/ref_constraint and partitions could be preserved. Otherwise returns 0
   FUNCTION comp_subpartitioning(
     in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_check_position   IN BOOLEAN DEFAULT TRUE
   )
   RETURN PLS_INTEGER
   AS
@@ -749,9 +752,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       RETURN comp_column_arr(
                in_source_table_rec  => in_source_table_rec,
                in_target_table_rec  => in_target_table_rec,
-               in_source_column_arr => in_source_table_rec.part_key_column_arr,
-               in_target_column_arr => in_target_table_rec.part_key_column_arr,
-               in_check_type        => TRUE
+               in_source_column_arr => in_source_table_rec.subpart_key_column_arr, 
+               in_target_column_arr => in_target_table_rec.subpart_key_column_arr,
+               in_check_position    => in_check_position
              );
     ELSE
       RETURN 1;
@@ -1990,6 +1993,27 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       debug('Compare subpartitioning_type - 1');
       RETURN gc_result_recreate;
     END IF;
+    l_comp_result := comp_partitioning(
+                         in_source_table_rec => in_source_table_rec,
+                         in_target_table_rec => in_target_table_rec
+                       ); 
+    debug('comp_partitioning - '||l_comp_result);
+    
+                      
+    IF in_source_table_rec.subpartitioning_type <> 'NONE' OR 
+       in_target_table_rec.subpartitioning_type <> 'NONE' 
+    THEN
+      l_comp_result := comp_subpartitioning(
+                         in_source_table_rec => in_source_table_rec,
+                         in_target_table_rec => in_target_table_rec
+                       );
+      debug('comp_subpartitioning - '||l_comp_result);                  
+    END IF;  
+
+    IF l_comp_result > 0 THEN
+      RETURN gc_result_recreate;
+    END IF;  
+    
     IF comp_value(in_source_table_rec.temporary, in_target_table_rec.temporary) = 1 THEN
       debug('Compare temporary - 1');
       RETURN gc_result_recreate;
@@ -2437,14 +2461,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
     IF comp_array(in_source_table_rec.iot_pk_column_sort_type_arr, in_target_table_rec.iot_pk_column_sort_type_arr) = 1 THEN
       debug('Compare iot PK key sort types - 1');
-      RETURN gc_result_recreate;
-    END IF;
-    IF comp_column_arr(in_source_table_rec, in_target_table_rec, in_source_table_rec.part_key_column_arr, in_target_table_rec.part_key_column_arr, TRUE) = 1 THEN
-      debug('Compare part key columns - 1');
-      RETURN gc_result_recreate;
-    END IF;
-    IF comp_column_arr(in_source_table_rec, in_target_table_rec, in_source_table_rec.subpart_key_column_arr, in_target_table_rec.subpart_key_column_arr, TRUE) = 1 THEN
-      debug('Compare subpart key columns - 1');
       RETURN gc_result_recreate;
     END IF;
     IF comp_ref_ptn_constraint(in_source_table_rec, in_target_table_rec) = 1 THEN
@@ -5896,10 +5912,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       l_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_overflow_tablespace, in_partition_rec.overflow_tablespace, '"', '"');
     END IF;
     -- Compression
-    IF in_partition_rec.iot_key_compression IS NULL THEN
-      l_clause_indx_arr(gc_compression) := get_compress_clause(in_partition_rec.compression_rec);
-    ELSE
+    IF in_partition_rec.iot_key_compression IS NOT NULL THEN
       l_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, in_partition_rec.iot_key_compression);
+    ELSE
+      IF cort_exec_pkg.g_params.compression.value_exists(in_partition_rec.partition_level) THEN 
+      l_clause_indx_arr(gc_compression) := get_compress_clause(in_partition_rec.compression_rec);
+      END IF;  
     END IF;
     -- Lob partitioning storage
     -- varray
@@ -5951,10 +5969,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       l_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_partition_rec.tablespace_name, '"', '"');
     END IF;
     -- compression
-    IF in_partition_rec.iot_key_compression IS NULL THEN
-      l_clause_indx_arr(gc_compression) := get_compress_clause(in_partition_rec.compression_rec);
-    ELSE
+    IF in_partition_rec.iot_key_compression IS NOT NULL THEN
       l_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, in_partition_rec.iot_key_compression);
+    ELSE
+      IF cort_exec_pkg.g_params.compression.value_exists(in_partition_rec.partition_level) THEN 
+      l_clause_indx_arr(gc_compression) := get_compress_clause(in_partition_rec.compression_rec);
+      END IF;  
     END IF;
 
     -- Overflow
@@ -6000,7 +6020,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
            get_clause_by_name(l_clause_indx_arr, gc_subpartitions);
   END get_partition_desc_clause;
 
-  -- Forwar declaration. compares subpartitions for two given partitions
+  -- Forward declaration. compares subpartitions for two given partitions
   FUNCTION comp_subpartitions(
     io_source_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
@@ -6080,7 +6100,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
 
     -- Compression
-    IF comp_compression(
+    IF cort_exec_pkg.g_params.compression.value_exists(io_source_partition_rec.partition_level) AND 
+       comp_compression(
          in_source_compression_rec  => io_source_partition_rec.compression_rec,
          in_target_compression_rec  => io_target_partition_rec.compression_rec,
          out_frwd_clause            => l_frwd_clause,
@@ -6771,48 +6792,24 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     RETURN l_result;
   END comp_range_partitions;
 
-  -- compare partitions
-  FUNCTION comp_partitions(
+  -- internal function for campare individual partition/subpartition segments 
+  FUNCTION int_comp_partition_segments(
     io_source_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
     io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
-    in_partition_level      IN VARCHAR2, -- PARTITION/SUBPARTITION
+    in_partitioning_type    IN VARCHAR2, -- HASH/LIST/RANGE/SYSTEM/REFERENCE
     io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
     io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
-    l_comp_result            PLS_INTEGER;
     l_partitioning_type      VARCHAR2(30);
     l_frwd_alter_stmt_arr    arrays.gt_clob_arr; -- forward alter statements
     l_rlbk_alter_stmt_arr    arrays.gt_clob_arr;  -- rollback alter statements
   BEGIN
-    cort_exec_pkg.start_timer;
-    l_result := gc_result_nochange;
-    CASE in_partition_level
-    WHEN 'PARTITION' THEN
-      l_partitioning_type := io_source_table_rec.partitioning_type;
-      l_comp_result := comp_partitioning(
-                         in_source_table_rec => io_source_table_rec,
-                         in_target_table_rec => io_target_table_rec
-                       );
-      debug('comp_partitioning - '||l_comp_result);
-    WHEN 'SUBPARTITION' THEN
-      l_partitioning_type := io_source_table_rec.subpartitioning_type;
-      l_comp_result := comp_subpartitioning(
-                         in_source_table_rec => io_source_table_rec,
-                         in_target_table_rec => io_target_table_rec
-                       );
-      debug('comp_subpartitioning - '||l_comp_result);
-    END CASE;
-
-    IF l_comp_result > 0 THEN
-      RETURN gc_result_recreate;
-    END IF;
-
-    CASE l_partitioning_type
+    CASE in_partitioning_type
     WHEN 'HASH' THEN
       l_result := comp_hash_partitions(
                     io_source_table_rec     => io_source_table_rec,
@@ -6870,6 +6867,34 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         io_rlbk_alter_stmt_arr(io_rlbk_alter_stmt_arr.COUNT+1) := l_rlbk_alter_stmt_arr(i);
       END LOOP;
     END IF;
+
+    RETURN l_result;
+  END int_comp_partition_segments;
+
+  -- compare partitions
+  FUNCTION comp_partitions(
+    io_source_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr, 
+    io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr, 
+    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
+    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+  )
+  RETURN PLS_INTEGER
+  AS
+    l_result                 PLS_INTEGER;
+  BEGIN
+    cort_exec_pkg.start_timer;    
+
+    l_result := int_comp_partition_segments(
+                  io_source_table_rec     => io_source_table_rec,
+                  io_target_table_rec     => io_target_table_rec,
+                  io_source_partition_arr => io_source_partition_arr, 
+                  io_target_partition_arr => io_target_partition_arr, 
+                  in_partitioning_type    => io_source_table_rec.partitioning_type,
+                  io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr, 
+                  io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
+                );
     cort_exec_pkg.stop_timer;
 
     RETURN l_result;
@@ -6909,12 +6934,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       debug('target subpart name = '||l_target_subpartition_arr(l_index).partition_name);
       l_index := l_index + 1;
     END LOOP;
-    l_result := comp_partitions(
+    l_result := int_comp_partition_segments(
                   io_source_table_rec     => io_source_table_rec,
                   io_target_table_rec     => io_target_table_rec,
                   io_source_partition_arr => l_source_subpartition_arr,
                   io_target_partition_arr => l_target_subpartition_arr,
-                  in_partition_level      => 'SUBPARTITION',
+                  in_partitioning_type    => io_source_table_rec.subpartitioning_type,
                   io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr,
                   io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
                 );

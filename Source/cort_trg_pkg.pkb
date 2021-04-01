@@ -176,7 +176,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_statement_id IN VARCHAR2,
     in_plan_id      IN NUMBER,
     in_timestamp    IN TIMESTAMP, 
-    out_other_xml   OUT NOCOPY CLOB  
+    out_other_xml   OUT NOCOPY CLOB,  
+    out_revert_ddl  OUT NOCOPY VARCHAR2
   )
   AS
   BEGIN
@@ -192,9 +193,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       out_last_id      => :g_last_id
     );
   END;}' USING IN in_statement_id, IN in_plan_id, IN in_timestamp, OUT out_other_xml, OUT g_last_id;  
-        IF g_last_id > 0 THEN 
-          io_operation := 'CREATE OR REPLACE TABLE (CORT) STATEMENT plan_id ='||to_char(in_plan_id);
-        END IF;  
+        io_operation := 'CREATE OR REPLACE TABLE (CORT) STATEMENT plan_id ='||to_char(in_plan_id);
+        out_revert_ddl := 'REVERT DDL';
       END IF;
     ELSE
       IF g_last_id > 0 AND io_parent_id = 0 THEN 

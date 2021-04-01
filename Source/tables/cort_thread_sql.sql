@@ -21,48 +21,38 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 /*
-  Description: Script for cort_objects table
+  Description: Script for cort_thread_sql table
   ----------------------------------------------------------------------------------------------------------------------     
   Release | Author(s)         | Comments
   ----------------------------------------------------------------------------------------------------------------------  
-  19.00   | Rustam Kafarov    | table for storing history of all changes made to database objects via cort 
+  19.00   | Rustam Kafarov    | table for storing threading sql/ddl statements
   20.00   | Rustam Kafarov    | Added support of long names in Oracle 12.2 
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
 
----- TABLE CORT_OBJECTS ----
+---- TABLE CORT_THREAD_SQL ----
 
 BEGIN
-  FOR X IN (SELECT * FROM user_tables WHERE table_name = 'CORT_OBJECTS') LOOP
+  FOR X IN (SELECT * FROM user_tables WHERE table_name = 'CORT_THREAD_SQL') LOOP
     EXECUTE IMMEDIATE 'DROP TABLE '||x.table_name||' CASCADE CONSTRAINT';
   END LOOP;
 END;
 /  
 
 
-CREATE TABLE cort_objects(
-  object_owner                   VARCHAR2(128) NOT NULL,
-  object_name                    VARCHAR2(128) NOT NULL,
-  object_type                    VARCHAR2(30)  NOT NULL,
-  exec_time                      TIMESTAMP(9)  NOT NULL,
-  sid                            VARCHAR2(30)  NOT NULL,
-  sql_text                       CLOB,
-  last_ddl_time                  DATE,
-  application                    VARCHAR2(20),
-  release                        VARCHAR2(20),
-  build                          VARCHAR2(20),
-  change_type                    VARCHAR2(30), 
-  metadata                       CLOB, --XMLTYPE
-  forward_ddl                    CLOB, --XMLTYPE,
-  revert_ddl                     CLOB, --XMLTYPE,
-  revert_name                    VARCHAR2(128),
-  last_ddl_index                 NUMBER(9),
-  rename_name                    VARCHAR2(128),
-  CONSTRAINT cort_objects_pk PRIMARY KEY (object_owner, object_name, object_type, exec_time)
-    USING INDEX COMPRESS
-)
-;
+CREATE TABLE cort_thread_sql(
+  object_owner        VARCHAR2(128)    NOT NULL,
+  object_name         VARCHAR2(128)    NOT NULL,
+  thread_id           NUMBER           NOT NULL,
+  status              VARCHAR2(30)     NOT NULL,
+  sql_text            CLOB             NOT NULL,
+  start_time          TIMESTAMP,
+  end_time            TIMESTAMP,
+  job_name            VARCHAR2(128),
+  error_msg           VARCHAR2(1000),
+  constraint cort_thread_sql_status_chk check (status in ('REGISTERED','RUNNING','FAILED','COMPLETED')),
+  constraint cort_thread_sql_pk primary key(object_owner, object_name, thread_id)
+);
 
-CREATE INDEX cort_objects_release_idx ON cort_objects(application, release, object_name); 
 

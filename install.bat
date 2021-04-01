@@ -1,10 +1,9 @@
 @echo off
-
-
+REM   
 REM   CORT - Oracle database DevOps tool
-REM 
+REM   
 REM   Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
-REM 
+REM   
 REM   www.cort.tech
 REM   master@cort.tech
 REM 
@@ -21,35 +20,11 @@ REM
 REM   You should have received a copy of the GNU General Public License
 REM   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-ECHO Required privileges:
-ECHO   CREATE SESSION, CREATE TABLE, CREATE INDEX, CREATE PROCEDURE, CREATE TRIGGER, CREATE TYPE, CREATE VIEW, CREATE JOB
-ECHO   EXECUTE ON SYS.DBMS_LOB, SYS.DBMS_LOCK, SYS.DBMS_SESSION, SYS.DBMS_SQL, SYS.DBML_RLS
-ECHO   SELECT ON SYS.V_$PARAMETER, SYS.GV_SESSION
-ECHO Optional privileges: 
-ECHO   SELECT ON GV_$SQLTEXT_WITH_NEWLINES (for explain plan support)
-ECHO   SELECT ON DBA_OBJECTS, DBA_SEGMENTS, DBA_CLU_COLUMNS (for creating lobs/cluster tables in different schema) 
+set connection_string=cort/cort@orcl
 
-for /D %%I in (%0%) do (
-  set root_path=%%~dpI
-)
+cd source
 
-SET default_instance=orcl
-SET default_schema=cort_git
-
-SET db_inst=%default_instance%
-SET cort_user=%default_schema%
-
-ECHO Enter Database service/instance name
-SET /P db_inst="[%default_instance%] > "
-
-ECHO Enter user for CORT schema
-SET /P cort_user="[%default_schema%] > " 
-
-ECHO Connecting as %cort_user% ...
-
-cd "%root_path%Source
-
-sqlplus %cort_user%@%db_inst% @master_install.sql
+sqlplus %connection_string% @master_install.sql
 
 echo.
 echo.

@@ -96,6 +96,11 @@ PROMPT
 @@cort_thread_job_pkg.pks
 @@cort_thread_exec_pkg.pks
 
+-- Views
+@@views/cort_recent_objects.sql
+@@views/cort_recent_jobs.sql
+@@views/cort_user_params.sql
+
 -- Type bodies
 @@cort_param_obj.tpb
 
@@ -115,9 +120,6 @@ PROMPT
 @@cort_thread_job_pkg.pkb
 @@cort_thread_exec_pkg.pkb
 
--- Views
-@@cort_recent_objects.sql
-@@cort_recent_jobs.sql
 
 -- Triggers
 @@cort_create_trg.trg
@@ -125,6 +127,7 @@ PROMPT
 @@cort_lock_object_trg.trg
 @@cort_before_xplan_trg.trg
 
+grant execute on cort_pkg to public;
 
 SPOOL OFF
 

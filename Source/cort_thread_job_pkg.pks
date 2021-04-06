@@ -1,3 +1,6 @@
+CREATE OR REPLACE PACKAGE cort_thread_job_pkg 
+AS
+
 /*
 CORT - Oracle database DevOps tool
 
@@ -21,39 +24,59 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 /*
-  Description: Script for cort_applications table
+  Description: job execution API
   ----------------------------------------------------------------------------------------------------------------------     
   Release | Author(s)         | Comments
   ----------------------------------------------------------------------------------------------------------------------  
-  19.00   | Rustam Kafarov    | Configuration table for storing application names.  
+  18.00   | Rustam Kafarov    | Added API for creating threading jobs 
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
+  TYPE gt_thread_rec IS RECORD (
+    thread_id           NUMBER,
+    thread_rowid        ROWID,
+    sql_text            CLOB
+  );
+  
+  -- bulk register threads
+  PROCEDURE register_threads(
+    in_stmt_arr     IN arrays.gt_clob_arr
+  );
 
----- TABLE CORT_APPLICATIONS ----
+  FUNCTION get_next_thread(
+    in_object_owner IN VARCHAR2,
+    in_object_name  IN VARCHAR2,
+    in_job_name     IN VARCHAR2
+  )
+  RETURN gt_thread_rec;
+  
+  PROCEDURE complete_sql(
+    in_rowid    IN ROWID
+  );  
 
-BEGIN
-  FOR X IN (SELECT * FROM user_tables WHERE table_name = 'CORT_APPLICATIONS') LOOP
-    EXECUTE IMMEDIATE 'DROP TABLE '||x.table_name||' CASCADE CONSTRAINT';
-  END LOOP;
-END;
-/  
+  PROCEDURE fail_sql(
+    in_rowid     IN ROWID,
+    in_error_msg IN VARCHAR2
+  );
 
-CREATE TABLE cort_applications(
-  application                    VARCHAR2(20)  NOT NULL,
-  release_regexp                 VARCHAR2(100),
-  application_name               VARCHAR2(250),
-  CONSTRAINT cort_applications_pk
-    PRIMARY KEY (application)
-)
-ORGANIZATION INDEX
-;
+  FUNCTION get_max_job_number
+  RETURN NUMBER;
+  
+  FUNCTION get_thread_count(
+    in_object_owner IN VARCHAR2,
+    in_object_name  IN VARCHAR2
+  )
+  RETURN NUMBER;
 
+  PROCEDURE reset_failed_threads(
+    in_object_owner IN VARCHAR2,
+    in_object_name  IN VARCHAR2
+  );
 
-BEGIN
-  INSERT INTO cort_applications VALUES('DEFAULT', '.*', 'DEFAULT');
-EXCEPTION
-  WHEN DUP_VAL_ON_INDEX THEN
-    NULL;  
-END;
-/  
+  PROCEDURE check_failed_threads(
+    in_object_owner IN VARCHAR2,
+    in_object_name  IN VARCHAR2
+  );
+
+END cort_thread_job_pkg;
+/

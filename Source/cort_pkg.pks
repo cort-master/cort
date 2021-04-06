@@ -159,6 +159,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_system_columns  IN arrays.gt_str_tab DEFAULT NULL
   );
 
+  -- Return DDL with /*# OR REPLACE */ hint for existing table
   FUNCTION get_cort_ddl(
     in_table_name          IN VARCHAR2, 
     in_table_owner         IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
@@ -169,6 +170,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_size_byte_keyword   IN BOOLEAN DEFAULT FALSE
   )
   RETURN CLOB;
+  
+  -- Self installation API
 
+  -- drop CORT triggers
+  PROCEDURE drop_cort_triggers;
+
+  -- create CORT triggers
+  PROCEDURE create_cort_triggers;
+  
+  -- install cort synonyms, triggers, grants into separate schema 
+  PROCEDURE install;
+  
+  -- deinstall cort synonyms, triggers, grants from separate schema 
+  PROCEDURE deinstall;
+  
 END cort_pkg;
 /

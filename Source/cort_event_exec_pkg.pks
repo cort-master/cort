@@ -33,6 +33,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
+  -- returns object last modification date
+  FUNCTION get_object_last_ddl_time(
+    in_object_type  IN VARCHAR2,
+    in_object_name  IN VARCHAR2,
+    in_object_owner IN VARCHAR2
+  )
+  RETURN DATE;
+
+  FUNCTION is_object_modified(
+    in_object_type  IN VARCHAR2,
+    in_object_name  IN VARCHAR2,
+    in_object_owner IN VARCHAR2,
+    in_sql_text     IN CLOB
+  )
+  RETURN BOOLEAN;
+
   -- Run infinit loop until dbms_scheduler job is done
   PROCEDURE wait_for_job_end(
     in_rec IN cort_jobs%ROWTYPE

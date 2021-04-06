@@ -716,7 +716,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   RETURN PLS_INTEGER
   AS
   BEGIN
-    IF in_source_table_rec.partitioning_type = in_target_table_rec.partitioning_type THEN
+    CASE 
+    WHEN in_source_table_rec.partitioning_type = in_target_table_rec.partitioning_type THEN
       CASE in_source_table_rec.partitioning_type
       WHEN 'SYSTEM' THEN
         RETURN 0;
@@ -734,9 +735,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                  in_check_position    => in_check_position
                );
       END CASE;
+    WHEN in_source_table_rec.partitioning_type IS NULL AND in_target_table_rec.partitioning_type IS NULL THEN
+      RETURN 0; 
     ELSE
       RETURN 1;
-    END IF;
+    END CASE;
   END comp_partitioning;
 
   -- Returns 1 if same partitiong used, for same columns/ref_constraint and partitions could be preserved. Otherwise returns 0
@@ -748,7 +751,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   RETURN PLS_INTEGER
   AS
   BEGIN
-    IF in_source_table_rec.subpartitioning_type = in_target_table_rec.subpartitioning_type THEN
+    CASE 
+    WHEN in_source_table_rec.subpartitioning_type IS NULL AND in_target_table_rec.subpartitioning_type IS NULL THEN 
+      RETURN 0;
+    WHEN in_source_table_rec.subpartitioning_type = 'NONE' AND in_target_table_rec.subpartitioning_type = 'NONE' THEN 
+      RETURN 0;
+    WHEN in_source_table_rec.subpartitioning_type = in_target_table_rec.subpartitioning_type THEN
       RETURN comp_column_arr(
                in_source_table_rec  => in_source_table_rec,
                in_target_table_rec  => in_target_table_rec,
@@ -758,7 +766,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
              );
     ELSE
       RETURN 1;
-    END IF;
+    END CASE;
   END comp_subpartitioning;
 
   FUNCTION get_partitioning_option
@@ -3577,12 +3585,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     THEN
       -- get the first new column
       debug('Index of adding new column : '||l_add_column_arr.FIRST||'  Segment ID of first new column : '||l_add_column_arr(l_add_column_arr.FIRST));
-      debug('Segment ID of last source column : '||l_source_segment_col_arr(l_source_segment_col_arr.LAST));
+      IF l_source_segment_col_arr.LAST IS NOT NULL THEN 
+        debug('Segment ID of last source column : '||l_source_segment_col_arr(l_source_segment_col_arr.LAST));
+      ELSE
+        debug('Segment ID of last source column : 0');
+      END IF;  
       -- if not found then all new columns were added to the end and ALTER change is available
       -- OR
       -- ignore columns order option is enabled
       -- otherwise need to recreate
-      IF l_add_column_arr(l_add_column_arr.FIRST) > l_source_segment_col_arr(l_source_segment_col_arr.LAST) OR cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER')
+      IF l_source_segment_col_arr.COUNT > 0 AND l_add_column_arr(l_add_column_arr.FIRST) > l_source_segment_col_arr(l_source_segment_col_arr.LAST) OR cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER')
       THEN
         l_segment_result := gc_result_alter;
       ELSE

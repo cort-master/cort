@@ -51,6 +51,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   END output;
 
 
+  -- returns object last modification date
   FUNCTION get_object_last_ddl_time(
     in_object_type  IN VARCHAR2,
     in_object_name  IN VARCHAR2,
@@ -399,7 +400,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_job_owner           arrays.gt_name;
   BEGIN
     l_sid := dbms_session.unique_session_id;
-    l_job_owner := SYS_CONTEXT('USERENV','CURRENT_USER');
+    l_job_owner  := SYS_CONTEXT('USERENV','CURRENT_USER');
 
     l_rec := cort_job_pkg.register_job(
                in_sid            => l_sid,
@@ -503,6 +504,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   AS
     PRAGMA AUTONOMOUS_TRANSACTION;
   BEGIN
+  dbms_output.put_line('in cort_event_pkg.instead_of_create: session_user = '||sys_context('userenv','session_user'));
+  dbms_output.put_line('in cort_event_pkg.instead_of_create: current_user = '||sys_context('userenv','current_user'));
+  dbms_output.put_line('in cort_event_pkg.instead_of_create: current_schema = '||sys_context('userenv','current_schema'));
+
     -- if test mode is enabled on session level
     IF cort_session_pkg.test OR
        -- or object has been changed

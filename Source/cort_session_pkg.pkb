@@ -49,8 +49,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     SELECT param_name, default_value
       BULK COLLECT 
       INTO l_param_arr, l_default_arr 
-      FROM cort_params
-     WHERE user_name = user;
+      FROM cort_user_params;
      
     l_param_names_indx := cort_params_pkg.get_param_names_indx;
      

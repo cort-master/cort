@@ -135,30 +135,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     RETURN l_systime;
   END get_systimestamp;
 
-  FUNCTION get_object_last_ddl_time(
-    in_object_type  IN VARCHAR2,
-    in_object_name  IN VARCHAR2,
-    in_object_owner IN VARCHAR2
-  )
-  RETURN DATE
-  AS
-    l_last_ddl_time DATE;
-  BEGIN
-    BEGIN
-      SELECT last_ddl_time
-        INTO l_last_ddl_time 
-        FROM all_objects
-       WHERE owner = in_object_owner
-         AND object_name = in_object_name
-         AND object_type = in_object_type
-         AND subobject_name IS NULL;
-    EXCEPTION
-      WHEN NO_DATA_FOUND THEN
-        l_last_ddl_time := NULL;
-    END;
-    RETURN l_last_ddl_time;
-  END get_object_last_ddl_time;
-
   PROCEDURE reverse_array(
     io_array IN OUT NOCOPY arrays.gt_clob_arr
   )
@@ -311,6 +287,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_object_owner   IN VARCHAR2,
     in_job_rec        IN cort_jobs%ROWTYPE,
     in_sql            IN CLOB,
+    in_last_ddl_time  IN DATE,
     in_change_type    IN NUMBER,
     in_revert_name    IN VARCHAR2,
     in_last_ddl_index IN PLS_INTEGER,
@@ -324,7 +301,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_new_rec       cort_objects%ROWTYPE;
     l_xml           XMLType;
     l_change_type   VARCHAR2(30);
-    l_last_ddl_time TIMESTAMP WITH TIME ZONE;
   BEGIN
     l_change_type := cort_comp_pkg.get_result_name(in_change_type);
     
@@ -333,11 +309,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                    in_object_type  => in_object_type,
                    in_object_name  => in_object_name
                  );
-    l_last_ddl_time := get_object_last_ddl_time(
-                         in_object_type  => in_object_type,
-                         in_object_name  => in_object_name,
-                         in_object_owner => in_object_owner
-                       );
     IF in_change_type > cort_comp_pkg.gc_result_nochange OR -- actual change
        l_old_rec.object_name IS NULL -- no history for the object
     THEN
@@ -347,7 +318,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       l_new_rec.sid := in_job_rec.sid;
       l_new_rec.exec_time := get_systimestamp;
       l_new_rec.sql_text := in_sql; 
-      l_new_rec.last_ddl_time := greatest(systimestamp, l_last_ddl_time); 
+      l_new_rec.last_ddl_time := GREATEST(SYSTIMESTAMP, in_last_ddl_time); 
       l_new_rec.change_type := l_change_type;
       l_new_rec.application := in_job_rec.application;
       l_new_rec.release := in_job_rec.release;
@@ -382,7 +353,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       -- just update sql text
       l_old_rec.sql_text := in_sql; 
       l_old_rec.sid := dbms_session.unique_session_id;
-      l_old_rec.last_ddl_time := GREATEST(SYSTIMESTAMP, l_last_ddl_time); 
+      l_old_rec.last_ddl_time := GREATEST(SYSTIMESTAMP, in_last_ddl_time); 
       l_old_rec.release := cort_pkg.get_current_release;  
       l_old_rec.build := SUBSTR(SYS_CONTEXT('USERENV','CLIENT_INFO'), 12); 
       update_change(l_old_rec);
@@ -409,38 +380,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     COMMIT;
   END unregister_change;
 
-  -- Check if executed SQL and objects's last_ddl_time match to the last registered corresponded parameters 
-  FUNCTION is_object_modified(
-    in_object_type  IN VARCHAR2,
-    in_object_name  IN VARCHAR2,
-    in_object_owner IN VARCHAR2,
-    in_sql_text     IN CLOB
-  )
-  RETURN BOOLEAN
-  AS
-    l_rec           cort_objects%ROWTYPE;
-    l_result        BOOLEAN;
-  BEGIN
-    l_result := TRUE;
-    l_rec := get_last_change(
-               in_object_owner => in_object_owner,
-               in_object_type  => in_object_type,
-               in_object_name  => in_object_name
-             );
-    IF l_rec.sql_text = in_sql_text THEN
-      IF l_rec.last_ddl_time = get_object_last_ddl_time(
-                                  in_object_owner => in_object_owner, 
-                                  in_object_name  => in_object_name,
-                                  in_object_type  => in_object_type      
-                                ) 
-      THEN
-        update_change(l_rec);
-        l_result := FALSE;
-      END IF;
-    END IF;
-    RETURN l_result;
-  END is_object_modified;
-  
   -- Check if objects was renamed in given release  
   FUNCTION is_object_renamed(
     in_object_type  IN VARCHAR2,
@@ -776,6 +715,80 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     COMMIT;
   END update_build;
 
+
+  PROCEDURE obtain_grants(in_user_name in VARCHAR2)
+  AS
+    l_sql                varchar2(4000);
+    l_cort_objects_arr   arrays.gt_name_arr;
+    l_object_type_arr    arrays.gt_str_arr;
+  BEGIN
+    SELECT object_name, object_type
+      BULK COLLECT
+      INTO l_cort_objects_arr, l_object_type_arr
+      FROM (SELECT DISTINCT object_name, object_type
+              FROM user_procedures
+             WHERE object_name like 'CORT%'
+              -- AND authid = 'CURRENT_USER'
+               AND object_type = 'PACKAGE'
+             UNION ALL
+            SELECT DISTINCT object_name, object_type
+              FROM user_objects
+             WHERE object_name like 'CORT%'
+               AND object_type IN ('TABLE','VIEW')
+               AND object_name IN (
+                'CORT_OBJECTS',
+                'CORT_JOBS',
+                'CORT_JOB_LOG',
+                'CORT_LOG',
+                'CORT_APPLICATIONS',
+                'CORT_RELEASES',
+                'CORT_BUILDS',
+                'CORT_RECENT_JOBS',
+                'CORT_RECENT_OBJECTS',
+                'CORT_USER_PARAMS'
+              )
+            );
+
+    FOR i IN 1..l_cort_objects_arr.COUNT LOOP
+      IF l_object_type_arr(i) = 'PACKAGE' THEN     
+        l_sql := 'GRANT EXECUTE ON '||l_cort_objects_arr(i)||' TO "'||in_user_name||'"';
+      ELSIF l_cort_objects_arr(i) in ('CORT_APPLICATIONS', 'CORT_RELEASES', 'CORT_BUILDS', 'CORT_USER_PARAMS') THEN
+        l_sql := 'GRANT SELECT, INSERT, UPDATE, DELETE ON '||l_cort_objects_arr(i)||' TO "'||in_user_name||'"';
+      ELSE
+        l_sql := 'GRANT SELECT ON '||l_cort_objects_arr(i)||' TO "'||in_user_name||'"';
+      END IF;  
+      dbms_output.put_line(l_sql);
+      execute immediate l_sql;
+    END LOOP;
+
+    
+  END obtain_grants;
+
+  -- revoke all grants on cort objects
+  PROCEDURE revoke_grants(in_user_name in VARCHAR2)
+  AS
+    l_sql                varchar2(4000);
+  BEGIN
+    FOR x IN (SELECT *
+                FROM user_tab_privs
+               WHERE owner = SYS_CONTEXT('userenv', 'current_user')
+                 AND table_name like 'CORT%'
+                 AND grantee = in_user_name
+                 AND grantor = SYS_CONTEXT('userenv', 'current_user')
+                 AND table_name NOT IN ('CORT_AUX_PKG', 'CORT_PKG')
+             ) 
+    LOOP 
+      l_sql := 'REVOKE '||x.privilege||' ON "'||x.owner||'".'||x.table_name||' FROM '||x.grantee; 
+      dbms_output.put_line(l_sql);
+      execute immediate l_sql;
+    END LOOP;
+  END;
+
+  FUNCTION get_cort_schema RETURN VARCHAR2
+  AS
+  BEGIN
+    RETURN SYS_CONTEXT('userenv', 'current_user');
+  END;
 
 END cort_aux_pkg;
 /

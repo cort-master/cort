@@ -18,42 +18,24 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
 
-/*
-  Description: Script for cort_applications table
+  Description: View returning latest version of cort_job for each object 
   ----------------------------------------------------------------------------------------------------------------------     
   Release | Author(s)         | Comments
   ----------------------------------------------------------------------------------------------------------------------  
-  19.00   | Rustam Kafarov    | Configuration table for storing application names.  
+  17.00   | Rustam Kafarov    | Created view
   ----------------------------------------------------------------------------------------------------------------------  
 */
-
-
----- TABLE CORT_APPLICATIONS ----
-
-BEGIN
-  FOR X IN (SELECT * FROM user_tables WHERE table_name = 'CORT_APPLICATIONS') LOOP
-    EXECUTE IMMEDIATE 'DROP TABLE '||x.table_name||' CASCADE CONSTRAINT';
-  END LOOP;
-END;
-/  
-
-CREATE TABLE cort_applications(
-  application                    VARCHAR2(20)  NOT NULL,
-  release_regexp                 VARCHAR2(100),
-  application_name               VARCHAR2(250),
-  CONSTRAINT cort_applications_pk
-    PRIMARY KEY (application)
-)
-ORGANIZATION INDEX
-;
-
-
-BEGIN
-  INSERT INTO cort_applications VALUES('DEFAULT', '.*', 'DEFAULT');
-EXCEPTION
-  WHEN DUP_VAL_ON_INDEX THEN
-    NULL;  
-END;
-/  
+CREATE OR REPLACE VIEW cort_recent_jobs
+AS
+SELECT sid, action, status, object_type, object_owner, object_name, job_owner, job_name, job_time, job_sid, sql_text, new_name, current_schema, application, release, build, session_params, object_params, output, run_time, parent_object_type, parent_object_owner, parent_object_name, resume_action, session_id, username, osuser, machine, terminal, module, error_code, error_message, error_backtrace, error_stack, call_stack
+  FROM (SELECT j.*,
+               MAX(decode(job_time, last_job, substr(sid, 1, 12))) OVER(PARTITION BY object_owner, object_name, object_type) as last_sid
+          FROM (SELECT j.*,
+                       MAX(job_time) OVER (PARTITION BY object_owner, object_name, object_type) AS last_job
+                  FROM cort_jobs j
+                 WHERE job_owner = USER
+               ) j
+       )        
+ WHERE substr(sid, 1, 12) = last_sid; 
+  

@@ -18,42 +18,18 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
 
-/*
-  Description: Script for cort_applications table
+  Description: View returning latest version for cort_objects and details of job applied them
   ----------------------------------------------------------------------------------------------------------------------     
   Release | Author(s)         | Comments
   ----------------------------------------------------------------------------------------------------------------------  
-  19.00   | Rustam Kafarov    | Configuration table for storing application names.  
+  20.00   | Rustam Kafarov    | Created view with restricted by user_name access
   ----------------------------------------------------------------------------------------------------------------------  
 */
-
-
----- TABLE CORT_APPLICATIONS ----
-
-BEGIN
-  FOR X IN (SELECT * FROM user_tables WHERE table_name = 'CORT_APPLICATIONS') LOOP
-    EXECUTE IMMEDIATE 'DROP TABLE '||x.table_name||' CASCADE CONSTRAINT';
-  END LOOP;
-END;
-/  
-
-CREATE TABLE cort_applications(
-  application                    VARCHAR2(20)  NOT NULL,
-  release_regexp                 VARCHAR2(100),
-  application_name               VARCHAR2(250),
-  CONSTRAINT cort_applications_pk
-    PRIMARY KEY (application)
-)
-ORGANIZATION INDEX
-;
-
-
-BEGIN
-  INSERT INTO cort_applications VALUES('DEFAULT', '.*', 'DEFAULT');
-EXCEPTION
-  WHEN DUP_VAL_ON_INDEX THEN
-    NULL;  
-END;
-/  
+CREATE OR REPLACE VIEW cort_user_params
+AS 
+SELECT * 
+  FROM cort_params
+ WHERE user_name = USER
+  WITH CHECK OPTION
+ ;

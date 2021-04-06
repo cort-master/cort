@@ -3031,14 +3031,31 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_enable         IN BOOLEAN DEFAULT TRUE
   )
   AS
+    l_sql VARCHAR2(1000); 
   BEGIN
     FOR i IN 1..in_policy_arr.COUNT LOOP
-      dbms_rls.enable_policy(
-        object_schema => in_policy_arr(i).object_owner,
-        object_name   => in_policy_arr(i).object_name,
-        policy_name   => in_policy_arr(i).policy_name,
-        enable        => in_enable
-      );
+      IF in_enable THEN 
+        l_sql := '
+begin
+  dbms_rls.enable_policy(
+    object_schema => :in_object_owner,
+    object_name   => :in_object_name,
+    policy_name   => :in_policy_name,
+    enable        => TRUE
+  );
+end;';     
+      ELSE
+        l_sql := '
+begin
+  dbms_rls.enable_policy(
+    object_schema => :in_object_owner,
+    object_name   => :in_object_name,
+    policy_name   => :in_policy_name,
+    enable        => FALSE
+  );
+end;';
+     END IF;
+     EXECUTE IMMEDIATE l_sql USING in_policy_arr(i).object_owner, in_policy_arr(i).object_name,in_policy_arr(i).policy_name;    
     END LOOP;
   END enable_policies;
 
@@ -3897,7 +3914,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END LOOP;
   END change_status_for_all_fk;
 
-PROCEDURE change_status_for_policies(
+  PROCEDURE change_status_for_policies(
     in_table_rec     IN gt_table_rec,
     in_action        IN VARCHAR2,  -- DISABLE/ENABLE
     io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
@@ -5152,6 +5169,11 @@ end;';
           in_object_type    => 'TRIGGER',
           in_job_rec        => in_job_rec,
           in_sql            => NULL,
+          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                 in_object_owner   => io_source_table_rec.trigger_arr(i).owner,
+                                 in_object_name    => io_source_table_rec.trigger_arr(i).trigger_name,
+                                 in_object_type    => 'TRIGGER'
+                               ),
           in_change_type    => cort_comp_pkg.gc_result_recreate,
           in_revert_name    => NULL,
           in_last_ddl_index => NULL,
@@ -6335,6 +6357,11 @@ end;';
                 in_object_name    => in_job_rec.object_name,
                 in_job_rec        => in_job_rec,
                 in_sql            => in_job_rec.sql_text,
+                in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                       in_object_owner   => in_job_rec.object_owner,
+                                       in_object_name    => in_job_rec.object_name,
+                                       in_object_type    => in_job_rec.object_type
+                                     ),
                 in_change_type    => l_result,
                 in_revert_name    => NULL,
                 in_last_ddl_index => l_frwd_alter_stmt_arr.COUNT,
@@ -6405,6 +6432,11 @@ end;';
                 in_object_name    => in_job_rec.object_name,
                 in_job_rec        => in_job_rec,
                 in_sql            => in_job_rec.sql_text,
+                in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                       in_object_owner   => in_job_rec.object_owner,
+                                       in_object_name    => in_job_rec.object_name,
+                                       in_object_type    => in_job_rec.object_type
+                                     ),
                 in_change_type    => l_result,
                 in_revert_name    => l_revert_name,
                 in_last_ddl_index => l_last_ddl_index,
@@ -6497,6 +6529,11 @@ end;';
             in_object_name    => in_job_rec.object_name,
             in_job_rec        => in_job_rec,
             in_sql            => in_job_rec.sql_text,
+            in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                   in_object_owner   => in_job_rec.object_owner,
+                                   in_object_name    => in_job_rec.object_name,
+                                   in_object_type    => in_job_rec.object_type
+                                 ),
             in_change_type    => case when io_sql_rec.as_select_flag then cort_comp_pkg.gc_result_create_as_select else cort_comp_pkg.gc_result_create end,
             in_revert_name    => NULL,
             in_last_ddl_index => l_create_ddl_arr.COUNT,
@@ -6685,6 +6722,11 @@ end;';
           in_object_name    => in_job_rec.object_name,
           in_job_rec        => in_job_rec,
           in_sql            => in_job_rec.sql_text,
+          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                 in_object_owner   => in_job_rec.object_owner,
+                                 in_object_name    => in_job_rec.object_name,
+                                 in_object_type    => in_job_rec.object_type
+                               ),
           in_change_type    => l_result,
           in_revert_name    => NULL,
           in_last_ddl_index => NULL,
@@ -6724,6 +6766,11 @@ end;';
           in_object_name    => in_job_rec.object_name,
           in_job_rec        => in_job_rec,
           in_sql            => in_job_rec.sql_text,
+          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                 in_object_owner   => in_job_rec.object_owner,
+                                 in_object_name    => in_job_rec.object_name,
+                                 in_object_type    => in_job_rec.object_type
+                               ),
           in_change_type    => cort_comp_pkg.gc_result_create,
           in_revert_name    => NULL,
           in_last_ddl_index => NULL,
@@ -6949,6 +6996,11 @@ end;';
           in_object_name    => in_job_rec.object_name,
           in_job_rec        => in_job_rec,
           in_sql            => in_job_rec.sql_text,
+          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                 in_object_owner   => in_job_rec.object_owner,
+                                 in_object_name    => in_job_rec.object_name,
+                                 in_object_type    => in_job_rec.object_type
+                               ),
           in_change_type    => l_result,
           in_revert_name    => NULL,
           in_last_ddl_index => NULL,
@@ -6989,6 +7041,11 @@ end;';
           in_object_name    => in_job_rec.object_name,
           in_job_rec        => in_job_rec,
           in_sql            => in_job_rec.sql_text,
+          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                 in_object_owner   => in_job_rec.object_owner,
+                                 in_object_name    => in_job_rec.object_name,
+                                 in_object_type    => in_job_rec.object_type
+                               ),
           in_change_type    => cort_comp_pkg.gc_result_create,
           in_revert_name    => NULL,
           in_last_ddl_index => NULL,
@@ -7172,6 +7229,11 @@ end;';
       in_object_type    => in_job_rec.object_type,
       in_job_rec        => in_job_rec,
       in_sql            => in_job_rec.sql_text,
+      in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                             in_object_owner   => in_job_rec.object_owner,
+                             in_object_name    => in_job_rec.object_name,
+                             in_object_type    => in_job_rec.object_type
+                           ),
       in_change_type    => l_change_type,
       in_revert_name    => NULL,
       in_last_ddl_index => NULL,
@@ -7229,17 +7291,22 @@ end;';
 
       IF NOT g_params.test.get_bool_value THEN
         cort_aux_pkg.register_change(
-          in_object_owner    => in_job_rec.object_owner,
-          in_object_name     => in_job_rec.object_name,
-          in_object_type     => in_job_rec.object_type,
-          in_job_rec         => in_job_rec,
-          in_sql             => in_job_rec.sql_text,
-          in_change_type     => cort_comp_pkg.gc_result_rename,
-          in_revert_name     => NULL,
-          in_last_ddl_index  => NULL,
-          in_rename_name     => in_job_rec.new_name,
-          in_frwd_stmt_arr   => l_frwd_stmt_arr,
-          in_rlbk_stmt_arr   => l_rlbk_stmt_arr
+          in_object_owner   => in_job_rec.object_owner,
+          in_object_name    => in_job_rec.object_name,
+          in_object_type    => in_job_rec.object_type,
+          in_job_rec        => in_job_rec,
+          in_sql            => in_job_rec.sql_text,
+          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                 in_object_owner   => in_job_rec.object_owner,
+                                 in_object_name    => in_job_rec.object_name,
+                                 in_object_type    => in_job_rec.object_type
+                               ),
+          in_change_type    => cort_comp_pkg.gc_result_rename,
+          in_revert_name    => NULL,
+          in_last_ddl_index => NULL,
+          in_rename_name    => in_job_rec.new_name,
+          in_frwd_stmt_arr  => l_frwd_stmt_arr,
+          in_rlbk_stmt_arr  => l_rlbk_stmt_arr
         );
       END IF;
     END IF;

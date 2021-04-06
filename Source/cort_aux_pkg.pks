@@ -57,15 +57,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     out_clob    OUT NOCOPY CLOB
   );
 
-  -- Check if executed SQL and objects's last_ddl_time match to the last registered corresponded parameters 
-  FUNCTION is_object_modified(
-    in_object_type  IN VARCHAR2,
-    in_object_name  IN VARCHAR2,
-    in_object_owner IN VARCHAR2,
-    in_sql_text     IN CLOB
-  )
-  RETURN BOOLEAN;
-
   -- Check if objects was renamed in given release  
   FUNCTION is_object_renamed(
     in_object_type  IN VARCHAR2,
@@ -119,6 +110,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_object_owner   IN VARCHAR2,
     in_job_rec        IN cort_jobs%ROWTYPE,
     in_sql            IN CLOB,
+    in_last_ddl_time  IN DATE,
     in_change_type    IN NUMBER,
     in_revert_name    IN VARCHAR2,
     in_last_ddl_index IN PLS_INTEGER,
@@ -212,5 +204,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_row IN cort_builds%ROWTYPE
   );
 
+  -- grant all required privileges to an user
+  PROCEDURE obtain_grants(in_user_name in VARCHAR2);
+
+  -- revoke all grants on cort objects
+  PROCEDURE revoke_grants(in_user_name in VARCHAR2);
+
+  -- return schema name where CORT is installed
+  FUNCTION get_cort_schema RETURN VARCHAR2;
+  
 END cort_aux_pkg;
 /

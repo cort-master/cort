@@ -828,5 +828,183 @@ END;';
   END get_cort_ddl;
     
 
+  PROCEDURE drop_cort_triggers
+  AS
+    l_sql VARCHAR2(4000);
+  BEGIN
+    FOR X IN (SELECT *
+                FROM user_triggers
+               WHERE trigger_name like 'CORT%'
+               ORDER BY trigger_name DESC) 
+    LOOP
+      l_sql := 'DROP TRIGGER '||x.trigger_name;
+      dbms_output.put_line(l_sql);
+      EXECUTE IMMEDIATE l_sql;
+    END LOOP;   
+  END drop_cort_triggers;
+
+  PROCEDURE create_cort_triggers
+  AS
+    l_sql VARCHAR2(4000);
+  BEGIN
+    drop_cort_triggers;
+
+    l_sql := q'{
+CREATE TRIGGER cort_create_trg INSTEAD OF CREATE ON SCHEMA
+WHEN (
+      (cort_trg_pkg.get_status = 'ENABLED') AND 
+      (ora_dict_obj_type IN ('TABLE','INDEX','SEQUENCE','TYPE')) AND
+      (ora_dict_obj_owner NOT IN ('SYS','SYSTEM')) AND
+      (cort_trg_pkg.get_execution_mode(ora_dict_obj_type) = 'REPLACE')
+     )
+BEGIN
+  dbms_output.put_line('in trigger: session_user = '||sys_context('userenv','session_user'));
+  dbms_output.put_line('in trigger: current_user = '||sys_context('userenv','current_user'));
+  dbms_output.put_line('in trigger: current_schema = '||sys_context('userenv','current_schema'));
+  cort_trg_pkg.instead_of_create;
+END;}';   
+    dbms_output.put_line(l_sql);
+    EXECUTE IMMEDIATE l_sql;
+   
+    l_sql := q'{
+CREATE OR REPLACE TRIGGER cort_before_create_trg BEFORE CREATE ON SCHEMA
+WHEN (
+      (cort_trg_pkg.get_status = 'ENABLED') AND 
+      (NVL(ora_dict_obj_owner,'?') NOT IN ('SYS','SYSTEM')) AND 
+      (ora_dict_obj_type IN ('PACKAGE','PACKAGE BODY','PROCEDURE','FUNCTION','TRIGGER','VIEW','SYNONYM','TYPE BODY','JAVA','CONTEXT','LIBRARY')) AND 
+      (cort_trg_pkg.get_execution_mode(in_object_type => ora_dict_obj_type) = 'REPLACE')
+     )
+BEGIN
+  cort_trg_pkg.before_create;
+END;}';   
+    dbms_output.put_line(l_sql);
+    EXECUTE IMMEDIATE l_sql;
+
+    l_sql := q'{
+CREATE OR REPLACE TRIGGER cort_lock_object_trg BEFORE DDL ON schema
+WHEN (
+      (cort_trg_pkg.get_status = 'ENABLED') AND 
+      (ora_dict_obj_type in ('TABLE','TYPE','SEQUENCE','INDEX')) AND
+      (ora_dict_obj_owner NOT IN ('SYS','SYSTEM')) 
+     )
+BEGIN
+  cort_trg_pkg.lock_object;
+END;}';  
+    dbms_output.put_line(l_sql);
+    EXECUTE IMMEDIATE l_sql;
+
+    l_sql := q'{
+CREATE OR REPLACE TRIGGER cort_lock_object_trg BEFORE DDL ON schema
+WHEN (
+      (cort_trg_pkg.get_status = 'ENABLED') AND 
+      (ora_dict_obj_type in ('TABLE','TYPE','SEQUENCE','INDEX')) AND
+      (ora_dict_obj_owner NOT IN ('SYS','SYSTEM')) 
+     )
+BEGIN
+  cort_trg_pkg.lock_object;
+END;}';  
+    dbms_output.put_line(l_sql);
+    EXECUTE IMMEDIATE l_sql;
+
+  EXCEPTION
+    WHEN OTHERS THEN
+      RAISE_APPLICATION_ERROR(-20000, 'CREATE TRIGGER privilege is required. '||sqlerrm);
+  END create_cort_triggers;
+
+  -- install cort synonyms, triggers, grants into separate schema 
+  PROCEDURE install
+  AS
+    l_sql               VARCHAR2(4000);
+    l_cort_objects_arr  arrays.gt_name_arr;
+    l_cort_schema       arrays.gt_name := cort_aux_pkg.get_cort_schema;
+    l_cnt               NUMBER;
+  BEGIN
+    IF user <> l_cort_schema THEN  
+      SELECT count(*)
+        INTO l_cnt
+        FROM user_sys_privs
+       WHERE privilege in ('CREATE TRIGGER', 'CREATE ANY TRIGGER');
+      
+      IF l_cnt = 0 THEN
+        RAISE_APPLICATION_ERROR(-20000,'CREATE TRIGGER privilege is require');
+      END IF;
+      
+      SELECT count(*)
+        INTO l_cnt
+        FROM user_sys_privs
+       WHERE privilege in ('CREATE JOB', 'CREATE ANY JOB');
+      
+      IF l_cnt = 0 THEN
+        RAISE_APPLICATION_ERROR(-20000,'CREATE JOB privilege is require');
+      END IF;
+
+      SELECT count(*)
+        INTO l_cnt
+        FROM user_sys_privs
+       WHERE privilege in ('CREATE SYNONYM', 'CREATE ANY SYNONYM');
+      
+      IF l_cnt = 0 THEN
+        RAISE_APPLICATION_ERROR(-20000,'CREATE SYNONYM privilege is require');
+      END IF;
+      
+      cort_aux_pkg.obtain_grants(sys_context('userenv','current_user'));
+      SELECT object_name
+        BULK COLLECT
+        INTO l_cort_objects_arr
+        FROM (SELECT DISTINCT object_name
+                FROM all_procedures
+               WHERE object_name like 'CORT%'
+                 AND owner = l_cort_schema
+                 AND object_type = 'PACKAGE'
+               UNION ALL
+              SELECT DISTINCT object_name
+                FROM all_objects
+               WHERE object_name like 'CORT%'
+                 AND owner = l_cort_schema
+                 AND object_type IN ('TABLE','VIEW')
+                 AND object_name IN (
+                    'CORT_OBJECTS',
+                    'CORT_JOBS',
+                    'CORT_JOB_LOG',
+                    'CORT_LOG',
+                    'CORT_RELEASES',
+                    'CORT_BUILDS',
+                    'CORT_RECENT_JOBS',
+                    'CORT_RECENT_OBJECTS',
+                    'CORT_USER_PARAMS'
+                  )
+                ); 
+
+      FOR i IN 1..l_cort_objects_arr.COUNT LOOP
+        l_sql := 'CREATE OR REPLACE SYNONYM '||l_cort_objects_arr(i)||' FOR "'||l_cort_schema||'".'||l_cort_objects_arr(i);
+        dbms_output.put_line(l_sql);
+        EXECUTE IMMEDIATE l_sql;
+      END LOOP;
+      drop_cort_triggers;
+      create_cort_triggers;
+    END IF;   
+  END install;
+  
+  -- deinstall cort synonyms, triggers, grants from separate schema 
+  PROCEDURE deinstall
+  AS
+    l_cort_schema       arrays.gt_name := cort_aux_pkg.get_cort_schema;
+    l_sql               VARCHAR2(1000);
+  BEGIN
+    IF user <> l_cort_schema THEN  
+      drop_cort_triggers;
+      FOR x IN (SELECT * 
+                  FROM user_synonyms 
+                 WHERE synonym_name like 'CORT%'
+               ) 
+      LOOP
+        l_sql := 'DROP SYNONYM '||x.synonym_name;
+        dbms_output.put_line(l_sql);
+        EXECUTE IMMEDIATE l_sql;
+      END LOOP;
+      cort_aux_pkg.revoke_grants(sys_context('userenv','current_user'));
+    END IF;   
+  END deinstall;
+
 END cort_pkg;
 /

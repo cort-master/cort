@@ -1,7 +1,7 @@
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -42,7 +42,7 @@ END;
 
 CREATE TABLE cort_builds(
   application                    VARCHAR2(20)  NOT NULL,
-  build                          VARCHAR2(20)  NOT NULL,
+  build                          VARCHAR2(30)  NOT NULL,  
   status                         VARCHAR2(10)  NOT NULL CHECK (status in ('RUNNING','STALE','COMPLETED','REVERTED','FAILED')),
   session_id                     VARCHAR2(30)  NOT NULL,
   release                        VARCHAR2(20),

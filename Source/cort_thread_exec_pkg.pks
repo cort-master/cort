@@ -5,7 +5,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -38,34 +38,39 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   gc_auto_threading CONSTANT PLS_INTEGER := 32766;
   gc_max_threading  CONSTANT PLS_INTEGER := 32767;
 
-  FUNCTION get_threading_value
-  RETURN NUMBER;
-  
-  PROCEDURE make_sql_threadable(
-    io_sql     IN OUT NOCOPY CLOB
-  );  
+  -- reset all global variables;
+  PROCEDURE reset_threading;
 
-  PROCEDURE add_threading_sql(
-    io_sql_arr IN OUT NOCOPY arrays.gt_clob_arr
+  -- init threading values
+  PROCEDURE init_threading(
+    in_data_source_rec  IN cort_exec_pkg.gt_data_source_rec,
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec
   );
 
-  PROCEDURE find_threading_statements(
-    in_frwd_alter_stmt_arr  IN arrays.gt_clob_arr,  -- forward alter statements
-    in_rlbk_alter_stmt_arr  IN arrays.gt_clob_arr,  -- rollback alter statements
-    out_frwd_alter_stmt_arr OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    out_rlbk_alter_stmt_arr OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  );
+  -- returns TRUE if submitted changes could be run in threads
+  FUNCTION is_threadable
+  RETURN BOOLEAN;
+
+  -- get number of thread we can run
+  FUNCTION get_thread_number
+  RETURN PLS_INTEGER;
+
+  -- returns value for parallel hint for DML taking into account threading numbers 
+  FUNCTION get_dml_parallel
+  RETURN VARCHAR2;
   
   -- Threading API
-  PROCEDURE prepare_for_threading;
 
-  PROCEDURE start_threading(
-    in_threading IN PLS_INTEGER
+  -- execute sql changes in threads
+  PROCEDURE apply_change(
+    io_change_arr   IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   );
 
-  PROCEDURE process_thread(
-     in_job_rec       IN cort_jobs%ROWTYPE
-  );  
+  -- Generic execution which is called from job
+  PROCEDURE execute_thread(
+    in_job_id IN TIMESTAMP
+  );
 
 END cort_thread_exec_pkg;
 /

@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -40,16 +40,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- Return job record 
   FUNCTION get_job_rec(
-    in_sid           IN VARCHAR2,
-    in_object_name   IN VARCHAR2,
-    in_object_owner  IN VARCHAR2
+    in_job_id        IN TIMESTAMP
   )
-  RETURN cort_jobs%ROWTYPE;
-
-  -- Return running job record and assign it to current session (set job_session_id) 
-  FUNCTION assign_job(
-    in_sid IN VARCHAR2
-  ) 
   RETURN cort_jobs%ROWTYPE;
 
   -- Find pending job for given object
@@ -66,39 +58,41 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   RETURN cort_jobs%ROWTYPE;
 
-  -- check if parent job session still keeps lock  
-  FUNCTION is_job_alive(
-    in_job_rec IN  cort_jobs%ROWTYPE
+  -- check if job session still keeps lock  
+  FUNCTION is_object_locked(
+    in_object_owner IN VARCHAR2,
+    in_object_name  IN VARCHAR2,
+    in_lock_type    IN VARCHAR2
   )
   RETURN BOOLEAN;
 
-  PROCEDURE check_sibling_jobs_alive(
-    in_job_rec IN  cort_jobs%ROWTYPE
-  );
-
   -- add record for given job.  
   FUNCTION register_job(
-    in_sid            IN VARCHAR2,
-    in_job_owner      IN VARCHAR2,
     in_action         IN VARCHAR2,
     in_object_type    IN VARCHAR2,
     in_object_name    IN VARCHAR2,
     in_object_owner   IN VARCHAR2,
     in_sql            IN CLOB,
     in_current_schema IN VARCHAR2,
-    in_params_rec     IN cort_params_pkg.gt_params_rec,
-    in_new_name       IN VARCHAR2 DEFAULT NULL,
-    in_resume_action  IN VARCHAR2 DEFAULT NULL
+    in_params_rec     IN cort_params_pkg.gt_run_params_rec,
+    in_new_name       IN VARCHAR2 DEFAULT NULL
   )  
   RETURN cort_jobs%ROWTYPE;
 
-  -- Create lock for starting job
-  PROCEDURE start_job(
-    in_rec           IN cort_jobs%ROWTYPE
-  );
+  -- Return REGISTERED job record and assign it to current session (set status = RUNNING)
+  FUNCTION run_job(
+    in_job_id        IN TIMESTAMP
+  )
+  RETURN cort_jobs%ROWTYPE;
+
+  -- resume pending job
+  FUNCTION resume_job(
+    in_job_rec        IN cort_jobs%ROWTYPE
+  )
+  RETURN cort_jobs%ROWTYPE;
 
   -- Finish job
-  PROCEDURE success_job(
+  PROCEDURE complete_job(
     in_rec IN cort_jobs%ROWTYPE
   );
   
@@ -119,18 +113,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_error_message   IN VARCHAR2
   );
 
-  -- Update info about parent object for given job 
-  PROCEDURE update_parent_obejct(
-    in_rec                 IN cort_jobs%ROWTYPE,
-    in_parent_object_type  IN VARCHAR2,
-    in_parent_object_owner IN VARCHAR2,
-    in_parent_object_name  IN VARCHAR2
-  );
-
-  -- Update object_params for given job 
-  PROCEDURE update_object_params(
+  -- Update change_params for given job 
+  PROCEDURE update_change_params(
     in_rec           IN cort_jobs%ROWTYPE,
-    in_object_params IN CLOB
+    in_change_params IN CLOB
   );
 
 END cort_job_pkg;

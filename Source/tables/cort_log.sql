@@ -1,7 +1,7 @@
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   ----------------------------------------------------------------------------------------------------------------------  
   19.00   | Rustam Kafarov    | table for logging all executed sql, debug echo and debug information 
   20.00   | Rustam Kafarov    | Added support of long names in Oracle 12.2 
+  21.00   | Rustam Kafarov    | Added log_type_attr - additional attributes working as bitmask 
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
@@ -42,14 +43,15 @@ END;
 
 CREATE TABLE cort_log(
   log_time        TIMESTAMP(9)    NOT NULL,
-  sid             VARCHAR2(30)    NOT NULL,
-  job_time        TIMESTAMP(6) WITH TIME ZONE,
+  job_id          TIMESTAMP(6),
   action          VARCHAR2(30),
   object_owner    VARCHAR2(128),
   object_name     VARCHAR2(128),
   log_type        VARCHAR2(100),
+  echo_flag       VARCHAR2(1), --Y/N
   text            VARCHAR2(4000),
   details         CLOB,
+  revert_ddl      CLOB,
   execution_time  INTERVAL DAY TO SECOND(9),
   call_stack      VARCHAR2(4000),
   error_message   VARCHAR2(4000),
@@ -60,4 +62,4 @@ PARTITION BY RANGE(log_time)
 ( PARTITION p_start VALUES LESS THAN (DATE'2019-01-01') )
 ;
 
-CREATE INDEX cort_log_idx ON cort_log(sid, object_owner, object_name, job_time) LOCAL;
+CREATE INDEX cort_log_idx ON cort_log(job_id) LOCAL;

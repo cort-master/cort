@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -34,6 +34,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
+  -- execute attributes
+  gc_execure constant pls_integer := 1; 
+  gc_echo    constant pls_integer := 2; 
+  gc_test    constant pls_integer := 4; 
 
   PROCEDURE init_log(
     in_job_rec  IN cort_jobs%ROWTYPE
@@ -43,31 +47,34 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   FUNCTION get_error_stack
   RETURN CLOB;
 
-  PROCEDURE log_job(
-    in_status   IN VARCHAR2,
-    in_job_rec  IN cort_jobs%ROWTYPE
-  );
-
   PROCEDURE execute(
-    in_text  IN CLOB
+    in_sql            IN CLOB,
+    in_echo           IN BOOLEAN
   );
 
   PROCEDURE update_exec_time;
 
 
   PROCEDURE test(
-    in_text  IN CLOB
-  );
-
-  PROCEDURE revert(
-    in_text  IN CLOB
+    in_ddl            IN CLOB,
+    in_revert_ddl     IN CLOB DEFAULT NULL
   );
 
   PROCEDURE echo(
     in_text      IN CLOB
   );
 
+  PROCEDURE echo_sql(
+    in_sql      IN CLOB
+  );
+
   PROCEDURE error(
+    in_text      IN VARCHAR2,
+    in_details   IN CLOB DEFAULT NULL,
+    in_echo      IN BOOLEAN DEFAULT TRUE
+  );
+
+  PROCEDURE warning(
     in_text      IN VARCHAR2,
     in_details   IN CLOB DEFAULT NULL
   );

@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -33,6 +33,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   15.00   | Rustam Kafarov    | Added alternative to CONTEXT using
   17.00   | Rustam Kafarov    | Added FOR REPLACE option for RENAME DDL. Removed hard references
   20.00   | Rustam Kafarov    | Added support of long names in Oracle 12.2 
+  21.00   | Rustam Kafarov    | Fixed regexp for single line comment 
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
@@ -51,7 +52,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_prfx := '#';
     l_create_expr := '^\s*CREATE\s*';
     l_regexp := '('||l_create_expr||'\/\*'||l_prfx||'\s*OR\s+REPLACE\W)|'||
-                '('||l_create_expr|| '--' ||l_prfx||'[ \t]*OR[ \t]*+REPLACE\W)';
+                '('||l_create_expr|| '--' ||l_prfx||'[ \t]*OR[ \t]+REPLACE\W)';
     RETURN REGEXP_INSTR(in_sql, l_regexp, 1, 1, 0, 'imn') = 1;
   END is_replace_mode;
 
@@ -116,7 +117,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   BEGIN
     l_ddl := ora_dict_ddl;
     CASE  
-    WHEN in_object_type IN ('TABLE', 'SEQUENCE', 'TYPE', 'INDEX') THEN 
+    WHEN in_object_type IN ('TABLE', 'SEQUENCE', 'TYPE', 'INDEX', 'TYPE BODY') THEN 
       IF is_replace_mode(l_ddl)  
       THEN
         l_result := 'REPLACE';

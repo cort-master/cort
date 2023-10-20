@@ -1,7 +1,7 @@
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   ----------------------------------------------------------------------------------------------------------------------  
   19.00   | Rustam Kafarov    | job control table for setting locks on running job instances
   20.00   | Rustam Kafarov    | Added support of long names in Oracle 12.2 
+  21.00   | Rustam Kafarov    | Change structure to spupport 2 way lock by object name 
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
@@ -42,9 +43,9 @@ END;
 
 
 CREATE TABLE cort_job_control(
-  object_type         VARCHAR2(30)    NOT NULL,
   object_owner        VARCHAR2(128)   NOT NULL,
   object_name         VARCHAR2(128)   NOT NULL,
-  sid                 VARCHAR2(30)    NOT NULL,
-  CONSTRAINT cort_job_control_pk PRIMARY KEY(object_type,object_owner,object_name,sid)  
+  lock_type           VARCHAR2(15)    NOT NULL CHECK(lock_type in ('CONTROL SESSION', 'JOB SESSION')), 
+  CONSTRAINT cort_job_control_pk PRIMARY KEY(object_owner, object_name, lock_type)
 );
+

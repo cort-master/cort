@@ -1,7 +1,7 @@
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   ----------------------------------------------------------------------------------------------------------------------  
   19.07   | Rustam Kafarov    | Simple full install script
   20.00   | Rustam Kafarov    | Added requirement info and spooling
+  22.00   | Rustam Kafarov    | Triggers moved into separate folder
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
@@ -34,6 +35,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 SET SERVEROUTPUT ON
 SET VERIFY OFF
 SET LINESIZE 400
+SET ECHO ON
 WHENEVER SQLERROR EXIT
 
 SPOOL install.log
@@ -41,18 +43,24 @@ SPOOL install.log
 PROMPT ..... CORT INSTALLATION .....
 PROMPT 
 PROMPT CORT main schema requires following privileges: 
-PROMPT   CREATE SESSION, CREATE TABLE, CREATE INDEX, CREATE PROCEDURE, CREATE TRIGGER, CREATE JOB, CREATE VIEW, CREATE TYPE
+PROMPT   CREATE SESSION, CREATE TABLE, CREATE VIEW, CREATE PROCEDURE, CREATE TRIGGER, CREATE JOB, CREATE TYPE, CREATE SYNONYM, CREATE SEQUENCE
+PROMPT   SELECT ON V_$RESERVED_WORDS (for parsing)
+PROMPT   EXECUTE ON DBMS_LOCK
 PROMPT Optional privileges: 
 PROMPT   SELECT ON V_$SQLTEXT_WITH_NEWLINES (for explain plan support)
-PROMPT   SELECT ON DBA_SEGMENTS, SELECT ON DBA_CLU_COLUMNS (for creating lobs/cluster tables in different schema) 
+PROMPT   SELECT ON DBA_SEGMENTS  (for creating lobs in different schema)  
+PROMPT   SELECT ON DBA_CLU_COLUMNS (for creating cluster tables in different schema) 
 PROMPT 
 
     
-@@drop_triggers.sql
+@@triggers/drop_triggers.sql
+
+@@plsql_utilities/sql_arrays.sql
 
 @@plsql_utilities/arrays.pks
 @@plsql_utilities/partition_utils.pks
 @@plsql_utilities/xml_utils.pks
+@@plsql_utilities/arrays.pkb
 @@plsql_utilities/partition_utils.pkb
 @@plsql_utilities/xml_utils.pkb
 
@@ -62,19 +70,15 @@ PROMPT
 @@tables/cort_builds.sql
 @@tables/cort_context.sql
 @@tables/cort_job_control.sql
-@@tables/cort_job_log.sql
 @@tables/cort_jobs.sql
 @@tables/cort_lob.sql
 @@tables/cort_log.sql
 @@tables/cort_objects.sql
+@@tables/cort_sql.sql
 @@tables/cort_params.sql
 @@tables/cort_releases.sql
 @@tables/cort_stat.sql
-@@tables/cort_thread_sql.sql
 @@tables/plan_table.sql
-
--- params
-@@cort_params.sql
 
 -- Types
 @@cort_param_obj.tps
@@ -84,16 +88,15 @@ PROMPT
 @@cort_log_pkg.pks
 @@cort_params_pkg.pks
 @@cort_exec_pkg.pks
-@@cort_comp_pkg.pks
 @@cort_parse_pkg.pks
-@@cort_xml_pkg.pks
+@@cort_comp_pkg.pks
 @@cort_aux_pkg.pks
+@@cort_xml_pkg.pks
 @@cort_pkg.pks
 @@cort_session_pkg.pks
 @@cort_trg_pkg.pks
 @@cort_job_pkg.pks
 @@cort_event_exec_pkg.pks
-@@cort_thread_job_pkg.pks
 @@cort_thread_exec_pkg.pks
 
 -- Views
@@ -110,22 +113,21 @@ PROMPT
 @@cort_exec_pkg.pkb
 @@cort_comp_pkg.pkb
 @@cort_parse_pkg.pkb
-@@cort_xml_pkg.pkb
 @@cort_aux_pkg.pkb
+@@cort_xml_pkg.pkb
 @@cort_pkg.pkb
 @@cort_session_pkg.pkb
 @@cort_trg_pkg.pkb
 @@cort_job_pkg.pkb
 @@cort_event_exec_pkg.pkb
-@@cort_thread_job_pkg.pkb
 @@cort_thread_exec_pkg.pkb
 
 
 -- Triggers
-@@cort_create_trg.trg
-@@cort_before_create_trg.trg
-@@cort_lock_object_trg.trg
-@@cort_before_xplan_trg.trg
+@@triggers/cort_create_trg.trg
+@@triggers/cort_before_create_trg.trg
+@@triggers/cort_lock_object_trg.trg
+@@triggers/cort_before_xplan_trg.trg
 
 grant execute on cort_pkg to public;
 

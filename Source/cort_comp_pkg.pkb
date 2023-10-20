@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -96,6 +96,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   gc_drop                    CONSTANT VARCHAR2(30) := 'DROP';
   gc_index                   CONSTANT VARCHAR2(30) := 'INDEX';
   gc_alter_index             CONSTANT VARCHAR2(30) := 'ALTER INDEX';
+  gc_rebuild                 CONSTANT VARCHAR2(30) := 'REBUILD';
   gc_rename_to               CONSTANT VARCHAR2(30) := 'RENAME TO';
   gc_on_table                CONSTANT VARCHAR2(30) := 'ON';
   gc_index_columns           CONSTANT VARCHAR2(30) := '<gc_index_columns>';
@@ -182,7 +183,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   gc_grant_option            CONSTANT VARCHAR2(30) := 'WITH GRANT OPTION';
 
   gc_create_trigger          CONSTANT VARCHAR2(30) := 'CREATE OR REPLACE TRIGGER';
-  gc_drop_trigger            CONSTANT VARCHAR2(30) := 'DROP TRIGGER';
   gc_trigger_type            CONSTANT VARCHAR2(30) := '<trigger_type>';
   gc_triggerring_event       CONSTANT VARCHAR2(30) := '<triggerring_event>';
   gc_referencing_names       CONSTANT VARCHAR2(30) := '<referencing_names>';
@@ -199,6 +199,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   gc_final                   CONSTANT VARCHAR2(30) := 'FINAL';
   gc_instantiable            CONSTANT VARCHAR2(30) := 'INSTANTIABLE';
+  gc_persistable             CONSTANT VARCHAR2(30) := 'PERSISTABLE';
 
   TYPE gt_type_matrix IS TABLE OF arrays.gt_mstr_indx INDEX BY VARCHAR2(255);
 
@@ -243,10 +244,124 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
              WHEN gc_result_replace            THEN 'replace'
              WHEN gc_result_rename             THEN 'rename'
              WHEN gc_result_drop               THEN 'drop'
-             WHEN gc_result_cas_from_itself    THEN 'create_as_select_from_itself'
+             WHEN gc_result_recreate_as_select THEN 'recreate_as_select'
+             WHEN gc_result_cas_from_itself    THEN 'recreate_as_select_from_itself'
              ELSE to_char(in_result_code)
            END;
   END get_result_name;
+
+    
+  -- return DROP object DDL
+  FUNCTION get_drop_object_ddl(
+    in_object_type  IN VARCHAR2,
+    in_object_name  IN VARCHAR2,
+    in_object_owner IN VARCHAR2,
+    in_purge        IN BOOLEAN DEFAULT FALSE
+  )
+  RETURN VARCHAR2
+  AS
+    l_sql VARCHAR2(32767);
+  BEGIN
+    l_sql :=  'DROP '||in_object_type||' "'||in_object_owner||'"."'||in_object_name||'"';
+    IF in_object_type = 'TABLE' THEN
+      l_sql := l_sql||' CASCADE CONSTRAINTS ';
+      IF in_purge THEN
+        l_sql := l_sql||' PURGE';
+      END IF;
+    END IF;
+
+    IF in_object_type = 'INDEX' THEN
+      l_sql := l_sql||' ONLINE';
+    END IF;
+
+    IF in_object_type = 'TYPE' THEN
+      IF in_purge THEN
+        l_sql := l_sql||' FORCE';
+      ELSE
+        l_sql := l_sql||' VALIDATE';
+      END IF;  
+    END IF;
+    RETURN l_sql;
+  END get_drop_object_ddl;
+
+  -- warpper for TABLE
+  FUNCTION get_drop_table_ddl(
+    in_table_name   IN VARCHAR2,
+    in_owner        IN VARCHAR2
+  )
+  RETURN VARCHAR2
+  AS
+  BEGIN
+    RETURN get_drop_object_ddl(
+             in_object_type  => 'TABLE',
+             in_object_name  => in_table_name,
+             in_object_owner => in_owner,
+             in_purge        => TRUE
+           );
+  END get_drop_table_ddl;
+
+  -- warpper for INDEX
+  FUNCTION get_drop_index_ddl(
+    in_index_name   IN VARCHAR2,
+    in_owner        IN VARCHAR2
+  )
+  RETURN VARCHAR2
+  AS
+  BEGIN
+    RETURN get_drop_object_ddl(
+             in_object_type  => 'INDEX',
+             in_object_name  => in_index_name,
+             in_object_owner => in_owner
+           );
+  END get_drop_index_ddl;
+
+  -- warpper for SEQUENCE
+  FUNCTION get_drop_sequence_ddl(
+    in_sequence_name  IN VARCHAR2,
+    in_owner          IN VARCHAR2
+  )
+  RETURN VARCHAR2
+  AS
+  BEGIN
+    RETURN get_drop_object_ddl(
+             in_object_type  => 'SEQUENCE',
+             in_object_name  => in_sequence_name,
+             in_object_owner => in_owner
+           );
+  END get_drop_sequence_ddl;
+
+
+  -- warpper for TYPE
+  FUNCTION get_drop_type_ddl(
+    in_type_name  IN VARCHAR2,
+    in_owner      IN VARCHAR2,
+    in_force      IN BOOLEAN DEFAULT FALSE
+  )
+  RETURN VARCHAR2
+  AS
+  BEGIN
+    RETURN get_drop_object_ddl(
+             in_object_type  => 'TYPE',
+             in_object_name  => in_type_name,
+             in_object_owner => in_owner,
+             in_purge        => in_force
+           );
+  END get_drop_type_ddl;
+
+  -- warpper for VIEW
+  FUNCTION get_drop_view_ddl(
+    in_view_name  IN VARCHAR2,
+    in_owner      IN VARCHAR2
+  )
+  RETURN VARCHAR2
+  AS
+  BEGIN
+    RETURN get_drop_object_ddl(
+             in_object_type  => 'VIEW',
+             in_object_name  => in_view_name,
+             in_object_owner => in_owner
+           );
+  END get_drop_view_ddl;
 
   FUNCTION convert_arr_to_str(
     in_value_arr    IN arrays.gt_int_arr,
@@ -346,12 +461,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   FUNCTION get_hash_value(in_value IN VARCHAR2)
   RETURN VARCHAR2
   AS
+    h1 varchar2(100);
+    h2 varchar2(100);
+    h3 varchar2(100);
+    h4 varchar2(100);
+    r  number;
+    g  number;
   BEGIN
     IF LENGTH(in_value) > 255 THEN
-      RETURN dbms_obfuscation_toolkit.MD5(input => utl_raw.cast_to_raw(in_value))||
-             dbms_obfuscation_toolkit.MD5(input => utl_raw.cast_to_raw(reverse(in_value)))||
-             dbms_obfuscation_toolkit.MD5(input => utl_raw.cast_to_raw(LOWER(in_value)))||
-             dbms_obfuscation_toolkit.MD5(input => utl_raw.cast_to_raw(reverse(UPPER(in_value))));
+      r := dbms_utility.get_sql_hash(in_value, h1, g);
+      r := dbms_utility.get_sql_hash(reverse(in_value), h2, g);
+      r := dbms_utility.get_sql_hash(lower(in_value), h3, g);
+      r := dbms_utility.get_sql_hash(reverse(upper(in_value)), h4, g);
+      
+      RETURN h1||h2||h3||h4;
     ELSE
       RETURN in_value;
     END IF;
@@ -558,12 +681,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   END comp_data_type;
 
   -- compares array of column names
-  FUNCTION comp_column_arr(
+  FUNCTION comp_part_key_columns(
     in_source_table_rec  IN cort_exec_pkg.gt_table_rec,
     in_target_table_rec  IN cort_exec_pkg.gt_table_rec,
     in_source_column_arr IN arrays.gt_name_arr,
-    in_target_column_arr IN arrays.gt_name_arr,
-    in_check_position    IN BOOLEAN DEFAULT TRUE
+    in_target_column_arr IN arrays.gt_name_arr
   )
   RETURN PLS_INTEGER
   AS
@@ -592,12 +714,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         debug('no target column specified on position '||i);
       END IF;
       IF in_source_column_arr.EXISTS(i) AND
-         in_target_column_arr.EXISTS(i) THEN
+         in_target_column_arr.EXISTS(i)
+      THEN
         IF in_source_table_rec.column_indx_arr.EXISTS(in_source_column_arr(i)) THEN
           l_indx := in_source_table_rec.column_indx_arr(in_source_column_arr(i));
           l_source_column_rec := in_source_table_rec.column_arr(l_indx);
           debug('source column found - '||l_source_column_rec.column_name);
         ELSE
+          debug('source column not found on position '||i);
           RETURN 1;
         END IF;
         IF in_target_table_rec.column_indx_arr.EXISTS(in_target_column_arr(i)) THEN
@@ -605,22 +729,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           l_target_column_rec := in_target_table_rec.column_arr(l_indx);
           debug('target column found - '||l_target_column_rec.column_name);
         ELSE
+          debug('target column not found on position '||i);
           RETURN 1;
         END IF;
         IF comp_data_type(l_source_column_rec, l_target_column_rec) = 1 THEN
           debug('column types do not match each other');
           RETURN 1;
         END IF;
-        IF in_check_position THEN
-          IF l_source_column_rec.matched_column_id = l_target_column_rec.column_id AND
-             l_source_column_rec.column_id = l_target_column_rec.matched_column_id
-          THEN
-            debug('columns positions match each other');
-          ELSE
-            debug('source column_id/matched_column_id = '||l_source_column_rec.column_id||'/'||l_source_column_rec.matched_column_id);
-            debug('target column_id/matched_column_id = '||l_target_column_rec.column_id||'/'||l_target_column_rec.matched_column_id);
-            RETURN 1;
-          END IF;
+        IF nvl(l_source_column_rec.new_column_name, l_source_column_rec.column_name) <> l_target_column_rec.column_name THEN
+          debug('column names do not match each other');
+          RETURN 1;
         END IF;
           
 /*
@@ -659,7 +777,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END LOOP;
     -- if reach to this posint then arrays are identical
     RETURN 0;
-  END comp_column_arr;
+  END comp_part_key_columns;
 
   -- compares REF constraints by their names
   FUNCTION comp_ref_ptn_constraint(
@@ -710,8 +828,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   -- Returns 1 if same partitiong used, for same columns/ref_constraint and partitions could be preserved. Otherwise returns 0
   FUNCTION comp_partitioning(
     in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_check_position   IN BOOLEAN DEFAULT TRUE
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec
   )
   RETURN PLS_INTEGER
   AS
@@ -727,12 +844,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                  in_target_table_rec  => in_target_table_rec
                );
       ELSE
-        RETURN comp_column_arr(
+        RETURN comp_part_key_columns(
                  in_source_table_rec  => in_source_table_rec,
                  in_target_table_rec  => in_target_table_rec,
                  in_source_column_arr => in_source_table_rec.part_key_column_arr,
-                 in_target_column_arr => in_target_table_rec.part_key_column_arr,
-                 in_check_position    => in_check_position
+                 in_target_column_arr => in_target_table_rec.part_key_column_arr
                );
       END CASE;
     WHEN in_source_table_rec.partitioning_type IS NULL AND in_target_table_rec.partitioning_type IS NULL THEN
@@ -743,10 +859,34 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   END comp_partitioning;
 
   -- Returns 1 if same partitiong used, for same columns/ref_constraint and partitions could be preserved. Otherwise returns 0
+  FUNCTION comp_partitioning(
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_sql_rec          IN cort_parse_pkg.gt_sql_rec
+  )
+  RETURN PLS_INTEGER
+  AS
+  BEGIN
+    CASE 
+    WHEN in_source_table_rec.partitioning_type = in_sql_rec.partitioning_type THEN
+      CASE in_source_table_rec.partitioning_type
+      WHEN 'SYSTEM' THEN
+        RETURN 0;
+      WHEN 'REFERENCE' THEN
+        RETURN 0;
+      ELSE
+        RETURN comp_array(in_source_table_rec.part_key_column_arr, in_sql_rec.part_key_column_arr);
+      END CASE;
+    WHEN in_source_table_rec.partitioning_type IS NULL AND in_sql_rec.partitioning_type IS NULL THEN
+      RETURN 0; 
+    ELSE
+      RETURN 1;
+    END CASE;
+  END comp_partitioning;
+
+  -- Returns 1 if same partitiong used, for same columns/ref_constraint and partitions could be preserved. Otherwise returns 0
   FUNCTION comp_subpartitioning(
     in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_check_position   IN BOOLEAN DEFAULT TRUE
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec
   )
   RETURN PLS_INTEGER
   AS
@@ -757,13 +897,31 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     WHEN in_source_table_rec.subpartitioning_type = 'NONE' AND in_target_table_rec.subpartitioning_type = 'NONE' THEN 
       RETURN 0;
     WHEN in_source_table_rec.subpartitioning_type = in_target_table_rec.subpartitioning_type THEN
-      RETURN comp_column_arr(
+      RETURN comp_part_key_columns(
                in_source_table_rec  => in_source_table_rec,
                in_target_table_rec  => in_target_table_rec,
                in_source_column_arr => in_source_table_rec.subpart_key_column_arr, 
-               in_target_column_arr => in_target_table_rec.subpart_key_column_arr,
-               in_check_position    => in_check_position
+               in_target_column_arr => in_target_table_rec.subpart_key_column_arr
              );
+    ELSE
+      RETURN 1;
+    END CASE;
+  END comp_subpartitioning;
+
+  FUNCTION comp_subpartitioning(
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_sql_rec          IN cort_parse_pkg.gt_sql_rec
+  )
+  RETURN PLS_INTEGER
+  AS
+  BEGIN
+    CASE 
+    WHEN in_source_table_rec.subpartitioning_type IS NULL AND in_sql_rec.subpartitioning_type IS NULL THEN 
+      RETURN 0;
+    WHEN in_source_table_rec.subpartitioning_type = 'NONE' AND in_sql_rec.subpartitioning_type = 'NONE' THEN 
+      RETURN 0;
+    WHEN in_source_table_rec.subpartitioning_type = in_sql_rec.subpartitioning_type THEN
+      RETURN comp_array(in_source_table_rec.subpart_key_column_arr, in_sql_rec.subpart_key_column_arr);
     ELSE
       RETURN 1;
     END CASE;
@@ -882,116 +1040,62 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   END get_clause_by_name;
 
   PROCEDURE add_alter_table_stmt(
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
+    io_change_arr    IN OUT NOCOPY cort_exec_pkg.gt_change_arr,
     in_table_name    IN VARCHAR2,
     in_owner         IN VARCHAR2,
-    in_frwd_clause   IN CLOB,
-    in_rlbk_clause   IN CLOB
+    in_change_clause IN CLOB,
+    in_revert_clause IN CLOB,
+    in_group_type    IN VARCHAR2 DEFAULT 'ALTER TABLE'
   )
   AS
-    l_stmt CLOB;
   BEGIN
-    IF in_frwd_clause IS NOT NULL THEN
-      l_stmt := 'ALTER TABLE "'||in_owner||'"."'||in_table_name||'" '||in_frwd_clause;
-    ELSE
-      l_stmt := NULL;
-    END IF;
-    io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_stmt;
-    IF in_rlbk_clause IS NOT NULL THEN
-      l_stmt := 'ALTER TABLE "'||in_owner||'"."'||in_table_name||'" '||in_rlbk_clause;
-    ELSE
-      l_stmt := NULL;
-    END IF;
-    io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_stmt;
+    cort_exec_pkg.add_change(
+      io_change_arr,
+      cort_exec_pkg.change_rec(
+        in_group_type => in_group_type,
+        in_change_sql => CASE WHEN in_change_clause IS NOT NULL THEN 'ALTER TABLE "'||in_owner||'"."'||in_table_name||'" '||in_change_clause END,
+        in_revert_sql => CASE WHEN in_revert_clause IS NOT NULL THEN 'ALTER TABLE "'||in_owner||'"."'||in_table_name||'" '||in_revert_clause END
+      )
+    );
   END add_alter_table_stmt;
 
   PROCEDURE add_alter_sequence_stmt(
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    in_sequence_name IN VARCHAR2,
-    in_owner         IN VARCHAR2,
-    in_frwd_clause   IN CLOB,
-    in_rlbk_clause   IN CLOB
+    io_change_arr     IN OUT NOCOPY cort_exec_pkg.gt_change_arr,
+    in_sequence_name  IN VARCHAR2,
+    in_owner          IN VARCHAR2,
+    in_change_clause  IN CLOB,
+    in_revert_clause  IN CLOB
   )
   AS
-    l_stmt CLOB;
   BEGIN
-    IF in_frwd_clause IS NOT NULL THEN
-      l_stmt := 'ALTER SEQUENCE "'||in_owner||'"."'||in_sequence_name||'" '||in_frwd_clause;
-    ELSE
-      l_stmt := NULL;
-    END IF;
-    io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_stmt;
-    IF in_rlbk_clause IS NOT NULL THEN
-      l_stmt := 'ALTER SEQUENCE "'||in_owner||'"."'||in_sequence_name||'" '||in_rlbk_clause;
-    ELSE
-      l_stmt := NULL;
-    END IF;
-    io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_stmt;
+    cort_exec_pkg.add_change(
+      io_change_arr,
+      cort_exec_pkg.change_rec(
+        in_group_type => 'ALTER SEQUENCE',
+        in_change_sql => CASE WHEN in_change_clause IS NOT NULL THEN 'ALTER SEQUENCE "'||in_owner||'"."'||in_sequence_name||'" '||in_change_clause END,
+        in_revert_sql => CASE WHEN in_revert_clause IS NOT NULL THEN 'ALTER SEQUENCE "'||in_owner||'"."'||in_sequence_name||'" '||in_revert_clause END
+      )
+    );
   END add_alter_sequence_stmt;
 
-  PROCEDURE add_alter_index_stmt(
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    in_index_name    IN VARCHAR2,
-    in_owner         IN VARCHAR2,
-    in_frwd_clause   IN CLOB,
-    in_rlbk_clause   IN CLOB
-  )
-  AS
-    l_stmt CLOB;
-  BEGIN
-    IF in_frwd_clause IS NOT NULL THEN
-      l_stmt := 'ALTER INDEX "'||in_owner||'"."'||in_index_name||'" '||in_frwd_clause;
-    ELSE
-      l_stmt := NULL;
-    END IF;
-    io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_stmt;
-    IF in_rlbk_clause IS NOT NULL THEN
-      l_stmt := 'ALTER INDEX "'||in_owner||'"."'||in_index_name||'" '||in_rlbk_clause;
-    ELSE
-      l_stmt := NULL;
-    END IF;
-    io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_stmt;
-  END add_alter_index_stmt;
-
   PROCEDURE add_alter_type_stmt(
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    in_type_name     IN VARCHAR2,
-    in_owner         IN VARCHAR2,
-    in_frwd_clause   IN CLOB,
-    in_rlbk_clause   IN CLOB
+    io_change_arr     IN OUT NOCOPY cort_exec_pkg.gt_change_arr,
+    in_type_name      IN VARCHAR2,
+    in_owner          IN VARCHAR2,
+    in_change_clause  IN CLOB,
+    in_revert_clause  IN CLOB
   )
   AS
-    l_stmt CLOB;
   BEGIN
-    IF in_frwd_clause IS NOT NULL THEN
-      l_stmt := 'ALTER TYPE "'||in_owner||'"."'||in_type_name||'" '||in_frwd_clause;
-    ELSE
-      l_stmt := NULL;
-    END IF;
-    io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_stmt;
-    IF in_rlbk_clause IS NOT NULL THEN
-      l_stmt := 'ALTER TYPE "'||in_owner||'"."'||in_type_name||'" '||in_rlbk_clause;
-    ELSE
-      l_stmt := NULL;
-    END IF;
-    io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_stmt;
+    cort_exec_pkg.add_change(
+      io_change_arr,
+      cort_exec_pkg.change_rec(
+        in_group_type => 'ALTER TYPE',
+        in_change_sql => CASE WHEN in_change_clause IS NOT NULL THEN 'ALTER TYPE "'||in_owner||'"."'||in_type_name||'" '||in_change_clause END,
+        in_revert_sql => CASE WHEN in_revert_clause IS NOT NULL THEN 'ALTER TYPE "'||in_owner||'"."'||in_type_name||'" '||in_revert_clause END
+      )
+    );
   END add_alter_type_stmt;
-
-  PROCEDURE add_stmt(
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    in_frwd_stmt     IN CLOB,
-    in_rlbk_stmt     IN CLOB
-  )
-  AS
-  BEGIN
-    io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := in_frwd_stmt;
-    io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := in_rlbk_stmt;
-  END add_stmt;
 
   -- returns SQL clause
   FUNCTION get_clause(
@@ -1008,6 +1112,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   BEGIN
     IF in_value IS NOT NULL THEN
       CASE in_clause
+      WHEN gc_parallel THEN
+        IF NVL(in_value, '1') = '1' THEN  
+          l_value := NULL;
+          l_clause := NULL;
+        ELSE  
+          l_value := in_value;
+          l_clause := in_clause;
+        END IF;
       WHEN gc_logging THEN
         l_value := CASE in_value
                      WHEN 'YES' THEN 'LOGGING'
@@ -1190,7 +1302,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         IF in_value IN ('DEFAULT','INVALID') THEN
           l_value := NULL;
         ELSE
-          l_value := in_value;
+          l_value := ' '||in_value;
         END IF;
         l_clause := in_clause;
       WHEN gc_xml_storage_type THEN
@@ -1210,6 +1322,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_value := CASE in_value
                      WHEN 'YES' THEN 'ALLOW NONSCHEMA'
                      WHEN 'NO' THEN 'DISALLOW NONSCHEMA'
+                   END;
+        l_clause := NULL;
+      WHEN gc_substitution_column THEN
+        l_value := CASE in_value
+                     WHEN 'Y' THEN 'SUBSTITUTABLE AT ALL LEVELS'
+                     WHEN 'N' THEN 'NOT SUBSTITUTABLE AT ALL LEVELS'
                    END;
         l_clause := NULL;
       WHEN gc_cycle_flag THEN
@@ -1240,6 +1358,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                      WHEN 'YES' THEN 'INSTANTIABLE'
                      WHEN 'NO'  THEN 'NOT INSTANTIABLE'
                    END;
+      WHEN gc_persistable THEN
+        l_value := CASE in_value
+                     WHEN 'YES' THEN 'PERSISTABLE'
+                     WHEN 'NO'  THEN 'NOT PERSISTABLE'
+                   END;
       ELSE
         IF in_clause LIKE '<%>' AND in_clause = LOWER(in_clause) THEN
           l_value := in_value;
@@ -1269,12 +1392,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   BEGIN
     l_result := NULL;
     FOR i IN 1..in_join_inner_table_arr.COUNT LOOP
-      l_full_name := '"'||in_join_inner_owner_arr(i)||'"."'||cort_parse_pkg.get_original_name('TABLE',in_join_inner_table_arr(i))||'"';
+      l_full_name := '"'||in_join_inner_owner_arr(i)||'"."'||cort_parse_pkg.get_original_name(in_join_inner_table_arr(i))||'"';
       IF NOT l_owner_table_ind.EXISTS(l_full_name) THEN
         l_result := l_result || l_full_name ||',';
         l_owner_table_ind(l_full_name) := i;
       END IF;
-      l_full_name := '"'||in_join_outer_owner_arr(i)||'"."'||cort_parse_pkg.get_original_name('TABLE',in_join_outer_table_arr(i))||'"';
+      l_full_name := '"'||in_join_outer_owner_arr(i)||'"."'||cort_parse_pkg.get_original_name(in_join_outer_table_arr(i))||'"';
       IF NOT l_owner_table_ind.EXISTS(l_full_name) THEN
         l_result := l_result || l_full_name ||',';
         l_owner_table_ind(l_full_name) := i;
@@ -1301,10 +1424,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_result := NULL;
     FOR i IN 1..in_join_inner_column_arr.COUNT LOOP
       l_full_name1 := '"'||in_join_inner_owner_arr(i)||'"."'||
-                          cort_parse_pkg.get_original_name('TABLE',in_join_inner_table_arr(i))||'"."'||
+                          cort_parse_pkg.get_original_name(in_join_inner_table_arr(i))||'"."'||
                           in_join_inner_column_arr(i)||'"';
       l_full_name2 := '"'||in_join_outer_owner_arr(i)||'"."'||
-                          cort_parse_pkg.get_original_name('TABLE',in_join_outer_table_arr(i))||'"."'||
+                          cort_parse_pkg.get_original_name(in_join_outer_table_arr(i))||'"."'||
                           in_join_outer_column_arr(i)||'"';
 
       l_result := l_result || l_full_name1 || ' = ' || l_full_name2;
@@ -1328,7 +1451,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       CASE in_compression_rec.compression
       WHEN 'ENABLED' THEN
         l_stmt := ' COMPRESS ';
-        $IF dbms_db_version.version >= 12 AND dbms_db_version.release >=1 $THEN
+        $IF dbms_db_version.version >= 12 $THEN
         l_stmt := l_stmt ||
                   CASE in_compression_rec.compress_for
                     WHEN 'BASIC' THEN 'BASIC '
@@ -1339,7 +1462,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     WHEN 'ARCHIVE HIGH' THEN 'FOR ARCHIVE HIGH '
                     ELSE NULL
                   END;
-        $ELSIF dbms_db_version.version >= 11 AND dbms_db_version.release >=2 $THEN
+        $ELSIF dbms_db_version.version = 11 AND dbms_db_version.release >=2 $THEN
         l_stmt := l_stmt ||
                   CASE in_compression_rec.compress_for
                     WHEN 'BASIC' THEN 'BASIC '
@@ -1350,7 +1473,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     WHEN 'ARCHIVE HIGH' THEN 'FOR ARCHIVE HIGH '
                     ELSE NULL
                   END;
-        $ELSIF dbms_db_version.version >= 11 AND dbms_db_version.release >=1 $THEN
+        $ELSIF dbms_db_version.version = 11 AND dbms_db_version.release =1 $THEN
         l_stmt := l_stmt ||
                   CASE in_compression_rec.compress_for
                     WHEN 'DIRECT LOAD ONLY' THEN 'FOR DIRECT_LOAD OPERATIONS '
@@ -1376,8 +1499,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   BEGIN
     IF in_column_rec.data_type_owner IS NULL THEN
       CASE
-       WHEN in_column_rec.data_type IN ('CHAR', 'VARCHAR2', 'NCHAR', 'NVARCHAR2') THEN
+       WHEN in_column_rec.data_type IN ('CHAR', 'VARCHAR2') THEN
          RETURN get_clause(in_column_rec.data_type, in_column_rec.char_length||' '||get_clause(gc_char_used,in_column_rec.char_used), '(', ')');
+       WHEN in_column_rec.data_type IN ('NCHAR', 'NVARCHAR2') THEN
+         RETURN get_clause(in_column_rec.data_type, in_column_rec.char_length, '(', ')');
        WHEN in_column_rec.data_type = 'NUMBER' THEN
          IF in_column_rec.data_precision IS NULL AND in_column_rec.data_scale IS NULL THEN
            RETURN get_clause(in_column_rec.data_type, ' ');
@@ -1464,45 +1589,43 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- builds ALTER statements to add constraint
   PROCEDURE add_constraint(
-    in_constraint_rec        IN cort_exec_pkg.gt_constraint_rec,
-    in_index_rec             IN cort_exec_pkg.gt_index_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_constraint_rec IN cort_exec_pkg.gt_constraint_rec,
+    in_index_rec      IN cort_exec_pkg.gt_index_rec,
+    io_change_arr     IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
     l_keep_index             VARCHAR2(30);
   BEGIN
     -- create forward statements
-    l_frwd_clause := get_add_constraint_clause(in_constraint_rec, in_index_rec);
+    l_change_clause := get_add_constraint_clause(in_constraint_rec, in_index_rec);
     -- create rollback statements
     IF in_constraint_rec.constraint_type IN ('P','U') THEN
       l_keep_index := ' KEEP INDEX';
     ELSE
       l_keep_index := NULL;
     END IF;
-    l_rlbk_clause := get_clause(gc_drop_constraint, in_constraint_rec.rename_rec.current_name, '"', '"'||l_keep_index);
+    l_revert_clause := get_clause(gc_drop_constraint, in_constraint_rec.rename_rec.current_name, '"', '"'||l_keep_index);
+
     add_alter_table_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+      io_change_arr    => io_change_arr,
       in_table_name    => in_constraint_rec.table_name,
       in_owner         => in_constraint_rec.owner,
-      in_frwd_clause   => l_frwd_clause,
-      in_rlbk_clause   => l_rlbk_clause
+      in_change_clause => l_change_clause,
+      in_revert_clause => l_revert_clause
     );
   END add_constraint;
 
   -- builds ALTER statements to drop constraint
   PROCEDURE drop_constraint(
-    in_constraint_rec        IN cort_exec_pkg.gt_constraint_rec,
-    in_index_rec             IN cort_exec_pkg.gt_index_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_constraint_rec IN cort_exec_pkg.gt_constraint_rec,
+    in_index_rec      IN cort_exec_pkg.gt_index_rec,
+    io_change_arr     IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
     l_keep_index             VARCHAR2(30);
   BEGIN
     -- create forward statements
@@ -1511,18 +1634,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     ELSE
       l_keep_index := NULL;
     END IF;
-    l_frwd_clause := get_clause(gc_drop_constraint, in_constraint_rec.rename_rec.current_name, '"', '"'||l_keep_index);
+    l_change_clause := get_clause(gc_drop_constraint, in_constraint_rec.rename_rec.current_name, '"', '"'||l_keep_index);
 
     -- create rollback statements
-    l_rlbk_clause := get_add_constraint_clause(in_constraint_rec, in_index_rec);
+    l_revert_clause := get_add_constraint_clause(in_constraint_rec, in_index_rec);
 
     add_alter_table_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+      io_change_arr    => io_change_arr,
       in_table_name    => in_constraint_rec.table_name,
       in_owner         => in_constraint_rec.owner,
-      in_frwd_clause   => l_frwd_clause,
-      in_rlbk_clause   => l_rlbk_clause
+      in_change_clause => l_change_clause,
+      in_revert_clause => l_revert_clause
     );
   END drop_constraint;
 
@@ -1581,50 +1703,46 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- builds ALTER statements to add check log_group
   PROCEDURE add_log_group(
-    in_log_group_rec         IN cort_exec_pkg.gt_log_group_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_log_group_rec IN cort_exec_pkg.gt_log_group_rec,
+    io_change_arr    IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
   BEGIN
     -- create forward statements
-    l_frwd_clause := get_add_log_group_clause(in_log_group_rec);
+    l_change_clause := get_add_log_group_clause(in_log_group_rec);
     -- create rollback statements
-    l_rlbk_clause := get_drop_log_group_clause(in_log_group_rec);
+    l_revert_clause := get_drop_log_group_clause(in_log_group_rec);
 
     add_alter_table_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+      io_change_arr    => io_change_arr,
       in_table_name    => in_log_group_rec.table_name,
       in_owner         => in_log_group_rec.owner,
-      in_frwd_clause   => l_frwd_clause,
-      in_rlbk_clause   => l_rlbk_clause
+      in_change_clause => l_change_clause,
+      in_revert_clause => l_revert_clause
     );
   END add_log_group;
 
   PROCEDURE drop_log_group(
-    in_log_group_rec         IN cort_exec_pkg.gt_log_group_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_log_group_rec IN cort_exec_pkg.gt_log_group_rec,
+    io_change_arr    IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
   BEGIN
     -- create forward statements
-    l_frwd_clause := get_drop_log_group_clause(in_log_group_rec);
+    l_change_clause := get_drop_log_group_clause(in_log_group_rec);
     -- create rollback statements
-    l_rlbk_clause := get_add_log_group_clause(in_log_group_rec);
+    l_revert_clause := get_add_log_group_clause(in_log_group_rec);
 
     add_alter_table_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+      io_change_arr    => io_change_arr,
       in_table_name    => in_log_group_rec.table_name,
       in_owner         => in_log_group_rec.owner,
-      in_frwd_clause   => l_frwd_clause,
-      in_rlbk_clause   => l_rlbk_clause
+      in_change_clause => l_change_clause,
+      in_revert_clause => l_revert_clause
     );
   END drop_log_group;
 
@@ -1652,7 +1770,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   AS
     l_clause   CLOB;
   BEGIN
-    IF cort_exec_pkg.g_params.physical_attr.value_exists('TABLE') THEN
+    IF cort_exec_pkg.g_params.physical_attr.exist('TABLE') THEN
       l_clause := l_clause||get_clause(gc_initial, in_storage_rec.initial_extent);
       l_clause := l_clause||get_clause(gc_minextents, in_storage_rec.min_extents);
       l_clause := l_clause||get_clause(gc_maxsize, in_storage_rec.max_size);
@@ -1669,8 +1787,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   FUNCTION comp_storage(
     in_source_storage_rec  IN cort_exec_pkg.gt_storage_rec,
     in_target_storage_rec  IN cort_exec_pkg.gt_storage_rec,
-    out_frwd_clause        OUT NOCOPY CLOB,
-    out_rlbk_clause        OUT NOCOPY CLOB
+    out_change_clause      OUT NOCOPY CLOB,
+    out_revert_clause      OUT NOCOPY CLOB
   )
   RETURN PLS_INTEGER
   AS
@@ -1691,24 +1809,24 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
     IF comp_value(in_source_storage_rec.pct_increase, in_target_storage_rec.pct_increase) = 1 THEN
       l_result := gc_result_alter;
-      out_frwd_clause := out_frwd_clause || get_clause(gc_pctincrease, in_target_storage_rec.pct_increase);
-      out_rlbk_clause := out_rlbk_clause || get_clause(gc_pctincrease, in_source_storage_rec.pct_increase);
+      out_change_clause := out_change_clause || get_clause(gc_pctincrease, in_target_storage_rec.pct_increase);
+      out_revert_clause := out_revert_clause || get_clause(gc_pctincrease, in_source_storage_rec.pct_increase);
     END IF;
     IF comp_value(in_source_storage_rec.freelists, in_target_storage_rec.freelists) = 1 THEN
       l_result := gc_result_alter;
-      out_frwd_clause := out_frwd_clause || get_clause(gc_freelists, in_target_storage_rec.freelists);
-      out_rlbk_clause := out_rlbk_clause || get_clause(gc_freelists, in_source_storage_rec.freelists);
+      out_change_clause := out_change_clause || get_clause(gc_freelists, in_target_storage_rec.freelists);
+      out_revert_clause := out_revert_clause || get_clause(gc_freelists, in_source_storage_rec.freelists);
     END IF;
     IF comp_value(in_source_storage_rec.buffer_pool, in_target_storage_rec.buffer_pool) = 1 THEN
       l_result := gc_result_alter;
-      out_frwd_clause := out_frwd_clause || get_clause(gc_buffer_pool, in_target_storage_rec.buffer_pool);
-      out_rlbk_clause := out_rlbk_clause || get_clause(gc_buffer_pool, in_source_storage_rec.buffer_pool);
+      out_change_clause := out_change_clause || get_clause(gc_buffer_pool, in_target_storage_rec.buffer_pool);
+      out_revert_clause := out_revert_clause || get_clause(gc_buffer_pool, in_source_storage_rec.buffer_pool);
     END IF;
     -- Applicable for LOB Segments only
     IF comp_value(in_source_storage_rec.max_size, in_target_storage_rec.max_size) = 1 THEN
       l_result := gc_result_alter;
-      out_frwd_clause := out_frwd_clause || get_clause(gc_maxsize, in_target_storage_rec.max_size);
-      out_rlbk_clause := out_rlbk_clause || get_clause(gc_maxsize, in_source_storage_rec.max_size);
+      out_change_clause := out_change_clause || get_clause(gc_maxsize, in_target_storage_rec.max_size);
+      out_revert_clause := out_revert_clause || get_clause(gc_maxsize, in_source_storage_rec.max_size);
     END IF;
     RETURN l_result;
   END comp_storage;
@@ -1720,7 +1838,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   AS
     l_clause   CLOB;
   BEGIN
-    IF cort_exec_pkg.g_params.physical_attr.value_exists(in_partition_rec.partition_level)
+    IF cort_exec_pkg.g_params.physical_attr.exist(in_partition_rec.partition_level)
     THEN
       l_clause := get_clause(gc_pctfree, in_partition_rec.physical_attr_rec.pct_free)||
                   get_clause(gc_pctused, in_partition_rec.physical_attr_rec.pct_used)||
@@ -1737,7 +1855,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   AS
     l_clause   CLOB;
   BEGIN
-    IF cort_exec_pkg.g_params.physical_attr.value_exists('INDEX') THEN
+    IF cort_exec_pkg.g_params.physical_attr.exist('INDEX') THEN
       l_clause := get_clause(gc_initrans, in_physical_attr_rec.ini_trans)||
                   get_storage_clause(in_physical_attr_rec.storage);
     END IF;
@@ -1749,41 +1867,41 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   FUNCTION comp_physical_attr(
     in_source_physical_attr_rec  IN cort_exec_pkg.gt_physical_attr_rec,
     in_target_physical_attr_rec  IN cort_exec_pkg.gt_physical_attr_rec,
-    out_frwd_clause              OUT NOCOPY CLOB,
-    out_rlbk_clause              OUT NOCOPY CLOB
+    out_change_clause            OUT NOCOPY CLOB,
+    out_revert_clause            OUT NOCOPY CLOB
   )
   RETURN PLS_INTEGER
   AS
-    l_frwd_clause         CLOB;
-    l_rlbk_clause         CLOB;
-    l_storage_frwd_clause CLOB;
-    l_storage_rlbk_clause CLOB;
-    l_result              PLS_INTEGER;
-    l_comp_result         PLS_INTEGER;
+    l_change_clause         CLOB;
+    l_revert_clause         CLOB;
+    l_storage_change_clause CLOB;
+    l_storage_revert_clause CLOB;
+    l_result                PLS_INTEGER;
+    l_comp_result           PLS_INTEGER;
   BEGIN
     l_result := gc_result_nochange;
 
     IF comp_value(in_source_physical_attr_rec.pct_free, in_target_physical_attr_rec.pct_free) = 1 THEN
       l_result := gc_result_alter;
-      l_frwd_clause := l_frwd_clause || get_clause(gc_pctfree, in_target_physical_attr_rec.pct_free);
-      l_rlbk_clause := l_rlbk_clause || get_clause(gc_pctfree, in_source_physical_attr_rec.pct_free);
+      l_change_clause := l_change_clause || get_clause(gc_pctfree, in_target_physical_attr_rec.pct_free);
+      l_revert_clause := l_revert_clause || get_clause(gc_pctfree, in_source_physical_attr_rec.pct_free);
     END IF;
     IF comp_value(in_source_physical_attr_rec.pct_used, in_target_physical_attr_rec.pct_used) = 1 THEN
       l_result := gc_result_alter;
-      l_frwd_clause := l_frwd_clause || get_clause(gc_pctused, in_target_physical_attr_rec.pct_used);
-      l_rlbk_clause := l_rlbk_clause || get_clause(gc_pctused, in_source_physical_attr_rec.pct_used);
+      l_change_clause := l_change_clause || get_clause(gc_pctused, in_target_physical_attr_rec.pct_used);
+      l_revert_clause := l_revert_clause || get_clause(gc_pctused, in_source_physical_attr_rec.pct_used);
     END IF;
     IF comp_value(in_source_physical_attr_rec.ini_trans, in_target_physical_attr_rec.ini_trans) = 1 THEN
       l_result := gc_result_alter;
-      l_frwd_clause := l_frwd_clause || get_clause(gc_initrans, in_target_physical_attr_rec.ini_trans);
-      l_rlbk_clause := l_rlbk_clause || get_clause(gc_initrans, in_source_physical_attr_rec.ini_trans);
+      l_change_clause := l_change_clause || get_clause(gc_initrans, in_target_physical_attr_rec.ini_trans);
+      l_revert_clause := l_revert_clause || get_clause(gc_initrans, in_source_physical_attr_rec.ini_trans);
     END IF;
     -- storage clauses
     l_comp_result := comp_storage(
                        in_source_storage_rec => in_source_physical_attr_rec.storage,
                        in_target_storage_rec => in_target_physical_attr_rec.storage,
-                       out_frwd_clause       => l_storage_frwd_clause,
-                       out_rlbk_clause       => l_storage_rlbk_clause
+                       out_change_clause       => l_storage_change_clause,
+                       out_revert_clause       => l_storage_revert_clause
                      );
     CASE l_comp_result
     WHEN gc_result_recreate THEN
@@ -1792,14 +1910,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     WHEN gc_result_alter THEN
       debug('Compare physical_attr.sorage - alter');
       l_result := gc_result_alter;
-      l_frwd_clause := l_frwd_clause || get_clause(gc_storage, l_storage_frwd_clause, '(', ')');
-      l_rlbk_clause := l_rlbk_clause || get_clause(gc_storage, l_storage_rlbk_clause, '(', ')');
+      l_change_clause := l_change_clause || get_clause(gc_storage, l_storage_change_clause, '(', ')');
+      l_revert_clause := l_revert_clause || get_clause(gc_storage, l_storage_revert_clause, '(', ')');
     ELSE
       NULL;
     END CASE;
     IF l_result = gc_result_alter THEN
-      out_frwd_clause := l_frwd_clause;
-      out_rlbk_clause := l_rlbk_clause;
+      out_change_clause := l_change_clause;
+      out_revert_clause := l_revert_clause;
     END IF;
     RETURN l_result;
   END comp_physical_attr;
@@ -1808,17 +1926,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   FUNCTION comp_index_physical_attr(
     in_source_physical_attr_rec  IN cort_exec_pkg.gt_physical_attr_rec,
     in_target_physical_attr_rec  IN cort_exec_pkg.gt_physical_attr_rec,
-    out_frwd_clause              OUT NOCOPY CLOB,
-    out_rlbk_clause              OUT NOCOPY CLOB
+    out_change_clause            OUT NOCOPY CLOB,
+    out_revert_clause            OUT NOCOPY CLOB
   )
   RETURN PLS_INTEGER
   AS
-    l_frwd_clause         CLOB;
-    l_rlbk_clause         CLOB;
-    l_storage_frwd_clause CLOB;
-    l_storage_rlbk_clause CLOB;
-    l_result              PLS_INTEGER;
-    l_comp_result         PLS_INTEGER;
+    l_change_clause         CLOB;
+    l_revert_clause         CLOB;
+    l_storage_change_clause CLOB;
+    l_storage_revert_clause CLOB;
+    l_result                PLS_INTEGER;
+    l_comp_result           PLS_INTEGER;
   BEGIN
     l_result := gc_result_nochange;
 
@@ -1829,15 +1947,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     IF comp_value(in_source_physical_attr_rec.ini_trans, in_target_physical_attr_rec.ini_trans) = 1 THEN
       debug('Compare index physical_attr - alter');
       l_result := gc_result_alter;
-      l_frwd_clause := l_frwd_clause || get_clause(gc_initrans, in_target_physical_attr_rec.ini_trans);
-      l_rlbk_clause := l_rlbk_clause || get_clause(gc_initrans, in_source_physical_attr_rec.ini_trans);
+      l_change_clause := l_change_clause || get_clause(gc_initrans, in_target_physical_attr_rec.ini_trans);
+      l_revert_clause := l_revert_clause || get_clause(gc_initrans, in_source_physical_attr_rec.ini_trans);
     END IF;
     -- storage clauses
     l_comp_result := comp_storage(
                        in_source_storage_rec => in_source_physical_attr_rec.storage,
                        in_target_storage_rec => in_target_physical_attr_rec.storage,
-                       out_frwd_clause       => l_storage_frwd_clause,
-                       out_rlbk_clause       => l_storage_rlbk_clause
+                       out_change_clause     => l_storage_change_clause,
+                       out_revert_clause     => l_storage_revert_clause
                      );
     CASE l_comp_result
     WHEN gc_result_recreate THEN
@@ -1846,14 +1964,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     WHEN gc_result_alter THEN
       debug('Compare index physical_attr.sorage - alter');
       l_result := gc_result_alter;
-      l_frwd_clause := l_frwd_clause || get_clause(gc_storage, l_storage_frwd_clause, '(', ')');
-      l_rlbk_clause := l_rlbk_clause || get_clause(gc_storage, l_storage_rlbk_clause, '(', ')');
+      l_change_clause := l_change_clause || get_clause(gc_storage, l_storage_change_clause, '(', ')');
+      l_revert_clause := l_revert_clause || get_clause(gc_storage, l_storage_revert_clause, '(', ')');
     ELSE
       NULL;
     END CASE;
     IF l_result = gc_result_alter THEN
-      out_frwd_clause := l_frwd_clause;
-      out_rlbk_clause := l_rlbk_clause;
+      out_change_clause := l_change_clause;
+      out_revert_clause := l_revert_clause;
     END IF;
     RETURN l_result;
   END comp_index_physical_attr;
@@ -1862,8 +1980,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   FUNCTION comp_compression(
     in_source_compression_rec   IN cort_exec_pkg.gt_compression_rec,
     in_target_compression_rec   IN cort_exec_pkg.gt_compression_rec,
-    out_frwd_clause             OUT NOCOPY VARCHAR2,
-    out_rlbk_clause             OUT NOCOPY VARCHAR2
+    out_change_clause           OUT NOCOPY VARCHAR2,
+    out_revert_clause           OUT NOCOPY VARCHAR2
   )
   RETURN PLS_INTEGER
   AS
@@ -1872,8 +1990,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
        comp_value(in_source_compression_rec.compress_for, in_target_compression_rec.compress_for) = 1
     THEN
       debug('Compare compression - 1');
-      out_frwd_clause := get_compress_clause(in_target_compression_rec);
-      out_rlbk_clause := get_compress_clause(in_source_compression_rec);
+      out_change_clause := get_compress_clause(in_target_compression_rec);
+      out_revert_clause := get_compress_clause(in_source_compression_rec);
       RETURN 1;
     ELSE
       RETURN 0;
@@ -1884,19 +2002,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   FUNCTION comp_parallel(
     in_source_parallel_rec   IN cort_exec_pkg.gt_parallel_rec,
     in_target_parallel_rec   IN cort_exec_pkg.gt_parallel_rec,
-    out_frwd_clause          OUT NOCOPY VARCHAR2,
-    out_rlbk_clause          OUT NOCOPY VARCHAR2
+    out_change_clause        OUT NOCOPY VARCHAR2,
+    out_revert_clause        OUT NOCOPY VARCHAR2
   )
   RETURN PLS_INTEGER
   AS
-    l_frwd_clause         VARCHAR2(32767);
-    l_rlbk_clause         VARCHAR2(32767);
+    l_change_clause         VARCHAR2(32767);
+    l_revert_clause         VARCHAR2(32767);
   BEGIN
     IF comp_value(in_source_parallel_rec.degree, in_target_parallel_rec.degree) = 1 OR
        comp_value(in_source_parallel_rec.instances, in_target_parallel_rec.instances) = 1
     THEN
-      out_frwd_clause := get_clause(gc_degree, in_target_parallel_rec.degree)||get_clause(gc_instances, in_target_parallel_rec.instances);
-      out_rlbk_clause := get_clause(gc_degree, in_source_parallel_rec.degree)||get_clause(gc_instances, in_source_parallel_rec.instances);
+      out_change_clause := get_clause(gc_degree, in_target_parallel_rec.degree)||get_clause(gc_instances, in_target_parallel_rec.instances);
+      out_revert_clause := get_clause(gc_degree, in_source_parallel_rec.degree)||get_clause(gc_instances, in_source_parallel_rec.instances);
       RETURN 1;
     ELSE
       RETURN 0;
@@ -1922,15 +2040,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       ELSE
         NULL;
       END CASE;
-      IF cort_exec_pkg.g_params.tablespace.value_exists('SUBPARTITION') AND in_subpart_templ_arr(i).tablespace_name IS NOT NULL THEN
-        l_clause := l_clause || 'TABLESPACE "'||in_subpart_templ_arr(i).tablespace_name||'" ';
-      END IF;
+      l_clause := l_clause || 'TABLESPACE "'||in_subpart_templ_arr(i).tablespace_name||'" ';
       FOR j IN 1..in_subpart_templ_arr(i).lob_template_arr.COUNT LOOP
         l_lob_template_rec := in_subpart_templ_arr(i).lob_template_arr(j);
         l_clause := l_clause || 'LOB("'||l_lob_template_rec.lob_column_name||'") STORE AS "'||l_lob_template_rec.lob_segment_name||'" ';
-        IF cort_exec_pkg.g_params.tablespace.value_exists('LOB') AND l_lob_template_rec.tablespace_name IS NOT NULL THEN
-          l_clause := l_clause || '(TABLESPACE "'||l_lob_template_rec.tablespace_name||'") ';
-        END IF;
+        l_clause := l_clause || '(TABLESPACE "'||l_lob_template_rec.tablespace_name||'") ';
       END LOOP;
       IF i < in_subpart_templ_arr.COUNT THEN
         l_clause := l_clause || ',' || CHR(10);
@@ -1946,19 +2060,18 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   --   1 - if they differs and table must be recreated,
   --   2 - if source table could be changed  by ALTER command(s). out_alter_stmt_arr is also returned
   FUNCTION comp_tables(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
-    l_frwd_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_rlbk_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
-    l_result                 PLS_INTEGER;
-    l_comp_result            PLS_INTEGER;
+    l_change_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
+    l_result                   PLS_INTEGER;
+    l_comp_result              PLS_INTEGER;
   BEGIN
     l_result := gc_result_nochange;
 
@@ -2001,27 +2114,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       debug('Compare subpartitioning_type - 1');
       RETURN gc_result_recreate;
     END IF;
-    l_comp_result := comp_partitioning(
-                         in_source_table_rec => in_source_table_rec,
-                         in_target_table_rec => in_target_table_rec
-                       ); 
-    debug('comp_partitioning - '||l_comp_result);
-    
-                      
-    IF in_source_table_rec.subpartitioning_type <> 'NONE' OR 
-       in_target_table_rec.subpartitioning_type <> 'NONE' 
-    THEN
-      l_comp_result := comp_subpartitioning(
-                         in_source_table_rec => in_source_table_rec,
-                         in_target_table_rec => in_target_table_rec
-                       );
-      debug('comp_subpartitioning - '||l_comp_result);                  
-    END IF;  
-
-    IF l_comp_result > 0 THEN
+    IF comp_partitioning(in_source_table_rec,in_target_table_rec) = 1 THEN  
+      debug('comp_partitioning - 1');
       RETURN gc_result_recreate;
     END IF;  
-    
+    IF in_source_table_rec.subpartitioning_type <> 'NONE' AND 
+       in_target_table_rec.subpartitioning_type <> 'NONE' AND
+       comp_subpartitioning(
+         in_source_table_rec => in_source_table_rec,
+         in_target_table_rec => in_target_table_rec
+       ) = 1 
+    THEN
+      debug('comp_subpartitioning - 1');                  
+      RETURN gc_result_recreate;
+    END IF;  
     IF comp_value(in_source_table_rec.temporary, in_target_table_rec.temporary) = 1 THEN
       debug('Compare temporary - 1');
       RETURN gc_result_recreate;
@@ -2050,50 +2156,49 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     IF comp_parallel(
          in_source_parallel_rec  => in_source_table_rec.parallel_rec,
          in_target_parallel_rec  => in_target_table_rec.parallel_rec,
-         out_frwd_clause         => l_frwd_clause,
-         out_rlbk_clause         => l_rlbk_clause
+         out_change_clause       => l_change_clause,
+         out_revert_clause       => l_revert_clause
        ) = 1
     THEN
       l_result := greatest(gc_result_alter,l_result);
       debug('Compare parallel - '||l_result);
-      l_frwd_clause_indx_arr(gc_parallel) := get_clause(gc_parallel, l_frwd_clause, '(', ')');
-      l_rlbk_clause_indx_arr(gc_parallel) := get_clause(gc_parallel, l_rlbk_clause, '(', ')');
+      l_change_clause_indx_arr(gc_parallel) := get_clause(gc_parallel, l_change_clause, '(', ')');
+      l_revert_clause_indx_arr(gc_parallel) := get_clause(gc_parallel, l_revert_clause, '(', ')');
     END IF;
 
     -- cache
     IF comp_value(in_source_table_rec.cache, in_target_table_rec.cache) = 1 THEN
       l_result := greatest(gc_result_alter,l_result);
       debug('Compare cache - '||l_result);
-      l_frwd_clause_indx_arr(gc_cache) := get_clause(gc_cache, in_target_table_rec.cache);
-      l_rlbk_clause_indx_arr(gc_cache) := get_clause(gc_cache, in_source_table_rec.cache);
+      l_change_clause_indx_arr(gc_cache) := get_clause(gc_cache, in_target_table_rec.cache);
+      l_revert_clause_indx_arr(gc_cache) := get_clause(gc_cache, in_source_table_rec.cache);
     END IF;
 
     -- row movement
     IF comp_value(in_source_table_rec.row_movement, in_target_table_rec.row_movement) = 1 THEN
       l_result := greatest(gc_result_alter,l_result);
       debug('Compare row movement - '||l_result);
-      l_frwd_clause_indx_arr(gc_row_movement) := get_clause(gc_row_movement, in_target_table_rec.row_movement);
-      l_rlbk_clause_indx_arr(gc_row_movement) := get_clause(gc_row_movement, in_source_table_rec.row_movement);
+      l_change_clause_indx_arr(gc_row_movement) := get_clause(gc_row_movement, in_target_table_rec.row_movement);
+      l_revert_clause_indx_arr(gc_row_movement) := get_clause(gc_row_movement, in_source_table_rec.row_movement);
     END IF;
 
     -- monitoring
     IF comp_value(in_source_table_rec.monitoring, in_target_table_rec.monitoring) = 1 THEN
       l_result := greatest(gc_result_alter,l_result);
       debug('Compare monitoring - '||l_result);
-      l_frwd_clause_indx_arr(gc_monitoring) := get_clause(gc_monitoring, in_target_table_rec.monitoring);
-      l_rlbk_clause_indx_arr(gc_monitoring) := get_clause(gc_monitoring, in_source_table_rec.monitoring);
+      l_change_clause_indx_arr(gc_monitoring) := get_clause(gc_monitoring, in_target_table_rec.monitoring);
+      l_revert_clause_indx_arr(gc_monitoring) := get_clause(gc_monitoring, in_source_table_rec.monitoring);
     END IF;
 
     -- MOVE only
     -- Tablespace
-    IF cort_exec_pkg.g_params.tablespace.value_exists('TABLE') AND
-       in_source_table_rec.partitioned = 'NO' AND
+    IF in_source_table_rec.partitioned = 'NO' AND
        comp_value(in_source_table_rec.tablespace_name, in_target_table_rec.tablespace_name) = 1
     THEN
       l_result := gc_result_alter_move;
       debug('Compare tablespace - 1');
-      l_frwd_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_target_table_rec.tablespace_name, '"', '"');
-      l_rlbk_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_source_table_rec.tablespace_name, '"', '"');
+      l_change_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_target_table_rec.tablespace_name, '"', '"');
+      l_revert_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_source_table_rec.tablespace_name, '"', '"');
     END IF;
 
 
@@ -2111,17 +2216,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       debug('Source logging = "'||in_source_table_rec.logging||'"');
       debug('Target logging = "'||in_target_table_rec.logging||'"');
       debug('Logging clause = '||get_clause(gc_logging, in_target_table_rec.logging));
-      l_frwd_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_target_table_rec.logging);
-      l_rlbk_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_source_table_rec.logging);
+      l_change_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_target_table_rec.logging);
+      l_revert_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_source_table_rec.logging);
     END IF;
 
     -- storage physical attributes (including storage)
-    IF cort_exec_pkg.g_params.physical_attr.value_exists('TABLE') THEN
+    IF cort_exec_pkg.g_params.physical_attr.exist('TABLE') THEN
       l_comp_result := comp_physical_attr(
                          in_source_physical_attr_rec => in_source_table_rec.physical_attr_rec,
                          in_target_physical_attr_rec => in_target_table_rec.physical_attr_rec,
-                         out_frwd_clause             => l_frwd_clause,
-                         out_rlbk_clause             => l_rlbk_clause
+                         out_change_clause           => l_change_clause,
+                         out_revert_clause           => l_revert_clause
                        );
     ELSE
 
@@ -2139,8 +2244,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_result := gc_result_alter;
       END IF;
       debug('Compare physical_attr_rec - '||l_result);
-      l_frwd_clause_indx_arr(gc_physical_attr) := l_frwd_clause;
-      l_rlbk_clause_indx_arr(gc_physical_attr) := l_rlbk_clause;
+      l_change_clause_indx_arr(gc_physical_attr) := l_change_clause;
+      l_revert_clause_indx_arr(gc_physical_attr) := l_revert_clause;
     ELSE
       NULL;
     END CASE;
@@ -2149,8 +2254,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     IF comp_compression(
          in_source_compression_rec  => in_source_table_rec.compression_rec,
          in_target_compression_rec  => in_target_table_rec.compression_rec,
-         out_frwd_clause            => l_frwd_clause,
-         out_rlbk_clause            => l_rlbk_clause
+         out_change_clause            => l_change_clause,
+         out_revert_clause            => l_revert_clause
        ) = 1
     THEN
       IF cort_exec_pkg.g_params.change.get_value = 'MOVE' THEN
@@ -2159,8 +2264,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_result := gc_result_alter;
       END IF;
       debug('Compare compression - '||l_result);
-      l_frwd_clause_indx_arr(gc_compression) := l_frwd_clause;
-      l_rlbk_clause_indx_arr(gc_compression) := l_rlbk_clause;
+      l_change_clause_indx_arr(gc_compression) := l_change_clause;
+      l_revert_clause_indx_arr(gc_compression) := l_revert_clause;
     END IF;
 
     -- IOT attribytes
@@ -2173,8 +2278,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_result := gc_result_alter;
       END IF;
       debug('Compare IOT pctthreshold - '||l_result);
-      l_frwd_clause_indx_arr(gc_pct_threshold) := get_clause(gc_pct_threshold, in_target_table_rec.iot_pct_threshold);
-      l_rlbk_clause_indx_arr(gc_pct_threshold) := get_clause(gc_pct_threshold, in_source_table_rec.iot_pct_threshold);
+      l_change_clause_indx_arr(gc_pct_threshold) := get_clause(gc_pct_threshold, in_target_table_rec.iot_pct_threshold);
+      l_revert_clause_indx_arr(gc_pct_threshold) := get_clause(gc_pct_threshold, in_source_table_rec.iot_pct_threshold);
     END IF;
 
     -- key compression
@@ -2187,8 +2292,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_result := gc_result_alter;
       END IF;
       debug('Compare IOT key compression - '||l_result);
-      l_frwd_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, in_target_table_rec.iot_key_compression, NULL, ' '||in_target_table_rec.iot_prefix_length);
-      l_rlbk_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, in_source_table_rec.iot_key_compression, NULL, ' '||in_source_table_rec.iot_prefix_length);
+      l_change_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, in_target_table_rec.iot_key_compression, NULL, ' '||in_target_table_rec.iot_prefix_length);
+      l_revert_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, in_source_table_rec.iot_key_compression, NULL, ' '||in_source_table_rec.iot_prefix_length);
     END IF;
 
     -- mapping
@@ -2200,8 +2305,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_result := gc_result_alter;
       END IF;
       debug('Compare IOT mappoing - '||l_result);
-      l_frwd_clause_indx_arr(gc_mapping) := get_clause(gc_mapping, in_target_table_rec.mapping_table);
-      l_rlbk_clause_indx_arr(gc_mapping) := get_clause(gc_mapping, in_source_table_rec.mapping_table);
+      l_change_clause_indx_arr(gc_mapping) := get_clause(gc_mapping, in_target_table_rec.mapping_table);
+      l_revert_clause_indx_arr(gc_mapping) := get_clause(gc_mapping, in_source_table_rec.mapping_table);
     END IF;
 
     -- IOT overflow clause
@@ -2218,12 +2323,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           l_result := gc_result_alter;
         END IF;
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_table_name    => in_source_table_rec.table_name,
           in_owner         => in_source_table_rec.owner,
-          in_frwd_clause   => gc_add_overflow,
-          in_rlbk_clause   => NULL
+          in_change_clause => gc_add_overflow,
+          in_revert_clause => NULL
         );
       END IF;
 
@@ -2235,15 +2339,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           l_result := gc_result_alter;
         END IF;
         debug('Compare IOT overflow - '||l_result);
-        l_frwd_clause_indx_arr(gc_overflow) := gc_overflow;
-        l_rlbk_clause_indx_arr(gc_overflow) := gc_overflow;
-        l_frwd_clause_indx_arr(gc_including_column) := get_clause(gc_including_column, in_target_table_rec.iot_include_column);
-        l_rlbk_clause_indx_arr(gc_including_column) := get_clause(gc_including_column, in_source_table_rec.iot_include_column);
+        l_change_clause_indx_arr(gc_overflow) := gc_overflow;
+        l_revert_clause_indx_arr(gc_overflow) := gc_overflow;
+        l_change_clause_indx_arr(gc_including_column) := get_clause(gc_including_column, in_target_table_rec.iot_include_column);
+        l_revert_clause_indx_arr(gc_including_column) := get_clause(gc_including_column, in_source_table_rec.iot_include_column);
       END IF;
 
       -- overflow tablespace
-      IF cort_exec_pkg.g_params.tablespace.value_exists('TABLE') AND
-         comp_value(in_source_table_rec.overflow_tablespace, in_target_table_rec.overflow_tablespace) = 1
+      IF comp_value(in_source_table_rec.overflow_tablespace, in_target_table_rec.overflow_tablespace) = 1
       THEN
         IF cort_exec_pkg.g_params.change.get_value = 'MOVE' THEN
           l_result := gc_result_alter_move;
@@ -2251,10 +2354,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           l_result := gc_result_alter;
         END IF;
         debug('Compare IOT overflow tablespace - '||l_result);
-        l_frwd_clause_indx_arr(gc_overflow) := gc_overflow;
-        l_rlbk_clause_indx_arr(gc_overflow) := gc_overflow;
-        l_frwd_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_tablespace, in_target_table_rec.overflow_tablespace, '"', '"');
-        l_rlbk_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_tablespace, in_source_table_rec.overflow_tablespace, '"', '"');
+        l_change_clause_indx_arr(gc_overflow) := gc_overflow;
+        l_revert_clause_indx_arr(gc_overflow) := gc_overflow;
+        l_change_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_tablespace, in_target_table_rec.overflow_tablespace, '"', '"');
+        l_revert_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_tablespace, in_source_table_rec.overflow_tablespace, '"', '"');
       END IF;
 
       -- overflow logging
@@ -2267,19 +2370,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           l_result := gc_result_alter;
         END IF;
         debug('Compare IOT overflow logging - '||l_result);
-        l_frwd_clause_indx_arr(gc_overflow) := gc_overflow;
-        l_rlbk_clause_indx_arr(gc_overflow) := gc_overflow;
-        l_frwd_clause_indx_arr(gc_overflow_logging) := get_clause(gc_logging, in_target_table_rec.overflow_logging);
-        l_rlbk_clause_indx_arr(gc_overflow_logging) := get_clause(gc_logging, in_source_table_rec.overflow_logging);
+        l_change_clause_indx_arr(gc_overflow) := gc_overflow;
+        l_revert_clause_indx_arr(gc_overflow) := gc_overflow;
+        l_change_clause_indx_arr(gc_overflow_logging) := get_clause(gc_logging, in_target_table_rec.overflow_logging);
+        l_revert_clause_indx_arr(gc_overflow_logging) := get_clause(gc_logging, in_source_table_rec.overflow_logging);
       END IF;
 
       -- Overflow storage physical attributes (including storage)
-      IF cort_exec_pkg.g_params.physical_attr.value_exists('INDEX') THEN
+      IF cort_exec_pkg.g_params.physical_attr.exist('INDEX') THEN
         l_comp_result := comp_index_physical_attr(
                            in_source_physical_attr_rec => in_source_table_rec.overflow_physical_attr_rec,
                            in_target_physical_attr_rec => in_target_table_rec.overflow_physical_attr_rec,
-                           out_frwd_clause             => l_frwd_clause,
-                           out_rlbk_clause             => l_rlbk_clause
+                           out_change_clause           => l_change_clause,
+                           out_revert_clause           => l_revert_clause
                          );
 
         CASE l_comp_result
@@ -2293,10 +2396,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             l_result := gc_result_alter;
           END IF;
           debug('Compare IOT overflow physical_attr_rec - alter');
-          l_frwd_clause_indx_arr(gc_overflow) := gc_overflow;
-          l_rlbk_clause_indx_arr(gc_overflow) := gc_overflow;
-          l_frwd_clause_indx_arr(gc_overflow_physical_attr) := l_frwd_clause;
-          l_rlbk_clause_indx_arr(gc_overflow_physical_attr) := l_rlbk_clause;
+          l_change_clause_indx_arr(gc_overflow) := gc_overflow;
+          l_revert_clause_indx_arr(gc_overflow) := gc_overflow;
+          l_change_clause_indx_arr(gc_overflow_physical_attr) := l_change_clause;
+          l_revert_clause_indx_arr(gc_overflow_physical_attr) := l_revert_clause;
         ELSE
           NULL;
         END CASE;
@@ -2306,97 +2409,93 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
     IF l_result = gc_result_alter_move THEN
-      l_frwd_clause := get_clause_by_name(l_frwd_clause_indx_arr, gc_parallel)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_cache)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_row_movement)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_monitoring);
-      l_rlbk_clause := get_clause_by_name(l_rlbk_clause_indx_arr, gc_parallel)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_cache)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_row_movement)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_monitoring);
+      l_change_clause := get_clause_by_name(l_change_clause_indx_arr, gc_parallel)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_cache)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_row_movement)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_monitoring);
+      l_revert_clause := get_clause_by_name(l_revert_clause_indx_arr, gc_parallel)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_cache)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_row_movement)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_monitoring);
 
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_table_name    => in_source_table_rec.table_name,
         in_owner         => in_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause
       );
 
-      l_frwd_clause := gc_move||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_tablespace)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_logging)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_physical_attr)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_compression)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_pct_threshold)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_key_compression)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_mapping)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_including_column)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_tablespace)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_logging)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_physical_attr);
+      l_change_clause := gc_move||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_tablespace)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_logging)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_physical_attr)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_compression)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_pct_threshold)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_key_compression)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_mapping)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_including_column)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_tablespace)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_logging)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_physical_attr);
 
-      l_rlbk_clause := gc_move||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_tablespace)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_logging)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_physical_attr)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_compression)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_pct_threshold)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_key_compression)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_mapping)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_including_column)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_tablespace)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_logging)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_physical_attr);
+      l_revert_clause := gc_move||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_tablespace)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_logging)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_physical_attr)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_compression)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_pct_threshold)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_key_compression)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_mapping)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_including_column)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_tablespace)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_logging)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_physical_attr);
 
-      IF cort_exec_pkg.g_params.parallel.get_num_value > 1 THEN
-        l_frwd_clause := l_frwd_clause||get_clause(gc_parallel, cort_exec_pkg.g_params.parallel.get_num_value);
-        l_rlbk_clause := l_rlbk_clause||get_clause(gc_parallel, cort_exec_pkg.g_params.parallel.get_num_value);
-      END IF;
+      l_change_clause := l_change_clause||get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_num_value);
+      l_revert_clause := l_revert_clause||get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_num_value);
 
 
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_table_name    => in_source_table_rec.table_name,
         in_owner         => in_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause,
+        in_group_type    => 'ALTER TABLE MOVE'
       );
     ELSIF l_result = gc_result_alter THEN
-      l_frwd_clause := get_clause_by_name(l_frwd_clause_indx_arr, gc_logging)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_physical_attr)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_compression)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_parallel)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_cache)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_row_movement)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_monitoring)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_tablespace)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_logging)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_physical_attr);
-      l_rlbk_clause := get_clause_by_name(l_rlbk_clause_indx_arr, gc_logging)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_physical_attr)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_compression)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_parallel)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_cache)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_row_movement)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_monitoring)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_tablespace)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_logging)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_physical_attr);
+      l_change_clause := get_clause_by_name(l_change_clause_indx_arr, gc_logging)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_physical_attr)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_compression)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_parallel)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_cache)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_row_movement)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_monitoring)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_tablespace)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_logging)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_physical_attr);
+      l_revert_clause := get_clause_by_name(l_revert_clause_indx_arr, gc_logging)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_physical_attr)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_compression)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_parallel)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_cache)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_row_movement)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_monitoring)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_tablespace)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_logging)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_physical_attr);
 
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_table_name    => in_source_table_rec.table_name,
         in_owner         => in_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause
       );
     END IF;
 
@@ -2405,46 +2504,42 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       IF comp_value(in_source_table_rec.interval, in_target_table_rec.interval) = 1 THEN
         l_result := greatest(gc_result_alter, l_result);
         debug('Compare partitioning interval - 1');
-        l_frwd_clause := get_clause(gc_interval, nvl(in_target_table_rec.interval,' '), '(', ')');
-        l_rlbk_clause := get_clause(gc_interval, nvl(in_source_table_rec.interval,' '), '(', ')');
+        l_change_clause := get_clause(gc_interval, nvl(in_target_table_rec.interval,' '), '(', ')');
+        l_revert_clause := get_clause(gc_interval, nvl(in_source_table_rec.interval,' '), '(', ')');
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_table_name    => in_source_table_rec.table_name,
           in_owner         => in_source_table_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          in_change_clause => l_change_clause,
+          in_revert_clause => l_revert_clause
         );
       END IF;
 
-      IF cort_exec_pkg.g_params.tablespace.value_exists('TABLE')  AND
-         comp_value(in_source_table_rec.tablespace_name, in_target_table_rec.tablespace_name) = 1 THEN
+      IF comp_value(in_source_table_rec.tablespace_name, in_target_table_rec.tablespace_name) = 1 THEN
         l_result := greatest(gc_result_alter, l_result);
         debug('Compare partitioning table tablespace - 1');
-        l_frwd_clause := get_clause(gc_modify_default_attrs, get_clause(gc_tablespace, in_target_table_rec.tablespace_name, '"', '"'));
-        l_rlbk_clause := get_clause(gc_modify_default_attrs, get_clause(gc_tablespace, in_source_table_rec.tablespace_name, '"', '"'));
+        l_change_clause := get_clause(gc_modify_default_attrs, get_clause(gc_tablespace, in_target_table_rec.tablespace_name, '"', '"'));
+        l_revert_clause := get_clause(gc_modify_default_attrs, get_clause(gc_tablespace, in_source_table_rec.tablespace_name, '"', '"'));
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_table_name    => in_source_table_rec.table_name,
           in_owner         => in_source_table_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          in_change_clause => l_change_clause,
+          in_revert_clause => l_revert_clause
         );
       END IF;
 
-      l_frwd_clause := get_subpart_template_clause(in_target_table_rec.subpartition_template_arr);
-      l_rlbk_clause := get_subpart_template_clause(in_source_table_rec.subpartition_template_arr);
-      IF comp_value(l_frwd_clause, l_rlbk_clause) = 1 THEN
+      l_change_clause := get_subpart_template_clause(in_target_table_rec.subpartition_template_arr);
+      l_revert_clause := get_subpart_template_clause(in_source_table_rec.subpartition_template_arr);
+      IF comp_value(l_change_clause, l_revert_clause) = 1 THEN
         l_result := greatest(gc_result_alter, l_result);
-        debug('Compare partitioning table subpartition template - 1');
+        debug('Compare partitioning table subpartition template - 1', 'l_change_clause = '||l_change_clause||chr(10)||'l_revert_clause = '||l_revert_clause);
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_table_name    => in_source_table_rec.table_name,
           in_owner         => in_source_table_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          in_change_clause => l_change_clause,
+          in_revert_clause => l_revert_clause
         );
       END IF;
     END IF;
@@ -2506,7 +2601,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
     l_clause_indx_arr(gc_freepools) := get_clause(gc_freepools, in_lob_rec.freepools);
     IF in_lob_rec.securefile = 'YES' THEN
-      l_clause_indx_arr(gc_retention) := get_clause(gc_retention, in_lob_rec.retention, null, case when in_lob_rec.retention = 'MIN' then to_char(in_lob_rec.min_retention) end);
+      l_clause_indx_arr(gc_retention) := get_clause(gc_retention, in_lob_rec.retention) || case when in_lob_rec.retention = 'MIN' then ' '||to_char(in_lob_rec.min_retention) end;
     END IF;
     l_clause_indx_arr(gc_deduplication) := get_clause(gc_deduplication, in_lob_rec.deduplication);
     l_clause_indx_arr(gc_lob_compression) := get_clause(gc_lob_compression, in_lob_rec.compression);
@@ -2550,6 +2645,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_lob_rec          cort_exec_pkg.gt_lob_rec;
     l_xml_rec          cort_exec_pkg.gt_xml_col_rec;
     l_varray_rec       cort_exec_pkg.gt_varray_rec;
+    l_nested_table_rec cort_exec_pkg.gt_nested_table_rec;
   BEGIN
     l_column_name := in_column_rec.column_name;
     l_column_indx := in_column_rec.column_indx;
@@ -2594,9 +2690,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     ELSE -- varray
       IF in_table_rec.varray_arr.EXISTS(l_column_indx)
       THEN
-        l_column_indx := in_table_rec.column_indx_arr(l_column_name);
         l_varray_rec := in_table_rec.varray_arr(l_column_indx);
         l_clause_indx_arr(gc_varray) := get_clause(gc_varray, in_column_rec.column_name, '"', '"');
+        l_clause_indx_arr(gc_substitution_column) := get_clause(gc_substitution_column, l_varray_rec.element_substitutable); 
         IF l_varray_rec.lob_column_indx IS NOT NULL AND
            in_table_rec.lob_arr.EXISTS(l_varray_rec.lob_column_indx)
         THEN
@@ -2606,9 +2702,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           l_clause_indx_arr(gc_lob_params) := get_clause(gc_lob_params, get_lob_storage_params(l_lob_rec), '(', ')');
         END IF;
         l_clause := get_clause_by_name(l_clause_indx_arr, gc_varray)||
+                    get_clause_by_name(l_clause_indx_arr, gc_substitution_column)||
                     get_clause_by_name(l_clause_indx_arr, gc_store_as)||
                     get_clause_by_name(l_clause_indx_arr, gc_lob_item)||
                     get_clause_by_name(l_clause_indx_arr, gc_lob_params);
+      END IF;
+      IF in_table_rec.nested_tables_arr.EXISTS(l_column_indx)
+      THEN
+        l_nested_table_rec := in_table_rec.nested_tables_arr(l_column_indx);
+        cort_exec_pkg.raise_error('Nested tables are not supported by CORT');
       END IF;
     END CASE;
     RETURN l_clause;
@@ -2623,8 +2725,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   AS
     l_clause_indx_arr   arrays.gt_xlstr_indx;
   BEGIN
-    IF in_column_rec.virtual_column = 'NO' THEN
-      l_clause_indx_arr(gc_data_type) := get_column_type_clause(in_column_rec);
+    IF in_column_rec.virtual_column = 'YES' AND in_column_rec.data_default IS NOT NULL THEN    
+      l_clause_indx_arr(gc_generated_always_as) := get_clause(gc_generated_always_as, in_column_rec.data_default, '(', ')');
+      l_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_column_rec.nullable);
+
+      RETURN '"'||in_column_rec.column_name||'" '||
+             get_clause_by_name(l_clause_indx_arr, gc_generated_always_as)||
+             get_clause_by_name(l_clause_indx_arr, gc_nullable);
+    ELSE
+      IF in_column_rec.data_type_owner IS NOT NULL AND in_column_rec.original_data_type <> in_column_rec.data_type THEN
+        l_clause_indx_arr(gc_data_type) := ' '||in_column_rec.data_type_mod||' "'||in_column_rec.data_type_owner||'"."'||in_column_rec.original_data_type||'" ';
+      ELSE
+        l_clause_indx_arr(gc_data_type) := get_column_type_clause(in_column_rec);
+      END IF;
       l_clause_indx_arr(gc_default) := get_clause(gc_default, in_column_rec.data_default);
       l_clause_indx_arr(gc_encryption) := get_clause(gc_encryption, in_column_rec.encryption_alg) || get_clause(gc_salt, in_column_rec.salt);
       l_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_column_rec.nullable);
@@ -2633,13 +2746,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
              get_clause_by_name(l_clause_indx_arr, gc_data_type)||
              get_clause_by_name(l_clause_indx_arr, gc_default)||
              get_clause_by_name(l_clause_indx_arr, gc_encryption)||
-             get_clause_by_name(l_clause_indx_arr, gc_nullable);
-    ELSE
-      l_clause_indx_arr(gc_generated_always_as) := get_clause(gc_generated_always_as, in_column_rec.data_default, '(', ')');
-      l_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_column_rec.nullable);
-
-      RETURN '"'||in_column_rec.column_name||'" '||
-             get_clause_by_name(l_clause_indx_arr, gc_generated_always_as)||
              get_clause_by_name(l_clause_indx_arr, gc_nullable);
     END IF;
   END get_column_clause;
@@ -2679,74 +2785,60 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- Add column.
   PROCEDURE add_column(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_column_rec          IN cort_exec_pkg.gt_column_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_column_rec       IN cort_exec_pkg.gt_column_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
   BEGIN
-    l_frwd_clause := gc_add_column||' '||get_add_column_clause(in_target_table_rec, in_column_rec);
-    l_rlbk_clause := get_clause(gc_drop_column, in_column_rec.column_name, '"', '"');
-
     add_alter_table_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+      io_change_arr    => io_change_arr,
       in_table_name    => in_source_table_rec.table_name,
       in_owner         => in_source_table_rec.owner,
-      in_frwd_clause   => l_frwd_clause,
-      in_rlbk_clause   => l_rlbk_clause
+      in_change_clause => gc_add_column||' '||get_add_column_clause(in_target_table_rec, in_column_rec),
+      in_revert_clause => get_clause(gc_drop_column, in_column_rec.column_name, '"', '"')
     );
   END add_column;
 
   -- Drop column
   PROCEDURE drop_column(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_column_rec          IN cort_exec_pkg.gt_column_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_column_rec       IN cort_exec_pkg.gt_column_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause          CLOB;
+    l_revert_clause          CLOB;
     l_column_rec             cort_exec_pkg.gt_column_rec;
   BEGIN
 
-    CASE cort_exec_pkg.g_params.drop_column.get_value
-    WHEN 'DROP' THEN
-      l_frwd_clause := get_clause(gc_drop_column, in_column_rec.column_name, '"', '"')||gc_cascade_constraints;
-      l_rlbk_clause := NULL;
-    WHEN 'SET_UNUSED' THEN
-      l_frwd_clause := get_clause(gc_set_unused_column, in_column_rec.column_name, '"', '"')||gc_cascade_constraints;
-      l_rlbk_clause := NULL;
-    WHEN 'SET_INVISIBLE' THEN
-      l_frwd_clause := get_clause(gc_modify, in_column_rec.column_name, '"', '"')||gc_invisible;
-      l_rlbk_clause := get_clause(gc_modify, in_column_rec.column_name, '"', '"')||gc_visible;
-    WHEN 'RECREATE' THEN
-       NULL;
+    CASE  
+    WHEN cort_exec_pkg.g_params.compare.exist('IGNORE_INVISIBLE') AND dbms_db_version.version >= 12 THEN
+      l_change_clause := get_clause(gc_modify, in_column_rec.column_name, '"', '"')||gc_invisible;
+      l_revert_clause := get_clause(gc_modify, in_column_rec.column_name, '"', '"')||gc_visible;
+    WHEN cort_exec_pkg.g_params.compare.exist('IGNORE_UNUSED') THEN
+      l_change_clause := get_clause(gc_set_unused_column, in_column_rec.column_name, '"', '"')||gc_cascade_constraints;
+      IF cort_exec_pkg.g_params.compare.exist('IGNORE_ORDER') THEN
+        l_column_rec := in_column_rec;
+        IF l_column_rec.nullable = 'N' AND l_column_rec.data_default IS NULL THEN
+          l_column_rec.nullable := 'Y';
+        END IF;
+        l_revert_clause := gc_add_column||' '||get_add_column_clause(in_source_table_rec, l_column_rec);
+      ELSE
+        l_revert_clause := NULL;
+      END IF;
+    ELSE
+      l_change_clause := get_clause(gc_drop_column, in_column_rec.column_name, '"', '"')||gc_cascade_constraints;
+      l_revert_clause := NULL;
     END CASE;
 
-    IF cort_exec_pkg.g_params.drop_column.get_value IN ('DROP','SET_UNUSED') AND
-       cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER')
-    THEN
-      l_frwd_clause := get_clause(gc_set_unused_column, in_column_rec.column_name, '"', '"')||gc_cascade_constraints;
-      l_column_rec := in_column_rec;
-      IF l_column_rec.nullable = 'N' AND l_column_rec.data_default IS NULL THEN
-        l_column_rec.nullable := 'Y';
-      END IF;
-      l_rlbk_clause := gc_add_column||' '||get_add_column_clause(in_source_table_rec, l_column_rec);
-    END IF;
-
     add_alter_table_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+      io_change_arr    => io_change_arr,
       in_table_name    => in_source_table_rec.table_name,
       in_owner         => in_source_table_rec.owner,
-      in_frwd_clause   => l_frwd_clause,
-      in_rlbk_clause   => l_rlbk_clause
+      in_change_clause => l_change_clause,
+      in_revert_clause => l_revert_clause
     );
   END drop_column;
 
@@ -3020,20 +3112,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- compare one column
   FUNCTION comp_column(
-    io_source_table_rec    IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    in_source_column_rec   IN cort_exec_pkg.gt_column_rec,
-    in_target_column_rec   IN cort_exec_pkg.gt_column_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- rollback alter statements
-    in_check_name          IN BOOLEAN DEFAULT TRUE
+    io_source_table_rec  IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    in_source_column_rec IN cort_exec_pkg.gt_column_rec,
+    in_target_column_rec IN cort_exec_pkg.gt_column_rec,
+    io_change_arr        IN OUT NOCOPY cort_exec_pkg.gt_change_arr,
+    in_check_name        IN BOOLEAN DEFAULT TRUE
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
-    l_frwd_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_rlbk_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_change_clause          CLOB;
+    l_revert_clause          CLOB;
+    l_change_clause_indx_arr arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr arrays.gt_xlstr_indx;
     l_skip_comp_data_length  BOOLEAN := FALSE;
     l_revert_flag            BOOLEAN := TRUE;
   BEGIN
@@ -3041,7 +3132,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_result := gc_result_nochange;
 
     IF comp_value(in_source_column_rec.segment_column_id, in_target_column_rec.segment_column_id) = 1 AND
-       NOT cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER')
+       NOT cort_exec_pkg.g_params.compare.exist('IGNORE_ORDER')
     THEN
       debug('Column '||in_source_column_rec.column_name||' - changed segment position');
       RETURN gc_result_recreate;
@@ -3053,8 +3144,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       RETURN gc_result_recreate;
     END IF;
 
-    l_frwd_clause_indx_arr(gc_column_name) := get_clause(gc_modify_column, in_source_column_rec.column_name, '"', '"');
-    l_rlbk_clause_indx_arr(gc_column_name) := get_clause(gc_modify_column, in_source_column_rec.column_name, '"', '"');
+    l_change_clause_indx_arr(gc_column_name) := get_clause(gc_modify_column, in_source_column_rec.column_name, '"', '"');
+    l_revert_clause_indx_arr(gc_column_name) := get_clause(gc_modify_column, in_source_column_rec.column_name, '"', '"');
     IF in_source_column_rec.virtual_column = 'YES' THEN
       -- compare virtual columns
       -- Check expression
@@ -3066,8 +3157,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           RETURN gc_result_exchange;
         ELSE
           l_result := gc_result_alter;
-          l_frwd_clause_indx_arr(gc_generated_always_as) := get_clause(gc_generated_always_as, in_target_column_rec.data_default, '(', ')');
-          l_rlbk_clause_indx_arr(gc_generated_always_as) := get_clause(gc_generated_always_as, in_source_column_rec.data_default, '(', ')');
+          l_change_clause_indx_arr(gc_generated_always_as) := get_clause(gc_generated_always_as, in_target_column_rec.data_default, '(', ')');
+          l_revert_clause_indx_arr(gc_generated_always_as) := get_clause(gc_generated_always_as, in_source_column_rec.data_default, '(', ')');
         END IF;
       END IF;
 
@@ -3075,13 +3166,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       IF comp_value(in_source_column_rec.nullable, in_target_column_rec.nullable) = 1 THEN
         l_result := gc_result_alter;
         IF in_target_column_rec.notnull_constraint_name IS NOT NULL THEN
-          l_frwd_clause_indx_arr(gc_constraint) := get_clause(gc_constraint, in_target_column_rec.notnull_constraint_name, '"', '"');
+          l_change_clause_indx_arr(gc_constraint) := get_clause(gc_constraint, in_target_column_rec.notnull_constraint_name, '"', '"');
         END IF;
         IF in_source_column_rec.notnull_constraint_name IS NOT NULL THEN
-          l_rlbk_clause_indx_arr(gc_constraint) := get_clause(gc_constraint, in_source_column_rec.notnull_constraint_name, '"', '"');
+          l_revert_clause_indx_arr(gc_constraint) := get_clause(gc_constraint, in_source_column_rec.notnull_constraint_name, '"', '"');
         END IF;
-        l_frwd_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_target_column_rec.nullable);
-        l_rlbk_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_source_column_rec.nullable);
+        l_change_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_target_column_rec.nullable);
+        l_revert_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_source_column_rec.nullable);
       END IF;
       -- end of virtual column section
     ELSE
@@ -3091,7 +3182,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
          comp_value(in_source_column_rec.data_type_mod, in_target_column_rec.data_type_mod) = 1 OR
          comp_value(in_source_column_rec.data_type_owner, in_target_column_rec.data_type_owner) = 1 THEN
 
-        IF in_target_column_rec.cort_value IS NOT NULL AND  -- there is cort-value
+        IF cort_exec_pkg.g_params.data_values.get_value(in_target_column_rec.column_name) IS NOT NULL AND  -- there is cort-value
            in_source_column_rec.new_column_name IS NULL  -- but this cort-value is just reference on another column
         THEN
           debug('Column '||in_source_column_rec.column_name||' - changed type (with cort-value) - '||gc_result_recreate);
@@ -3125,8 +3216,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           THEN
             -- non-revertable
             debug('Column '||in_source_column_rec.column_name||' - changed type (CHAR/VARCHAR2|NCHAR/NVARCHAR2) - '||gc_result_alter);
-            l_frwd_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
-            l_rlbk_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
+            l_change_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
+            l_revert_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
           ELSIF
              (in_source_column_rec.data_type = 'TIMESTAMP' AND in_target_column_rec.data_type = 'DATE') OR
              (in_source_column_rec.data_type = 'DATE' AND in_target_column_rec.data_type = 'TIMESTAMP') OR
@@ -3141,10 +3232,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           THEN
             l_skip_comp_data_length := TRUE;
             debug('Column '||in_source_column_rec.column_name||' - changed type (NUMBER/FLOAT)|(DATE/TIMESTAMP) - '||gc_result_alter);
-            l_frwd_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
-            l_rlbk_clause_indx_arr(gc_data_type) := get_column_type_clause(in_source_column_rec);
+            l_change_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
+            l_revert_clause_indx_arr(gc_data_type) := get_column_type_clause(in_source_column_rec);
           ELSE
-            debug('Column '||in_source_column_rec.column_name||' - non-revertable changed type (scalar datatype)');
+            debug('Column '||in_source_column_rec.column_name||' - non-revertable changed type ('||in_target_column_rec.data_type||')');
             RETURN gc_result_recreate;
           END IF;
         END IF;
@@ -3161,7 +3252,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           comp_value(in_source_column_rec.data_precision, in_target_column_rec.data_precision) = 1 OR
           comp_value(in_source_column_rec.data_scale, in_target_column_rec.data_scale) = 1)
       THEN
-        IF in_target_column_rec.cort_value IS NOT NULL THEN
+        IF cort_exec_pkg.g_params.data_values.get_value(in_target_column_rec.column_name) IS NOT NULL THEN
           debug('Column '||in_source_column_rec.column_name||' - changed data_length/data_scale/data_precision (with cort-value) - '||gc_result_recreate);
           -- if complex data type
           RETURN gc_result_recreate;
@@ -3171,8 +3262,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         IF in_target_column_rec.data_type IN ('VARCHAR2','NVARCHAR2','RAW','CHAR','NCHAR')
         THEN
           debug('Column '||in_source_column_rec.column_name||' - VARCHAR2/NVARCHAR2/RAW/CHAR/NCHAR revertable changes of length - '||gc_result_alter);
-          l_frwd_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
-          l_rlbk_clause_indx_arr(gc_data_type) := get_column_type_clause(in_source_column_rec);
+          l_change_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
+          l_revert_clause_indx_arr(gc_data_type) := get_column_type_clause(in_source_column_rec);
         ELSIF
           in_target_column_rec.data_type = 'FLOAT' AND
           in_source_column_rec.data_type = 'FLOAT' AND
@@ -3180,8 +3271,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                                                       FLOOR(CEIL(in_source_column_rec.data_precision*0.30103)*3.32193)
         THEN
           debug('Column '||in_source_column_rec.column_name||' - FLOAT revertable change of length - '||gc_result_alter);
-          l_frwd_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
-          l_rlbk_clause_indx_arr(gc_data_type) := get_column_type_clause(in_source_column_rec);
+          l_change_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
+          l_revert_clause_indx_arr(gc_data_type) := get_column_type_clause(in_source_column_rec);
         ELSE
           -- non-revertable increasing changes of length.
           -- These changes will not reverted BUT they do not lead to data losses or application invalidation.
@@ -3207,8 +3298,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           THEN
             -- non-revertable
             debug('Column '||in_source_column_rec.column_name||' - non-revertable increasing of length - '||gc_result_alter);
-            l_frwd_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
-            l_rlbk_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
+            l_change_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
+            l_revert_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
             l_revert_flag := FALSE;
           ELSE
             debug('Column '||in_source_column_rec.column_name||' - changed data_length/data_scale/data_precision - '||gc_result_recreate);
@@ -3222,68 +3313,67 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
          comp_value(in_source_column_rec.char_used, in_target_column_rec.char_used) = 1
       THEN
         l_result := gc_result_alter;
-        l_frwd_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
-        l_rlbk_clause_indx_arr(gc_data_type) := get_column_type_clause(in_source_column_rec);
+        l_change_clause_indx_arr(gc_data_type) := get_column_type_clause(in_target_column_rec);
+        l_revert_clause_indx_arr(gc_data_type) := get_column_type_clause(in_source_column_rec);
       END IF;
 
       -- Check default value
       IF comp_value(NVL(in_source_column_rec.data_default,Q'{''}'), NVL(in_target_column_rec.data_default,Q'{''}')) = 1 THEN
         l_result := gc_result_alter;
-        l_frwd_clause_indx_arr(gc_default) := get_clause(gc_default, NVL(in_target_column_rec.data_default, Q'{''}'));
-        l_rlbk_clause_indx_arr(gc_default) := get_clause(gc_default, NVL(in_source_column_rec.data_default, Q'{''}'));
+        l_change_clause_indx_arr(gc_default) := get_clause(gc_default, NVL(in_target_column_rec.data_default, Q'{''}'));
+        l_revert_clause_indx_arr(gc_default) := get_clause(gc_default, NVL(in_source_column_rec.data_default, Q'{''}'));
       END IF;
 
       -- Check encryption_alg and salt
       IF comp_value(in_source_column_rec.encryption_alg, in_target_column_rec.encryption_alg) = 1 OR
          comp_value(in_source_column_rec.salt, in_target_column_rec.salt) = 1 THEN
         l_result := gc_result_alter;
-        l_frwd_clause := get_clause(gc_encryption, in_target_column_rec.encryption_alg);
-        l_rlbk_clause := get_clause(gc_encryption, in_source_column_rec.encryption_alg);
-        l_frwd_clause_indx_arr(gc_encryption) := l_frwd_clause || get_clause(gc_salt, in_target_column_rec.salt);
-        l_rlbk_clause_indx_arr(gc_encryption) := l_rlbk_clause || get_clause(gc_salt, in_source_column_rec.salt);
+        l_change_clause := get_clause(gc_encryption, in_target_column_rec.encryption_alg);
+        l_revert_clause := get_clause(gc_encryption, in_source_column_rec.encryption_alg);
+        l_change_clause_indx_arr(gc_encryption) := l_change_clause || get_clause(gc_salt, in_target_column_rec.salt);
+        l_revert_clause_indx_arr(gc_encryption) := l_revert_clause || get_clause(gc_salt, in_source_column_rec.salt);
       END IF;
 
       -- Check nullability value
       IF comp_value(in_source_column_rec.nullable, in_target_column_rec.nullable) = 1 THEN
         l_result := gc_result_alter;
         IF in_target_column_rec.notnull_constraint_name IS NOT NULL THEN
-          l_frwd_clause_indx_arr(gc_constraint) := get_clause(gc_constraint, in_target_column_rec.notnull_constraint_name, '"', '"');
+          l_change_clause_indx_arr(gc_constraint) := get_clause(gc_constraint, in_target_column_rec.notnull_constraint_name, '"', '"');
         END IF;
         IF in_source_column_rec.notnull_constraint_name IS NOT NULL THEN
-          l_rlbk_clause_indx_arr(gc_constraint) := get_clause(gc_constraint, in_source_column_rec.notnull_constraint_name, '"', '"');
+          l_revert_clause_indx_arr(gc_constraint) := get_clause(gc_constraint, in_source_column_rec.notnull_constraint_name, '"', '"');
         END IF;
-        l_frwd_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_target_column_rec.nullable);
-        l_rlbk_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_source_column_rec.nullable);
+        l_change_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_target_column_rec.nullable);
+        l_revert_clause_indx_arr(gc_nullable) := get_clause(gc_nullable, in_source_column_rec.nullable);
       END IF; -- end of normal column section
 
     END IF; -- end of compare section
-    l_frwd_clause := get_clause_by_name(l_frwd_clause_indx_arr, gc_column_name)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_data_type)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_default)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_generated_always_as)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_encryption)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_constraint)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_nullable);
+    l_change_clause := get_clause_by_name(l_change_clause_indx_arr, gc_column_name)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_data_type)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_default)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_generated_always_as)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_encryption)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_constraint)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_nullable);
     IF l_revert_flag THEN
-      l_rlbk_clause := get_clause_by_name(l_rlbk_clause_indx_arr, gc_column_name)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_data_type)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_default)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_generated_always_as)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_encryption)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_constraint)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_nullable);
+      l_revert_clause := get_clause_by_name(l_revert_clause_indx_arr, gc_column_name)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_data_type)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_default)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_generated_always_as)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_encryption)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_constraint)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_nullable);
     ELSE
-      l_rlbk_clause := NULL;
+      l_revert_clause := NULL;
     END IF;
 
     IF l_result = gc_result_alter THEN
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_table_name    => io_source_table_rec.table_name,
         in_owner         => io_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause
       );
     END IF;
 
@@ -3292,16 +3382,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     THEN
       debug('Column '||in_source_column_rec.column_name||' - changed column type: visible/invisible');
       l_result := gc_result_alter;
-      l_frwd_clause := get_clause(gc_modify_column, in_source_column_rec.column_name, '"', '"')||case when in_target_column_rec.hidden_column = 'YES' then gc_invisible else gc_visible end;
-      l_rlbk_clause := get_clause(gc_modify_column, in_source_column_rec.column_name, '"', '"')||case when in_source_column_rec.hidden_column = 'YES' then gc_invisible else gc_visible end;
+      l_change_clause := get_clause(gc_modify_column, in_source_column_rec.column_name, '"', '"')||case when in_target_column_rec.hidden_column = 'YES' then gc_invisible else gc_visible end;
+      l_revert_clause := get_clause(gc_modify_column, in_source_column_rec.column_name, '"', '"')||case when in_source_column_rec.hidden_column = 'YES' then gc_invisible else gc_visible end;
 
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-        in_table_name    => io_source_table_rec.table_name,
-        in_owner         => io_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        io_change_arr     => io_change_arr,
+        in_table_name     => io_source_table_rec.table_name,
+        in_owner          => io_source_table_rec.owner,
+        in_change_clause  => l_change_clause,
+        in_revert_clause  => l_revert_clause
       );
     END IF;
     $ELSE
@@ -3328,20 +3417,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       -- Second way at the end of all columns processing:
       --   Rename tmp1 -> A
       --   Rename tmp3 -> C
+      -- Then modify all virtual columns
 
       -- Check is it same renamed column or not
       IF in_source_column_rec.column_name != in_target_column_rec.column_name AND
          in_source_column_rec.new_column_name = in_target_column_rec.column_name
       THEN
-        l_frwd_clause := get_clause(gc_rename_column, '"'||in_source_column_rec.column_name||'" TO "'||in_source_column_rec.temp_column_name||'"');
-        l_rlbk_clause := get_clause(gc_rename_column, '"'||in_source_column_rec.temp_column_name||'" TO "'||in_source_column_rec.column_name||'"');
+        l_change_clause := get_clause(gc_rename_column, '"'||in_source_column_rec.column_name||'" TO "'||in_source_column_rec.temp_column_name||'"');
+        l_revert_clause := get_clause(gc_rename_column, '"'||in_source_column_rec.temp_column_name||'" TO "'||in_source_column_rec.column_name||'"');
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-          in_table_name    => io_source_table_rec.table_name,
-          in_owner         => io_source_table_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          io_change_arr     => io_change_arr,
+          in_table_name     => io_source_table_rec.table_name,
+          in_owner          => io_source_table_rec.owner,
+          in_change_clause  => l_change_clause,
+          in_revert_clause  => l_revert_clause
         );
         l_result := gc_result_alter;
       ELSE
@@ -3356,36 +3445,485 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- Second way of renaming process - renaming all temp columns into new column_name
   PROCEDURE rename_temp_columns(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause VARCHAR2(32767);
-    l_rlbk_clause VARCHAR2(32767);
   BEGIN
     FOR i IN 1..in_source_table_rec.column_arr.COUNT LOOP
       IF in_source_table_rec.column_arr(i).new_column_name IS NOT NULL THEN
-        l_frwd_clause := get_clause(gc_rename_column, '"'||in_source_table_rec.column_arr(i).temp_column_name||'" TO "'||in_source_table_rec.column_arr(i).new_column_name||'"');
-        l_rlbk_clause := get_clause(gc_rename_column, '"'||in_source_table_rec.column_arr(i).new_column_name||'" TO "'||in_source_table_rec.column_arr(i).temp_column_name||'"');
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_table_name    => in_source_table_rec.table_name,
           in_owner         => in_source_table_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          in_change_clause => get_clause(gc_rename_column, '"'||in_source_table_rec.column_arr(i).temp_column_name||'" TO "'||in_source_table_rec.column_arr(i).new_column_name||'"'),
+          in_revert_clause => get_clause(gc_rename_column, '"'||in_source_table_rec.column_arr(i).new_column_name||'" TO "'||in_source_table_rec.column_arr(i).temp_column_name||'"')
         );
       END IF;
     END LOOP;
   END rename_temp_columns;
 
+  -- compare lob rec
+  FUNCTION comp_lob_params(
+    in_source_lob_rec    IN cort_exec_pkg.gt_lob_rec,
+    in_target_lob_rec    IN cort_exec_pkg.gt_lob_rec,
+    out_frwd_lob_parames OUT NOCOPY CLOB,
+    out_rlbk_lob_parames OUT NOCOPY CLOB
+  )
+  RETURN NUMBER
+  AS
+    l_result                  PLS_INTEGER;
+    l_comp_result             PLS_INTEGER;
+    l_change_clause_indx_arr  arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr  arrays.gt_xlstr_indx;
+    l_storage_change_clause   CLOB;
+    l_storage_revert_clause   CLOB;
+  BEGIN
+    l_result := gc_result_nochange;
+
+    -- move or modify
+    IF comp_value(in_source_lob_rec.pctversion, in_target_lob_rec.pctversion) = 1 AND
+       in_target_lob_rec.securefile = 'NO'
+    THEN
+      l_result := gc_result_alter;
+      l_change_clause_indx_arr(gc_pctversion) := get_clause(gc_pctversion, in_target_lob_rec.pctversion);
+      l_revert_clause_indx_arr(gc_pctversion) := get_clause(gc_pctversion, in_source_lob_rec.pctversion);
+    END IF;
+
+    IF comp_value(in_source_lob_rec.freepools, in_target_lob_rec.freepools) = 1 THEN
+      l_result := gc_result_alter;
+      l_change_clause_indx_arr(gc_freepools) := get_clause(gc_freepools, in_target_lob_rec.freepools);
+      l_revert_clause_indx_arr(gc_freepools) := get_clause(gc_freepools, in_source_lob_rec.freepools);
+    END IF;
+    IF in_target_lob_rec.securefile = 'YES' AND
+       (comp_value(in_source_lob_rec.retention, in_target_lob_rec.retention) = 1 OR
+       (in_target_lob_rec.retention = 'MIN' AND comp_value(in_source_lob_rec.min_retention, in_target_lob_rec.min_retention) = 1))
+    THEN
+      debug('in_source_lob_rec.securefile = '||in_source_lob_rec.securefile);
+      debug('in_target_lob_rec.securefile = '||in_target_lob_rec.securefile);
+      debug('in_source_lob_rec.retention = '||in_source_lob_rec.retention);
+      debug('in_target_lob_rec.retention = '||in_target_lob_rec.retention);
+      debug('in_source_lob_rec.minretention = '||in_source_lob_rec.min_retention);
+      debug('in_target_lob_rec.minretention = '||in_target_lob_rec.min_retention);
+      l_result := gc_result_alter;
+      l_change_clause_indx_arr(gc_retention) := get_clause(gc_retention, in_target_lob_rec.retention) || case when in_target_lob_rec.retention = 'MIN' then ' '||to_char(in_target_lob_rec.min_retention) end;
+      l_revert_clause_indx_arr(gc_retention) := get_clause(gc_retention, in_source_lob_rec.retention) || case when in_source_lob_rec.retention = 'MIN' then ' '||to_char(in_source_lob_rec.min_retention) end;
+    END IF;
+
+    IF comp_value(in_source_lob_rec.deduplication, in_target_lob_rec.deduplication) = 1 THEN
+      l_result := gc_result_alter;
+      l_change_clause_indx_arr(gc_deduplication) := get_clause(gc_deduplication, in_target_lob_rec.deduplication);
+      l_revert_clause_indx_arr(gc_deduplication) := get_clause(gc_deduplication, in_source_lob_rec.deduplication);
+    END IF;
+
+    IF comp_value(in_source_lob_rec.compression, in_target_lob_rec.compression) = 1 THEN
+      l_result := gc_result_alter;
+      l_change_clause_indx_arr(gc_lob_compression) := get_clause(gc_lob_compression, in_target_lob_rec.compression);
+      l_revert_clause_indx_arr(gc_lob_compression) := get_clause(gc_lob_compression, in_source_lob_rec.compression);
+    END IF;
+
+    IF comp_value(in_source_lob_rec.encrypt, in_target_lob_rec.encrypt) = 1 THEN
+      l_result := gc_result_alter;
+      l_change_clause_indx_arr(gc_encrypt) := get_clause(gc_encrypt, in_target_lob_rec.encrypt);
+      l_revert_clause_indx_arr(gc_encrypt) := get_clause(gc_encrypt, in_source_lob_rec.encrypt);
+    END IF;
+
+    IF comp_value(in_source_lob_rec.cache, in_target_lob_rec.cache) = 1 OR
+       comp_value(in_source_lob_rec.logging, in_target_lob_rec.logging) = 1
+    THEN
+      l_result := gc_result_alter;
+    debug('in_source_lob_rec.cache = '||in_source_lob_rec.cache);
+    debug('in_target_lob_rec.cache = '||in_target_lob_rec.cache);
+    debug('in_source_lob_rec.logging = '||in_source_lob_rec.logging);
+    debug('in_target_lob_rec.logging = '||in_target_lob_rec.logging);
+      l_change_clause_indx_arr(gc_cache) := get_clause(gc_cache, in_target_lob_rec.cache);
+      l_revert_clause_indx_arr(gc_cache) := get_clause(gc_cache, in_source_lob_rec.cache);
+      l_change_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_target_lob_rec.logging);
+      l_revert_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_source_lob_rec.logging);
+    END IF;
+
+    IF comp_value(in_source_lob_rec.in_row, in_target_lob_rec.in_row) = 1 THEN
+      l_result := gc_result_alter;
+      l_change_clause_indx_arr(gc_in_row) := get_clause(gc_in_row, in_target_lob_rec.in_row);
+      l_revert_clause_indx_arr(gc_in_row) := get_clause(gc_in_row, in_source_lob_rec.in_row);
+    END IF;
+
+
+    l_comp_result := comp_storage(
+                       in_source_storage_rec => in_source_lob_rec.storage,
+                       in_target_storage_rec => in_target_lob_rec.storage,
+                       out_change_clause     => l_storage_change_clause,
+                       out_revert_clause     => l_storage_revert_clause
+                     );
+ 
+    CASE l_comp_result
+    WHEN gc_result_recreate THEN
+      RETURN gc_result_recreate;
+    WHEN gc_result_alter THEN
+      l_result := gc_result_alter;
+      debug('l_storage_change_clause = '||l_storage_change_clause);
+      l_change_clause_indx_arr(gc_storage) := get_clause(gc_storage, l_storage_change_clause, '(', ')');
+      l_revert_clause_indx_arr(gc_storage) := get_clause(gc_storage, l_storage_revert_clause, '(', ')');
+    ELSE
+      NULL;
+    END CASE;
+
+    -- move only
+    IF comp_value(in_source_lob_rec.chunk, in_target_lob_rec.chunk) = 1 THEN
+      l_result := gc_result_alter_move;
+      l_change_clause_indx_arr(gc_chunk) := get_clause(gc_chunk, in_target_lob_rec.chunk);
+      l_revert_clause_indx_arr(gc_chunk) := get_clause(gc_chunk, in_source_lob_rec.chunk);
+    END IF;
+    
+    IF comp_value(in_source_lob_rec.tablespace_name, in_target_lob_rec.tablespace_name) = 1 THEN
+      l_result := gc_result_alter_move;
+      l_change_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_target_lob_rec.tablespace_name, '"', '"');
+      l_revert_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_source_lob_rec.tablespace_name, '"', '"');
+    END IF;
+
+    IF l_result = gc_result_alter AND cort_exec_pkg.g_params.change.get_value = 'MOVE' THEN
+      l_result := gc_result_alter_move;
+    END IF;
+
+    IF l_result = gc_result_alter_move THEN
+      out_frwd_lob_parames := get_clause_by_name(l_change_clause_indx_arr, gc_tablespace)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_chunk)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_in_row)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_pctversion)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_freepools)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_retention)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_deduplication)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_lob_compression)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_encrypt)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_cache)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_logging)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_storage);
+
+      out_rlbk_lob_parames := get_clause_by_name(l_revert_clause_indx_arr, gc_tablespace)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_chunk)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_in_row)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_pctversion)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_freepools)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_retention)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_deduplication)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_lob_compression)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_encrypt)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_cache)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_logging)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_storage);
+    ELSIF l_result = gc_result_alter THEN
+      out_frwd_lob_parames := get_clause_by_name(l_change_clause_indx_arr, gc_in_row)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_pctversion)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_freepools)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_retention)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_deduplication)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_lob_compression)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_encrypt)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_cache)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_logging)||
+                              get_clause_by_name(l_change_clause_indx_arr, gc_storage);
+      out_rlbk_lob_parames := get_clause_by_name(l_revert_clause_indx_arr, gc_in_row)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_pctversion)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_freepools)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_retention)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_deduplication)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_lob_compression)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_encrypt)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_cache)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_logging)||
+                              get_clause_by_name(l_revert_clause_indx_arr, gc_storage);
+    END IF;
+
+    RETURN l_result;
+  END comp_lob_params;
+
+  -- compare lob rec
+  FUNCTION comp_lob(
+    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
+    in_source_lob_rec      IN cort_exec_pkg.gt_lob_rec,
+    in_target_lob_rec      IN cort_exec_pkg.gt_lob_rec,
+    out_change_clause      OUT CLOB, -- forward statement
+    out_revert_clause      OUT CLOB  -- rollback statement
+  )
+  RETURN PLS_INTEGER
+  AS
+    l_result                 PLS_INTEGER;
+    l_change_clause_indx_arr arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr arrays.gt_xlstr_indx;
+    l_frwd_lob_parames       CLOB;
+    l_rlbk_lob_parames       CLOB;
+    l_column_rec             cort_exec_pkg.gt_column_rec;
+    l_column_name            arrays.gt_name;
+  BEGIN
+    l_result := gc_result_nochange;
+
+    l_column_rec := in_source_table_rec.column_arr(in_source_lob_rec.column_indx);
+    l_column_name := NVL(l_column_rec.new_column_name,l_column_rec.column_name);
+
+    l_result := comp_lob_params(
+                  in_source_lob_rec    => in_source_lob_rec,
+                  in_target_lob_rec    => in_target_lob_rec,
+                  out_frwd_lob_parames => l_frwd_lob_parames,
+                  out_rlbk_lob_parames => l_rlbk_lob_parames
+                );
+    IF l_result > gc_result_nochange AND
+       l_frwd_lob_parames IS NOT NULL AND
+       l_rlbk_lob_parames IS NOT NULL
+    THEN
+      l_change_clause_indx_arr(gc_lob_params) := get_clause(gc_lob_params, l_frwd_lob_parames, '(', ')');
+      l_revert_clause_indx_arr(gc_lob_params) := get_clause(gc_lob_params, l_rlbk_lob_parames, '(', ')');
+    END IF;
+
+    -- move only
+    IF comp_value(in_source_lob_rec.securefile, in_target_lob_rec.securefile) = 1 THEN
+      l_result := gc_result_alter_move;
+    END IF;
+
+    IF l_result = gc_result_alter_move THEN
+      out_change_clause := -- use new_column_name in case column was renamed
+                         get_clause(gc_lob_item, l_column_name, '(', ')')||
+                         get_clause(gc_store_as, get_clause(gc_securefile, in_target_lob_rec.securefile))||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_lob_params);
+
+      out_revert_clause := -- use new_column_name in case column was renamed
+                         get_clause(gc_lob_item, l_column_name, '(', ')')||
+                         get_clause(gc_store_as, get_clause(gc_securefile, in_source_lob_rec.securefile))||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_lob_params);
+
+    ELSIF l_result = gc_result_alter THEN
+      -- use new_column_name in case column was renamed
+      out_change_clause := get_clause(gc_modify_lob_item, l_column_name, '(', ')')||
+                           get_clause_by_name(l_change_clause_indx_arr, gc_lob_params);
+      out_revert_clause := get_clause(gc_modify_lob_item, l_column_name, '(', ')')||
+                           get_clause_by_name(l_revert_clause_indx_arr, gc_lob_params);
+    END IF;
+
+    RETURN l_result;
+  END comp_lob;
+
+  -- compare xml rec
+  FUNCTION comp_xml(
+    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
+    in_source_xml_rec      IN cort_exec_pkg.gt_xml_col_rec,
+    in_target_xml_rec      IN cort_exec_pkg.gt_xml_col_rec,
+    out_change_clause      OUT CLOB, -- forward statement
+    out_revert_clause      OUT CLOB  -- rollback statement
+  )
+  RETURN PLS_INTEGER
+  AS
+    l_result                 PLS_INTEGER;
+    l_comp_result            PLS_INTEGER;
+    l_source_lob_rec         cort_exec_pkg.gt_lob_rec;
+    l_target_lob_rec         cort_exec_pkg.gt_lob_rec;
+    l_change_clause_indx_arr arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr arrays.gt_xlstr_indx;
+    l_frwd_lob_parames       CLOB;
+    l_rlbk_lob_parames       CLOB;
+    l_column_rec             cort_exec_pkg.gt_column_rec;
+    l_column_name            arrays.gt_name;
+  BEGIN
+    l_result := gc_result_nochange;
+
+    IF comp_value(in_source_xml_rec.xmlschema, in_target_xml_rec.xmlschema) = 1 OR
+       comp_value(in_source_xml_rec.schema_owner, in_target_xml_rec.schema_owner) = 1 OR
+       comp_value(in_source_xml_rec.element_name, in_target_xml_rec.element_name) = 1 OR
+       comp_value(in_source_xml_rec.storage_type, in_target_xml_rec.storage_type) = 1 OR
+       comp_value(in_source_xml_rec.anyschema, in_target_xml_rec.anyschema) = 1 OR
+       comp_value(in_source_xml_rec.nonschema, in_target_xml_rec.nonschema) = 1
+    THEN
+      debug('compare xml attributes '||in_source_xml_rec.column_name||' - 5');
+      RETURN gc_result_recreate;
+    END IF;
+
+    IF in_source_xml_rec.lob_column_indx IS NOT NULL AND
+       in_target_xml_rec.lob_column_indx IS NOT NULL AND
+       in_source_table_rec.lob_arr.EXISTS(in_source_xml_rec.lob_column_indx) AND
+       in_target_table_rec.lob_arr.EXISTS(in_target_xml_rec.lob_column_indx)
+    THEN
+      l_column_rec := in_source_table_rec.column_arr(in_source_xml_rec.column_indx);
+      l_column_name := NVL(l_column_rec.new_column_name,l_column_rec.column_name);
+
+      l_source_lob_rec := in_source_table_rec.lob_arr(in_source_xml_rec.lob_column_indx);
+      l_target_lob_rec := in_target_table_rec.lob_arr(in_target_xml_rec.lob_column_indx);
+
+      IF cort_exec_pkg.g_params.physical_attr.exist('LOB') THEN
+        l_result := comp_lob_params(
+                      in_source_lob_rec    => l_source_lob_rec,
+                      in_target_lob_rec    => l_target_lob_rec,
+                      out_frwd_lob_parames => l_frwd_lob_parames,
+                      out_rlbk_lob_parames => l_rlbk_lob_parames
+                    );
+        debug('compare xml lobs params - '||l_result, l_frwd_lob_parames);
+
+        CASE 
+        WHEN l_result = gc_result_alter THEN 
+          l_change_clause_indx_arr(gc_lob_params) := get_clause(gc_lob_params, l_frwd_lob_parames, '(', ')');
+          l_revert_clause_indx_arr(gc_lob_params) := get_clause(gc_lob_params, l_rlbk_lob_parames, '(', ')');
+        WHEN l_result = gc_result_alter_move THEN
+          debug('compare xml lob params '||in_source_xml_rec.column_name||' - 2');
+          RETURN gc_result_recreate;
+        WHEN l_result = gc_result_recreate THEN
+          debug('compare xml lob params '||in_source_xml_rec.column_name||' - 5');
+          RETURN gc_result_recreate;
+        ELSE 
+          NULL;  
+        END CASE;
+      END IF;
+
+      IF comp_value(l_source_lob_rec.securefile, l_target_lob_rec.securefile) = 1 THEN
+        debug('compare xml lob secure file '||in_source_xml_rec.column_name||' - 1');
+        l_change_clause_indx_arr(gc_securefile) := get_clause(gc_securefile, l_target_lob_rec.securefile);
+        l_revert_clause_indx_arr(gc_securefile) := get_clause(gc_securefile, l_source_lob_rec.securefilE);
+        l_result := GREATEST(l_result, gc_result_alter);
+      END IF;
+
+      IF l_result = gc_result_alter THEN
+        -- use new_column_name in case column was renamed
+        out_change_clause := get_clause(gc_modify_column, l_column_name, '("', '")')||
+                           get_clause(gc_xml_type_column, l_column_name, '"', '"')||
+                           get_clause(gc_store_as, get_clause(gc_xml_storage_type, in_source_xml_rec.storage_type, get_clause_by_name(l_change_clause_indx_arr, gc_securefile)))||
+                           get_clause_by_name(l_change_clause_indx_arr, gc_lob_params);
+
+
+        out_revert_clause := get_clause(gc_modify_column, l_column_name, '("', '")')||
+                           get_clause(gc_xml_type_column, l_column_name, '"', '"')||
+                           get_clause(gc_store_as, get_clause(gc_xml_storage_type, in_source_xml_rec.storage_type, get_clause_by_name(l_revert_clause_indx_arr, gc_securefile)))||
+                           get_clause_by_name(l_revert_clause_indx_arr, gc_lob_params);
+      END IF;
+      debug('compare xml lob '||in_source_xml_rec.column_name||' - '||l_result);
+    END IF;
+
+    RETURN l_result;
+  END comp_xml;
+
+  -- compare varray rec
+  FUNCTION comp_varray(
+    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
+    in_source_varray_rec   IN cort_exec_pkg.gt_varray_rec,
+    in_target_varray_rec   IN cort_exec_pkg.gt_varray_rec,
+    out_change_clause      OUT CLOB, -- forward statement
+    out_revert_clause      OUT CLOB  -- rollback statement
+  )
+  RETURN PLS_INTEGER
+  AS
+    l_result                 PLS_INTEGER;
+    l_comp_result            PLS_INTEGER;
+    l_source_lob_rec         cort_exec_pkg.gt_lob_rec;
+    l_target_lob_rec         cort_exec_pkg.gt_lob_rec;
+    l_change_clause_indx_arr arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr arrays.gt_xlstr_indx;
+    l_frwd_lob_parames       CLOB;
+    l_rlbk_lob_parames       CLOB;
+    l_column_rec             cort_exec_pkg.gt_column_rec;
+    l_column_name            arrays.gt_name;
+  BEGIN
+    l_result := gc_result_nochange;
+
+    IF comp_value(in_source_varray_rec.type_owner, in_target_varray_rec.type_owner) = 1 OR
+       comp_value(in_source_varray_rec.type_name, in_target_varray_rec.type_name) = 1 OR
+       (in_source_varray_rec.lob_name IS NULL AND in_target_varray_rec.lob_name IS NOT NULL) OR
+       (in_source_varray_rec.lob_name IS NOT NULL AND in_target_varray_rec.lob_name IS NULL) OR
+       comp_value(in_source_varray_rec.storage_spec, in_target_varray_rec.storage_spec) = 1 OR
+       comp_value(in_source_varray_rec.return_type, in_target_varray_rec.return_type) = 1 
+    THEN
+      debug('compare varray attributes '||in_source_varray_rec.column_name||' - 5');
+      RETURN gc_result_recreate;
+    END IF;
+    
+    IF comp_value(in_source_varray_rec.element_substitutable, in_target_varray_rec.element_substitutable) = 1 THEN
+      debug('varray substitution '||in_source_varray_rec.column_name||' - 1');
+      l_change_clause_indx_arr(gc_substitution_column) := get_clause(gc_substitution_column, in_target_varray_rec.element_substitutable);
+      l_revert_clause_indx_arr(gc_substitution_column) := get_clause(gc_substitution_column, in_source_varray_rec.element_substitutable);
+      l_result := gc_result_alter;
+    END IF;
+    
+
+    IF in_source_varray_rec.lob_column_indx IS NOT NULL AND
+       in_target_varray_rec.lob_column_indx IS NOT NULL AND
+       in_source_table_rec.lob_arr.EXISTS(in_source_varray_rec.lob_column_indx) AND
+       in_target_table_rec.lob_arr.EXISTS(in_target_varray_rec.lob_column_indx)
+    THEN
+      l_column_rec := in_source_table_rec.column_arr(in_source_varray_rec.column_indx);
+      l_column_name := NVL(l_column_rec.new_column_name,l_column_rec.column_name);
+
+      l_source_lob_rec := in_source_table_rec.lob_arr(in_source_varray_rec.lob_column_indx);
+      l_target_lob_rec := in_target_table_rec.lob_arr(in_target_varray_rec.lob_column_indx);
+
+      IF cort_exec_pkg.g_params.physical_attr.exist('LOB') THEN
+        l_comp_result := comp_lob_params(
+                           in_source_lob_rec    => l_source_lob_rec,
+                           in_target_lob_rec    => l_target_lob_rec,
+                           out_frwd_lob_parames => l_frwd_lob_parames,
+                           out_rlbk_lob_parames => l_rlbk_lob_parames
+                         );
+        debug('compare varray lobs params - '||l_comp_result, l_frwd_lob_parames);
+
+        CASE 
+        WHEN l_comp_result IN (gc_result_alter, gc_result_alter_move) THEN 
+          l_change_clause_indx_arr(gc_lob_params) := get_clause(gc_lob_params, l_frwd_lob_parames, '(', ')');
+          l_revert_clause_indx_arr(gc_lob_params) := get_clause(gc_lob_params, l_rlbk_lob_parames, '(', ')');
+        WHEN l_result = gc_result_recreate THEN
+          debug('compare varray lob params '||in_source_varray_rec.column_name||' - 5');
+          RETURN gc_result_recreate;
+        ELSE 
+          NULL;  
+        END CASE;
+        l_result := GREATEST(l_result, l_comp_result);
+      END IF;
+
+      IF comp_value(l_source_lob_rec.securefile, l_target_lob_rec.securefile) = 1 THEN
+        debug('compare varray lob secure file '||in_source_varray_rec.column_name||' - 1');
+        l_change_clause_indx_arr(gc_securefile) := get_clause(gc_securefile, l_target_lob_rec.securefile);
+        l_revert_clause_indx_arr(gc_securefile) := get_clause(gc_securefile, l_source_lob_rec.securefile);
+        l_result := GREATEST(l_result, gc_result_alter);
+      END IF;
+
+      IF l_result = gc_result_alter THEN
+        -- use new_column_name in case column was renamed
+        out_change_clause := get_clause(gc_modify_column, l_column_name, '("', '")')||
+                             get_clause(gc_varray, l_column_name, '"', '"')||
+                             get_clause_by_name(l_change_clause_indx_arr, gc_substitution_column)||
+                             get_clause(gc_store_as, gc_lob_item, get_clause_by_name(l_change_clause_indx_arr, gc_securefile))||
+                             get_clause_by_name(l_change_clause_indx_arr, gc_lob_params);
+
+        out_revert_clause := get_clause(gc_modify_column, l_column_name, '("', '")')||
+                             get_clause(gc_varray, l_column_name, '"', '"')||
+                             get_clause_by_name(l_revert_clause_indx_arr, gc_substitution_column)||
+                             get_clause(gc_store_as, gc_lob_item, get_clause_by_name(l_revert_clause_indx_arr, gc_securefile))||
+                             get_clause_by_name(l_revert_clause_indx_arr, gc_lob_params);
+      ELSIF l_result = gc_result_alter_move THEN
+        -- use new_column_name in case column was renamed
+        out_change_clause := gc_move||
+                             get_clause(gc_varray, l_column_name, '"', '"')||
+                             get_clause_by_name(l_change_clause_indx_arr, gc_substitution_column)||
+                             get_clause(gc_store_as, gc_lob_item, get_clause_by_name(l_change_clause_indx_arr, gc_securefile))||
+                             get_clause_by_name(l_change_clause_indx_arr, gc_lob_params)||
+                             get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_value);
+
+        out_revert_clause := gc_move||
+                             get_clause(gc_varray, l_column_name, '"', '"')||
+                             get_clause_by_name(l_revert_clause_indx_arr, gc_substitution_column)||
+                             get_clause(gc_store_as, gc_lob_item, get_clause_by_name(l_revert_clause_indx_arr, gc_securefile))||
+                             get_clause_by_name(l_revert_clause_indx_arr, gc_lob_params)||
+                             get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_value);
+      END IF;
+
+      debug('compare varray lob '||in_source_varray_rec.column_name||' - '||l_result);
+    END IF;
+
+
+
+    RETURN l_result;
+  END comp_varray;
+
   -- compare all table columns
   FUNCTION comp_table_columns(
-    io_source_table_rec    IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    io_target_table_rec    IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_source_table_rec IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    io_target_table_rec IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
@@ -3410,6 +3948,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_first_new_virt_col_indx PLS_INTEGER;
     l_first_old_virt_col_indx PLS_INTEGER;
     l_column_rec              cort_exec_pkg.gt_column_rec;
+    l_change_clause           CLOB;
+    l_revert_clause           CLOB;
+    l_virt_col_change_arr     cort_exec_pkg.gt_change_arr;
   BEGIN
     l_result := gc_result_nochange;
     l_segment_result := gc_result_nochange;
@@ -3425,7 +3966,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     FOR i IN 1..io_source_table_rec.column_arr.COUNT LOOP
       -- get segment non-hidden columns.
       IF io_source_table_rec.column_arr(i).virtual_column = 'NO' AND
-         (io_source_table_rec.column_arr(i).hidden_column = 'NO' OR io_source_table_rec.column_arr(i).user_generated = 'YES')
+         io_source_table_rec.column_arr(i).user_generated = 'YES'
       THEN
         l_source_segment_col_arr(i) := io_source_table_rec.column_arr(i).segment_column_id;
       END IF;
@@ -3435,7 +3976,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     FOR i IN 1..io_target_table_rec.column_arr.COUNT LOOP
       -- get segment non-hidden columns.
       IF io_target_table_rec.column_arr(i).virtual_column = 'NO' AND
-         (io_target_table_rec.column_arr(i).hidden_column = 'NO' OR io_target_table_rec.column_arr(i).user_generated = 'YES')
+         io_target_table_rec.column_arr(i).user_generated = 'YES'
       THEN
         l_target_segment_col_arr(i) := io_target_table_rec.column_arr(i).segment_column_id;
         -- prepropulate list for potentially new columns. Will delete from that list when find matching column
@@ -3453,6 +3994,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       -- check if this column exists in new table definition
       IF io_target_table_rec.column_indx_arr.EXISTS(l_column_name) THEN
         l_indx2 := io_target_table_rec.column_indx_arr(l_column_name);
+      ELSE
+        l_indx2 := NULL;
+      END IF;
+      
+      
+      IF l_indx2 IS NOT NULL AND io_target_table_rec.column_arr(l_indx2).segment_column_id IS NOT NULL
+      THEN
         -- not a new column. Delete from the add list
         l_add_column_arr.DELETE(l_indx2);
 
@@ -3468,12 +4016,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         -- check if this is invisible user column
         IF io_source_table_rec.column_arr(l_indx1).hidden_column = 'YES' AND
            io_source_table_rec.column_arr(l_indx1).user_generated = 'YES' AND
-           cort_exec_pkg.g_params.compare.value_exists('IGNORE_INVISIBLE')
+           cort_exec_pkg.g_params.compare.exist('IGNORE_INVISIBLE')
         THEN
           -- do nothing
           NULL;
         ELSIF io_source_table_rec.column_arr(l_indx1).unused_flag AND
-           cort_exec_pkg.g_params.compare.value_exists('IGNORE_UNUSED')
+           cort_exec_pkg.g_params.compare.exist('IGNORE_UNUSED')
         THEN
           -- do nothing for hidden columns
           NULL;
@@ -3485,7 +4033,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       l_indx1 := l_source_segment_col_arr.NEXT(l_indx1);
     END LOOP;
 
-
+/*
     -- [Smart rename]
     -- check that removed columns have added on the same segment position column with the same data type
     IF l_drop_column_arr.COUNT > 0 THEN
@@ -3529,50 +4077,44 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_indx1 := l_drop_column_arr.NEXT(l_indx1);
       END LOOP;
     END IF;
-
+*/
     -- if there are columns to drop
     IF l_drop_column_arr.COUNT > 0 THEN
-      IF cort_exec_pkg.g_params.drop_column.get_value <> 'RECREATE' THEN
-        l_cnt := 0;
-        FOR i IN 1..io_source_table_rec.column_arr.COUNT LOOP
-          l_indx1 := i;
-          IF l_drop_column_arr.EXISTS(l_indx1) THEN
-           -- remove dropping columns from source segment column array
-            debug('mark segment column to drop - '||io_source_table_rec.column_arr(l_indx1).column_name);
-            l_source_segment_col_arr.DELETE(l_indx1);
-            l_cnt := l_cnt + 1;
-          ELSE
-            IF l_source_xref_arr.EXISTS(l_indx1) THEN
-              l_indx2 := l_source_xref_arr(l_indx1);
+      l_cnt := 0;
+      FOR i IN 1..io_source_table_rec.column_arr.COUNT LOOP
+        l_indx1 := i;
+        IF l_drop_column_arr.EXISTS(l_indx1) THEN
+         -- remove dropping columns from source segment column array
+          debug('mark segment column to drop - '||io_source_table_rec.column_arr(l_indx1).column_name);
+          l_source_segment_col_arr.DELETE(l_indx1);
+          l_cnt := l_cnt + 1;
+        ELSE
+          IF l_source_xref_arr.EXISTS(l_indx1) THEN
+            l_indx2 := l_source_xref_arr(l_indx1);
 
-              io_source_table_rec.column_arr(l_indx1).segment_column_id := io_source_table_rec.column_arr(l_indx1).segment_column_id - l_cnt;
+            io_source_table_rec.column_arr(l_indx1).segment_column_id := io_source_table_rec.column_arr(l_indx1).segment_column_id - l_cnt;
 
-              -- check that all matched columns on their initial positions
-              -- decrease source segment_column_id by number of dropped columns for every existing segment column
-              IF comp_value(io_source_table_rec.column_arr(l_indx1).segment_column_id,
-                            io_target_table_rec.column_arr(l_indx2).segment_column_id) = 1
-              THEN
-                debug('There is moved existing segment column: '||io_source_table_rec.column_arr(l_indx1).column_name);
-                debug('Source column column indx - '||l_indx1||', name - '||io_source_table_rec.column_arr(l_indx1).column_name||', segment_column_id = '||to_char(io_source_table_rec.column_arr(l_indx1).segment_column_id));
-                debug('Target column column indx - '||l_indx2||', name - '||io_target_table_rec.column_arr(l_indx2).column_name||', segment_column_id = '||io_target_table_rec.column_arr(l_indx2).segment_column_id);
-                IF cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER') THEN
-                  NULL;
-                  -- do nothing;
-                  debug('IGNORE_ORDER param is enabled - no changes');
-                ELSE
-                  RETURN gc_result_recreate;
-                END IF;
+            -- check that all matched columns on their initial positions
+            -- decrease source segment_column_id by number of dropped columns for every existing segment column
+            IF comp_value(io_source_table_rec.column_arr(l_indx1).segment_column_id,
+                          io_target_table_rec.column_arr(l_indx2).segment_column_id) = 1
+            THEN
+              debug('There is moved existing segment column: '||io_source_table_rec.column_arr(l_indx1).column_name);
+              debug('Source column column indx - '||l_indx1||', name - '||io_source_table_rec.column_arr(l_indx1).column_name||', segment_column_id = '||to_char(io_source_table_rec.column_arr(l_indx1).segment_column_id));
+              debug('Target column column indx - '||l_indx2||', name - '||io_target_table_rec.column_arr(l_indx2).column_name||', segment_column_id = '||io_target_table_rec.column_arr(l_indx2).segment_column_id);
+              IF cort_exec_pkg.g_params.compare.exist('IGNORE_ORDER') THEN
+                NULL;
+                -- do nothing;
+                debug('IGNORE_ORDER param is enabled - no changes');
+              ELSE
+                RETURN gc_result_recreate;
               END IF;
-
             END IF;
+
           END IF;
-        END LOOP;
-        l_segment_result := gc_result_alter;
-      ELSE
-        -- then need to recreate
-        debug('RECREATE drop semantic is used to drop segment columns');
-        l_segment_result := gc_result_recreate;
-      END IF;
+        END IF;
+      END LOOP;
+      l_segment_result := gc_result_alter;
       -- if all column need to be dropped then recreate
       IF l_drop_column_arr.COUNT = l_source_segment_col_arr.COUNT THEN
         debug('All segment columns are dropped');
@@ -3594,7 +4136,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       -- OR
       -- ignore columns order option is enabled
       -- otherwise need to recreate
-      IF l_source_segment_col_arr.COUNT > 0 AND l_add_column_arr(l_add_column_arr.FIRST) > l_source_segment_col_arr(l_source_segment_col_arr.LAST) OR cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER')
+      IF l_source_segment_col_arr.COUNT > 0 AND l_add_column_arr(l_add_column_arr.FIRST) > l_source_segment_col_arr(l_source_segment_col_arr.LAST) OR cort_exec_pkg.g_params.compare.exist('IGNORE_ORDER')
       THEN
         l_segment_result := gc_result_alter;
       ELSE
@@ -3604,43 +4146,117 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
 
 
-/*
--- test output
-    l_indx1 := l_source_xref_arr.FIRST;
-    WHILE l_indx1 IS NOT NULL LOOP
-      debug(to_char(l_indx1)||') source column: '||io_source_table_rec.column_arr(l_indx1).column_name ||' - match id '||l_source_xref_arr(l_indx1));
-      l_indx1 := l_source_xref_arr.NEXT(l_indx1);
-    END LOOP;
-
-
-    l_indx2 := l_target_xref_arr.FIRST;
-    WHILE l_indx2 IS NOT NULL LOOP
-      debug(to_char(l_indx2)||') target column: '||io_target_table_rec.column_arr(l_indx2).column_name ||' - match id '||l_target_xref_arr(l_indx2));
-      l_indx2 := l_target_xref_arr.NEXT(l_indx2);
-    END LOOP;
--- end of test
-*/
     -- check all for matched segment columns
     l_indx1 := l_source_xref_arr.FIRST;
     l_indx2 := l_target_xref_arr.FIRST;
     WHILE l_indx1 IS NOT NULL AND l_indx2 IS NOT NULL LOOP
-      IF cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER') THEN
+      IF cort_exec_pkg.g_params.compare.exist('IGNORE_ORDER') THEN
         l_indx2 := l_source_xref_arr(l_indx1);
       END IF;
       l_comp_result := comp_column(
-                         io_source_table_rec    => io_source_table_rec,
-                         in_source_column_rec   => io_source_table_rec.column_arr(l_indx1),
-                         in_target_column_rec   => io_target_table_rec.column_arr(l_indx2),
-                         io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                         io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                         io_source_table_rec  => io_source_table_rec,
+                         in_source_column_rec => io_source_table_rec.column_arr(l_indx1),
+                         in_target_column_rec => io_target_table_rec.column_arr(l_indx2),
+                         io_change_arr        => io_change_arr
                        );
       debug('Compare segment column result = '||l_comp_result);
       l_segment_result := GREATEST(l_segment_result, l_comp_result);
       IF l_segment_result = gc_result_recreate THEN
         RETURN l_segment_result;
       END IF;
-      l_indx1 := l_source_xref_arr.NEXT(l_indx1);
-      IF NOT cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER') THEN
+     
+      IF io_source_table_rec.lob_arr.EXISTS(l_indx1) AND io_target_table_rec.lob_arr.EXISTS(l_indx2) AND
+         io_source_table_rec.column_arr(l_indx1).data_type IN ('CLOB','NCLOB','BLOB') AND 
+         io_target_table_rec.column_arr(l_indx2).data_type IN ('CLOB','NCLOB','BLOB') AND
+         cort_exec_pkg.g_params.physical_attr.exist('LOB')  
+      THEN
+        l_comp_result := comp_lob(
+                           in_source_table_rec => io_source_table_rec,
+                           in_target_table_rec => io_target_table_rec,
+                           in_source_lob_rec   => io_source_table_rec.lob_arr(l_indx1),
+                           in_target_lob_rec   => io_target_table_rec.lob_arr(l_indx2),
+                           out_change_clause   => l_change_clause,
+                           out_revert_clause   => l_revert_clause
+                         );
+        debug('Compare LOB column result = '||l_comp_result);
+        CASE l_comp_result 
+        WHEN gc_result_alter THEN
+          add_alter_table_stmt(
+            io_change_arr    => io_change_arr,
+            in_table_name    => io_source_table_rec.table_name,
+            in_owner         => io_source_table_rec.owner,
+            in_change_clause => l_change_clause,
+            in_revert_clause => l_revert_clause
+          );
+        WHEN gc_result_alter_move THEN
+          add_alter_table_stmt(
+            io_change_arr    => io_change_arr,
+            in_table_name    => io_source_table_rec.table_name,
+            in_owner         => io_source_table_rec.owner,
+            in_change_clause => gc_move||l_change_clause||get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_value),
+            in_revert_clause => gc_move||l_revert_clause||get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_value)
+          );
+        WHEN gc_result_recreate THEN
+          RETURN l_segment_result;
+        ELSE 
+          NULL;  
+        END CASE;
+        l_segment_result := GREATEST(l_segment_result, l_comp_result);
+      END IF;
+
+      IF io_source_table_rec.xml_col_arr.EXISTS(l_indx1) AND io_target_table_rec.xml_col_arr.EXISTS(l_indx2) THEN
+        l_comp_result := comp_xml(
+                           in_source_table_rec => io_source_table_rec,
+                           in_target_table_rec => io_target_table_rec,
+                           in_source_xml_rec   => io_source_table_rec.xml_col_arr(l_indx1),
+                           in_target_xml_rec   => io_target_table_rec.xml_col_arr(l_indx2),
+                           out_change_clause   => l_change_clause,
+                           out_revert_clause   => l_revert_clause
+                         );
+        debug('Compare XMLType column result = '||l_comp_result);
+        CASE l_comp_result 
+        WHEN gc_result_alter THEN
+          add_alter_table_stmt(
+            io_change_arr    => io_change_arr,
+            in_table_name    => io_source_table_rec.table_name,
+            in_owner         => io_source_table_rec.owner,
+            in_change_clause => l_change_clause,
+            in_revert_clause => l_revert_clause
+          );
+        WHEN gc_result_alter_move THEN
+          RETURN l_segment_result;
+        WHEN gc_result_recreate THEN
+          RETURN l_segment_result;
+        ELSE 
+          NULL;  
+        END CASE;
+        l_segment_result := GREATEST(l_segment_result, l_comp_result);
+      END IF;
+    
+      IF io_source_table_rec.varray_arr.EXISTS(l_indx1) AND io_target_table_rec.varray_arr.EXISTS(l_indx2) THEN
+        l_comp_result := comp_varray(
+                           in_source_table_rec  => io_source_table_rec,
+                           in_target_table_rec  => io_target_table_rec,
+                           in_source_varray_rec => io_source_table_rec.varray_arr(l_indx1),
+                           in_target_varray_rec => io_target_table_rec.varray_arr(l_indx2),
+                           out_change_clause    => l_change_clause,
+                           out_revert_clause    => l_revert_clause
+                         );
+        debug('Compare VARRAY column result = '||l_comp_result);
+        IF l_comp_result IN (gc_result_alter, gc_result_alter_move) THEN
+          add_alter_table_stmt(
+            io_change_arr    => io_change_arr,
+            in_table_name    => io_source_table_rec.table_name,
+            in_owner         => io_source_table_rec.owner,
+            in_change_clause => l_change_clause,
+            in_revert_clause => l_revert_clause
+          );
+        END IF;  
+        l_segment_result := GREATEST(l_segment_result, l_comp_result);
+      END IF;
+
+     l_indx1 := l_source_xref_arr.NEXT(l_indx1);
+      IF NOT cort_exec_pkg.g_params.compare.exist('IGNORE_ORDER') THEN
         l_indx2 := l_target_xref_arr.NEXT(l_indx2);
       END IF;
     END LOOP;
@@ -3683,7 +4299,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
         debug('Compare virtual columns on source_column_id = '||l_source_column_id||' and target_column_id = '||l_target_column_id);
 
-        IF (l_source_column_id - l_cnt = l_target_column_id) OR cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER') THEN
+        IF (l_source_column_id - l_cnt = l_target_column_id) OR cort_exec_pkg.g_params.compare.exist('IGNORE_ORDER') THEN
           io_source_table_rec.column_arr(l_indx1).matched_column_id := io_target_table_rec.column_arr(l_indx2).column_id;
           io_target_table_rec.column_arr(l_indx2).matched_column_id := io_source_table_rec.column_arr(l_indx1).column_id;
 
@@ -3693,11 +4309,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
            -- compare virtual columns
            l_comp_result := comp_column(
-                              io_source_table_rec    => io_source_table_rec,
-                              in_source_column_rec   => io_source_table_rec.column_arr(l_indx1),
-                              in_target_column_rec   => io_target_table_rec.column_arr(l_indx2),
-                              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                              io_source_table_rec  => io_source_table_rec,
+                              in_source_column_rec => io_source_table_rec.column_arr(l_indx1),
+                              in_target_column_rec => io_target_table_rec.column_arr(l_indx2),
+                              io_change_arr        => l_virt_col_change_arr
                             );
            debug('Compare virtual columns '||io_source_table_rec.column_arr(l_indx1).column_name||' and '||io_target_table_rec.column_arr(l_indx2).column_name||' - '||l_comp_result);
 
@@ -3768,13 +4383,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       -- get the first dropped virtual column
       l_indx1 := l_first_old_virt_col_indx;
       l_indx1 := l_source_segment_col_arr.NEXT(l_indx1);
-      IF l_indx1 IS NOT NULL AND cort_exec_pkg.g_params.drop_column.get_value = 'RECREATE'
-      THEN
-        -- then need to recreate
-        l_virtual_result := gc_result_exchange;
-      ELSE
-        l_virtual_result := GREATEST(l_virtual_result, gc_result_alter);
-      END IF;
+      l_virtual_result := GREATEST(l_virtual_result, gc_result_alter);
     END IF;
 
     debug('l_segment_result = '||l_segment_result);
@@ -3825,11 +4434,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           l_column_rec.data_default := '0';
           -- genmerate SQL to modify virt column expression
           l_comp_result := comp_column(
-                             io_source_table_rec    => io_source_table_rec,
-                             in_source_column_rec   => io_source_table_rec.column_arr(l_indx1),
-                             in_target_column_rec   => l_column_rec,
-                             io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                             io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                             io_source_table_rec  => io_source_table_rec,
+                             in_source_column_rec => io_source_table_rec.column_arr(l_indx1),
+                             in_target_column_rec => l_column_rec,
+                             io_change_arr        => io_change_arr
                            );
         END IF;
       END IF;
@@ -3842,10 +4450,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       debug('Dropping column '||io_source_table_rec.column_arr(l_indx1).column_name);
       IF io_source_table_rec.column_arr(l_indx1).partition_key OR
          io_source_table_rec.column_arr(l_indx1).cluster_key OR
-         io_source_table_rec.column_arr(l_indx1).iot_primary_key OR
+         io_source_table_rec.column_arr(l_indx1).iot_primary_key 
          --io_source_table_rec.compression_rec.compression = 'ENABLED' OR
          --io_source_table_rec.compressed_partitions OR
-         cort_exec_pkg.g_params.drop_column.get_value = 'RECREATE'
       -- check other drop restrictions
       THEN
         debug('Unable to drop column '||io_source_table_rec.column_arr(l_indx1).column_name);
@@ -3855,31 +4462,25 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         THEN
           IF l_virtual_result = gc_result_alter THEN
             drop_column(
-              in_source_table_rec    => io_source_table_rec,
-              in_column_rec          => io_source_table_rec.column_arr(l_indx1),
-              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+              in_source_table_rec => io_source_table_rec,
+              in_column_rec       => io_source_table_rec.column_arr(l_indx1),
+              io_change_arr       => io_change_arr
             );
-            IF cort_exec_pkg.g_params.drop_column.get_value <> 'SET_INVISIBLE' THEN
-              drop_column_refereces(
-                io_table_rec    => io_source_table_rec,
-                in_column_rec   => io_source_table_rec.column_arr(l_indx1)
-              );
-            END IF;
-          END IF;
-        ELSE
-          drop_column(
-            in_source_table_rec    => io_source_table_rec,
-            in_column_rec          => io_source_table_rec.column_arr(l_indx1),
-            io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-            io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
-          );
-          IF cort_exec_pkg.g_params.drop_column.get_value <> 'SET_INVISIBLE' THEN
             drop_column_refereces(
               io_table_rec    => io_source_table_rec,
               in_column_rec   => io_source_table_rec.column_arr(l_indx1)
             );
           END IF;
+        ELSE
+          drop_column(
+            in_source_table_rec => io_source_table_rec,
+            in_column_rec       => io_source_table_rec.column_arr(l_indx1),
+            io_change_arr       => io_change_arr
+          );
+          drop_column_refereces(
+            io_table_rec    => io_source_table_rec,
+            in_column_rec   => io_source_table_rec.column_arr(l_indx1)
+          );
         END IF;
       END IF;
       l_indx1 := l_drop_column_arr.PRIOR(l_indx1);
@@ -3894,24 +4495,29 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
          io_target_table_rec.column_arr(l_indx2).data_default IS NULL AND
          io_target_table_rec.column_arr(l_indx2).virtual_column = 'NO'
       THEN
-        IF io_target_table_rec.column_arr(l_indx2).cort_value IS NOT NULL THEN
+        IF cort_exec_pkg.g_params.data_values.get_value(io_target_table_rec.column_arr(l_indx2).column_name) IS NOT NULL THEN
           debug('Column '||io_target_table_rec.column_arr(l_indx2).column_name||' is mandatory and has no default value. Need to recreate...');
           RETURN gc_result_recreate;
         ELSE
           IF NOT io_source_table_rec.is_table_empty THEN
-            cort_exec_pkg.raise_error( 'New NOT NULL column '||io_target_table_rec.column_arr(l_indx2).column_name||' must have DEFAULT or CORT_VALUE value');
+            cort_exec_pkg.raise_error( 'New NOT NULL column '||io_target_table_rec.column_arr(l_indx2).column_name||' must have DEFAULT or DATA_VALUE value');
           END IF;
         END IF;
       END IF;
-      IF (io_target_table_rec.column_arr(l_indx2).virtual_column = 'NO') OR
-         (io_target_table_rec.column_arr(l_indx2).virtual_column = 'YES' AND l_virtual_result = gc_result_alter)
-      THEN
+      IF io_target_table_rec.column_arr(l_indx2).virtual_column = 'NO' THEN
         add_column(
-          in_source_table_rec    => io_source_table_rec,
-          in_target_table_rec    => io_target_table_rec,
-          in_column_rec          => io_target_table_rec.column_arr(l_indx2),
-          io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+          in_source_table_rec => io_source_table_rec,
+          in_target_table_rec => io_target_table_rec,
+          in_column_rec       => io_target_table_rec.column_arr(l_indx2),
+          io_change_arr       => io_change_arr
+        );
+      END IF;  
+      IF io_target_table_rec.column_arr(l_indx2).virtual_column = 'YES' AND l_virtual_result = gc_result_alter THEN
+        add_column(
+          in_source_table_rec => io_source_table_rec,
+          in_target_table_rec => io_target_table_rec,
+          in_column_rec       => io_target_table_rec.column_arr(l_indx2),
+          io_change_arr       => l_virt_col_change_arr
         );
       END IF;
       l_indx2 := l_add_column_arr.NEXT(l_indx2);
@@ -3919,15 +4525,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
     -- Second way of renaming process - renaming all temp columns into new column_name
     rename_temp_columns(
-      in_source_table_rec    => io_source_table_rec,
-      io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+      in_source_table_rec => io_source_table_rec,
+      io_change_arr       => io_change_arr
     );
-
+    
     -- update column names - replace name for smart renamed columns
     update_refs_on_renamed_columns(
       io_table_rec    => io_source_table_rec
     );
+
+    -- add all changes for virtual columns after segment column changes and renames to avoid reference issue
+    FOR i IN 1..l_virt_col_change_arr.COUNT LOOP
+      io_change_arr(io_change_arr.COUNT+1) := l_virt_col_change_arr(i);
+    END LOOP;
 
     RETURN l_result;
 
@@ -3942,7 +4552,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   BEGIN
     IF in_index_rec.index_type = 'BITMAP' AND in_index_rec.join_index = 'YES' THEN
       FOR i IN 1..in_index_rec.column_arr.COUNT LOOP
-        l_result := l_result || '"'||in_index_rec.column_table_owner_arr(i)||'"."'||cort_parse_pkg.get_original_name('TABLE',in_index_rec.column_table_arr(i))||'"."'||in_index_rec.column_arr(i)||'",';
+        l_result := l_result || '"'||in_index_rec.column_table_owner_arr(i)||'"."'||cort_parse_pkg.get_original_name(in_index_rec.column_table_arr(i))||'"."'||in_index_rec.column_arr(i)||'",';
       END LOOP;
     ELSE
       FOR i IN 1..in_index_rec.column_arr.COUNT LOOP
@@ -4025,16 +4635,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     -- Logging
     l_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_index_rec.logging);
     -- Parallel
-    IF cort_exec_pkg.g_params.parallel.get_num_value > 1 THEN
-      l_str := get_clause(gc_degree, cort_exec_pkg.g_params.parallel.get_num_value)||get_clause(gc_instances, in_index_rec.parallel_rec.instances);
+    IF cort_exec_pkg.g_run_params.parallel.get_num_value > 1 THEN
+      l_str := get_clause(gc_degree, cort_exec_pkg.g_run_params.parallel.get_num_value)||get_clause(gc_instances, in_index_rec.parallel_rec.instances);
     ELSE
     l_str := get_clause(gc_degree, in_index_rec.parallel_rec.degree)||get_clause(gc_instances, in_index_rec.parallel_rec.instances);
     END IF;
     l_clause_indx_arr(gc_parallel) := get_clause(gc_parallel, l_str, '(', ')');
     -- Tablespace
-    IF cort_exec_pkg.g_params.tablespace.value_exists('INDEX') THEN
-      l_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_index_rec.tablespace_name, '"', '"');
-    END IF;
+    l_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_index_rec.tablespace_name, '"', '"');
     -- visibility
     $IF dbms_db_version.version >= 11 $THEN
       IF in_index_rec.visibility IS NOT NULL THEN
@@ -4072,76 +4680,64 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- builds CREATE INDEX statements to add index
   PROCEDURE create_index(
-    in_index_rec             IN cort_exec_pkg.gt_index_rec,
-    in_table_name            IN VARCHAR2,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_index_rec  IN cort_exec_pkg.gt_index_rec,
+    in_table_name IN VARCHAR2,
+    io_change_arr IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_stmt            CLOB;
-    l_rlbk_stmt            CLOB;
   BEGIN
-    -- create forward statements
-    l_frwd_stmt := get_create_index_clause(in_index_rec.rename_rec.object_name, in_table_name, in_index_rec);
-    debug('Create index SQL', l_frwd_stmt);
-    -- create rollback statements
-    l_rlbk_stmt := gc_drop||get_clause(gc_index, in_index_rec.owner||'"."'||in_index_rec.rename_rec.object_name, '"', '"');
-
-    add_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-      in_frwd_stmt     => l_frwd_stmt,
-      in_rlbk_stmt     => l_rlbk_stmt
+    cort_exec_pkg.add_change(
+      io_change_arr,
+      cort_exec_pkg.change_rec(
+        in_group_type => 'CREATE INDEX',
+        in_change_sql => get_create_index_clause(in_index_rec.rename_rec.object_name, in_table_name, in_index_rec),
+        in_revert_sql => gc_drop||get_clause(gc_index, in_index_rec.owner||'"."'||in_index_rec.rename_rec.object_name, '"', '"')
+      )
     );
-    IF cort_exec_pkg.g_params.parallel.get_num_value > 1 THEN
-      l_frwd_stmt := get_clause(gc_parallel, get_clause(gc_degree, in_index_rec.parallel_rec.degree)||get_clause(gc_instances, in_index_rec.parallel_rec.instances), '(', ')');
-      l_rlbk_stmt := null;
-      add_alter_index_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-        in_index_name    => in_index_rec.rename_rec.object_name,
-        in_owner         => in_index_rec.owner,
-        in_frwd_clause   => l_frwd_stmt,
-        in_rlbk_clause   => l_rlbk_stmt
+    
+    IF cort_exec_pkg.g_run_params.parallel.get_num_value > 1 THEN
+      -- restoring index parallel degree
+      cort_exec_pkg.add_change(
+        io_change_arr,
+        cort_exec_pkg.change_rec(
+          in_group_type => 'CREATE INDEX',
+          in_change_sql => 'ALTER INDEX "'||in_index_rec.owner||'"."'||in_index_rec.rename_rec.object_name||'" '||get_clause(gc_parallel, get_clause(gc_degree, in_index_rec.parallel_rec.degree)||get_clause(gc_instances, in_index_rec.parallel_rec.instances), '(', ')'),
+          in_revert_sql => NULL
+        )
       );
-    END IF;
+    END IF;  
   END create_index;
 
   -- builds DROP INDEX ALTER statements to drop index
   PROCEDURE drop_index(
-    in_index_rec             IN cort_exec_pkg.gt_index_rec,
-    in_table_name            IN VARCHAR2,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_index_rec   IN cort_exec_pkg.gt_index_rec,
+    in_table_name  IN VARCHAR2,
+    io_change_arr  IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_stmt            CLOB;
-    l_rlbk_stmt            CLOB;
   BEGIN
-    -- create rollback statements
-    IF cort_exec_pkg.g_params.parallel.get_num_value > 1 THEN
-      l_rlbk_stmt := get_clause(gc_parallel, get_clause(gc_degree, in_index_rec.parallel_rec.degree)||get_clause(gc_instances, in_index_rec.parallel_rec.instances), '(', ')');
-      l_frwd_stmt := null;
-      add_alter_index_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-        in_index_name    => in_index_rec.index_name,
-        in_owner         => in_index_rec.owner,
-        in_frwd_clause   => l_frwd_stmt,
-        in_rlbk_clause   => l_rlbk_stmt
+    -- restoring index parallel degree in case of reverting
+    IF cort_exec_pkg.g_run_params.parallel.get_num_value > 1 THEN
+      cort_exec_pkg.add_change(
+        io_change_arr,
+        cort_exec_pkg.change_rec(
+          in_group_type => 'DROP INDEX',
+          in_change_sql => NULL,
+          in_revert_sql => 'ALTER INDEX "'||in_index_rec.owner||'"."'||in_index_rec.rename_rec.object_name||'" '||get_clause(gc_parallel, get_clause(gc_degree, in_index_rec.parallel_rec.degree)||get_clause(gc_instances, in_index_rec.parallel_rec.instances), '(', ')')
+        )
       );
-    END IF;
-    -- create forward statements
-    l_frwd_stmt := gc_drop||get_clause(gc_index, in_index_rec.owner||'"."'||in_index_rec.index_name, '"', '"');
-    -- create rollback statements
-    l_rlbk_stmt := get_create_index_clause(in_index_rec.index_name, in_table_name, in_index_rec);
-    add_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-      in_frwd_stmt     => l_frwd_stmt,
-      in_rlbk_stmt     => l_rlbk_stmt
+    END IF;  
+
+    cort_exec_pkg.add_change(
+      io_change_arr,
+      cort_exec_pkg.change_rec(
+        in_group_type => 'DROP INDEX',
+        in_change_sql => get_drop_index_ddl(in_index_rec.index_name, in_index_rec.owner),
+        in_revert_sql => get_create_index_clause(in_index_rec.index_name, in_table_name, in_index_rec)
+      )
     );
   END drop_index;
+  
 
   -- Returns index_rec assigned to given PK/UK
   FUNCTION get_pk_index_rec(
@@ -4150,7 +4746,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   RETURN cort_exec_pkg.gt_index_rec
   AS
-    l_index_full_name VARCHAR2(65);
+    l_index_full_name arrays.gt_full_name;
     l_index_rec       cort_exec_pkg.gt_index_rec;
   BEGIN
     IF in_constraint_rec.index_owner IS NOT NULL AND
@@ -4203,22 +4799,21 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- compares index
   FUNCTION comp_index(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    io_source_index_rec    IN OUT NOCOPY cort_exec_pkg.gt_index_rec,
-    io_target_index_rec    IN OUT NOCOPY cort_exec_pkg.gt_index_rec,
-    in_comp_phys_attr      IN BOOLEAN,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
+    io_source_index_rec IN OUT NOCOPY cort_exec_pkg.gt_index_rec,
+    io_target_index_rec IN OUT NOCOPY cort_exec_pkg.gt_index_rec,
+    in_comp_phys_attr   IN BOOLEAN,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
     l_comp_result            PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
-    l_frwd_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_rlbk_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
+    l_change_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr   arrays.gt_xlstr_indx;
   BEGIN
     l_result := gc_result_nochange;
     IF comp_value(io_source_index_rec.index_type, io_target_index_rec.index_type) = 1 OR
@@ -4234,14 +4829,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       debug('Recreate index : '||io_source_index_rec.index_name||' - mismatch index_type/itype/uniqueness/locality/compression');
       RETURN gc_result_recreate;
     END IF;
-
-    IF cort_exec_pkg.g_params.tablespace.value_exists('INDEX') AND
-       comp_value(io_source_index_rec.tablespace_name, io_target_index_rec.tablespace_name) = 1
-    THEN
-      debug('Recreate index : '||io_source_index_rec.index_name||' - mismatch tablespace');
-      RETURN gc_result_recreate;
-    END IF;
-
 
     IF io_source_index_rec.index_type IN ('FUNCTION-BASED NORMAL', 'FUNCTION-BASED NORMAL/REV', 'FUNCTION-BASED BITMAP') THEN
       IF comp_array(io_source_index_rec.column_expr_arr, io_target_index_rec.column_expr_arr) = 1 THEN
@@ -4267,12 +4854,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
     -- storage physical attributes (including storage)
     IF in_comp_phys_attr THEN
-      IF cort_exec_pkg.g_params.physical_attr.value_exists('INDEX') THEN
+      IF cort_exec_pkg.g_params.physical_attr.exist('INDEX') THEN
         l_comp_result := comp_index_physical_attr(
                            in_source_physical_attr_rec => io_source_index_rec.physical_attr_rec,
                            in_target_physical_attr_rec => io_target_index_rec.physical_attr_rec,
-                           out_frwd_clause             => l_frwd_clause,
-                           out_rlbk_clause             => l_rlbk_clause
+                           out_change_clause           => l_change_clause,
+                           out_revert_clause           => l_revert_clause
                          );
         CASE l_comp_result
         WHEN gc_result_recreate THEN
@@ -4281,72 +4868,88 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         WHEN gc_result_alter THEN
           debug('Alter index: Compare index physical_attr_rec - '||gc_result_alter);
           l_result := gc_result_alter;
-          l_frwd_clause_indx_arr(gc_physical_attr) := l_frwd_clause;
-          l_rlbk_clause_indx_arr(gc_physical_attr) := l_rlbk_clause;
+          l_change_clause_indx_arr(gc_physical_attr) := l_change_clause;
+          l_revert_clause_indx_arr(gc_physical_attr) := l_revert_clause;
         ELSE
           NULL;
         END CASE;
       END IF;
     END IF;
 
+
+    -- Tablespace
+    IF comp_value(io_source_index_rec.tablespace_name, io_target_index_rec.tablespace_name) = 1 
+    THEN
+      IF io_source_index_rec.partitioned = 'NO' THEN 
+        debug('ALTER REBUILD index : '||io_source_index_rec.index_name||' - mismatch tablespace');
+        l_result := gc_result_alter;
+        l_change_clause_indx_arr(gc_rebuild) := get_clause(gc_rebuild, io_target_index_rec.logging);
+        l_revert_clause_indx_arr(gc_rebuild) := get_clause(gc_rebuild, io_source_index_rec.logging);
+      ELSE
+      -- to do: add rebuild by partition for threading 
+        RETURN gc_result_recreate;
+      END IF;  
+    END IF;
+
+
     -- Logging
     IF comp_value(io_source_index_rec.logging, io_target_index_rec.logging) = 1 THEN
       debug('Alter index: mismatch logging');
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_logging) := get_clause(gc_logging, io_target_index_rec.logging);
-      l_rlbk_clause_indx_arr(gc_logging) := get_clause(gc_logging, io_source_index_rec.logging);
+      l_change_clause_indx_arr(gc_logging) := get_clause(gc_logging, io_target_index_rec.logging);
+      l_revert_clause_indx_arr(gc_logging) := get_clause(gc_logging, io_source_index_rec.logging);
     END IF;
 
     -- Parallel
     IF comp_parallel(
          in_source_parallel_rec  => io_source_index_rec.parallel_rec,
          in_target_parallel_rec  => io_target_index_rec.parallel_rec,
-         out_frwd_clause         => l_frwd_clause,
-         out_rlbk_clause         => l_rlbk_clause
+         out_change_clause       => l_change_clause,
+         out_revert_clause       => l_revert_clause
        ) = 1
     THEN
       debug('Alter index: mismatch parallel');
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_parallel) := get_clause(gc_parallel, l_frwd_clause, '(', ')');
-      l_rlbk_clause_indx_arr(gc_parallel) := get_clause(gc_parallel, l_rlbk_clause, '(', ')');
+      l_change_clause_indx_arr(gc_parallel) := get_clause(gc_parallel, l_change_clause, '(', ')');
+      l_revert_clause_indx_arr(gc_parallel) := get_clause(gc_parallel, l_revert_clause, '(', ')');
     END IF;
 
     -- Parameters
     IF comp_value(io_source_index_rec.parameters, io_target_index_rec.parameters) = 1 THEN
       debug('Alter index: mismatch parameters');
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_parameters) := get_clause(gc_parameters, io_target_index_rec.parameters, '(Q''{', '}'')');
-      l_rlbk_clause_indx_arr(gc_parameters) := get_clause(gc_parameters, io_source_index_rec.parameters, '(Q''{', '}'')');
+      l_change_clause_indx_arr(gc_parameters) := get_clause(gc_parameters, io_target_index_rec.parameters, '(Q''{', '}'')');
+      l_revert_clause_indx_arr(gc_parameters) := get_clause(gc_parameters, io_source_index_rec.parameters, '(Q''{', '}'')');
     END IF;
 
     $IF dbms_db_version.version > 12 OR (dbms_db_version.version = 12 AND dbms_db_version.release >= 2) $THEN
     IF comp_value(io_source_index_rec.indexing, io_target_index_rec.indexing) = 1 THEN
       debug('Alter index: mismatch indexing');
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_indexing) := get_clause(gc_indexing, io_target_index_rec.indexing);
-      l_rlbk_clause_indx_arr(gc_indexing) := get_clause(gc_indexing, io_source_index_rec.indexing);
+      l_change_clause_indx_arr(gc_indexing) := get_clause(gc_indexing, io_target_index_rec.indexing);
+      l_revert_clause_indx_arr(gc_indexing) := get_clause(gc_indexing, io_source_index_rec.indexing);
     END IF;
     $END
 
-    l_frwd_clause := get_clause_by_name(l_frwd_clause_indx_arr, gc_physical_attr)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_logging)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_parallel)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_parameters)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_indexing);
-    l_rlbk_clause := get_clause_by_name(l_rlbk_clause_indx_arr, gc_physical_attr)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_logging)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_parallel)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_parameters)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_indexing);
+    l_change_clause := get_clause_by_name(l_change_clause_indx_arr, gc_physical_attr)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_logging)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_parallel)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_parameters)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_indexing);
+    l_revert_clause := get_clause_by_name(l_revert_clause_indx_arr, gc_physical_attr)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_logging)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_parallel)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_parameters)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_indexing);
 
     IF l_result = gc_result_alter THEN
-      add_alter_index_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-        in_index_name    => io_source_index_rec.index_name,
-        in_owner         => io_source_index_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+      cort_exec_pkg.add_change(
+        io_change_arr,
+        cort_exec_pkg.change_rec(
+          in_group_type => 'ALTER INDEX',
+          in_change_sql => 'ALTER INDEX "'||io_source_index_rec.owner||'"."'||io_source_index_rec.index_name||'" '||l_change_clause,
+          in_revert_sql => 'ALTER INDEX "'||io_source_index_rec.owner||'"."'||io_source_index_rec.index_name||'" '||l_revert_clause
+        )
       );
     END IF;
 
@@ -4356,10 +4959,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       debug('Alter index: mismatch names');
       l_result := gc_result_alter;
       io_source_index_rec.rename_rec.object_name := io_target_index_rec.rename_rec.object_name;
-      l_frwd_clause := 'ALTER INDEX "'||io_source_index_rec.owner||'"."'||io_source_index_rec.index_name||'" '||get_clause(gc_rename_to, io_target_index_rec.rename_rec.object_name, '"', '"');
-      l_rlbk_clause := 'ALTER INDEX "'||io_source_index_rec.owner||'"."'||io_target_index_rec.rename_rec.object_name||'" '||get_clause(gc_rename_to, io_source_index_rec.index_name, '"', '"');
-      io_frwd_alter_stmt_arr(io_frwd_alter_stmt_arr.COUNT+1) := l_frwd_clause;
-      io_rlbk_alter_stmt_arr(io_rlbk_alter_stmt_arr.COUNT+1) := l_rlbk_clause;
+      cort_exec_pkg.add_change(
+        io_change_arr,
+        cort_exec_pkg.change_rec(
+          in_group_type => 'ALTER INDEX',
+          in_change_sql => 'ALTER INDEX "'||io_source_index_rec.owner||'"."'||io_source_index_rec.index_name||'" '||get_clause(gc_rename_to, io_target_index_rec.rename_rec.object_name, '"', '"'),
+          in_revert_sql => 'ALTER INDEX "'||io_source_index_rec.owner||'"."'||io_target_index_rec.rename_rec.object_name||'" '||get_clause(gc_rename_to, io_source_index_rec.index_name, '"', '"')
+        )
+      );
     END IF;
 
     RETURN l_result;
@@ -4369,10 +4976,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- compare all indexes (exception PK/UK) on table
   FUNCTION comp_indexes(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
@@ -4383,13 +4989,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_target_index_rec        cort_exec_pkg.gt_index_rec;
     l_comp_result             PLS_INTEGER;
     l_result                  PLS_INTEGER;
-    l_frwd_ddl_arr            arrays.gt_clob_arr;
-    l_rlbk_ddl_arr            arrays.gt_clob_arr;
-    l_frwd_drop_ddl_arr       arrays.gt_clob_arr;
-    l_rlbk_drop_ddl_arr       arrays.gt_clob_arr;
-    l_frwd_create_ddl_arr     arrays.gt_clob_arr;
-    l_rlbk_create_ddl_arr     arrays.gt_clob_arr;
-   -- l_index_stmt_rec          gt_index_statement_rec;
+    l_drop_change_arr         cort_exec_pkg.gt_change_arr;
+    l_create_change_arr       cort_exec_pkg.gt_change_arr;
   BEGIN
     -- build for source indexes description indx-array
     FOR i IN 1..in_source_table_rec.index_arr.COUNT LOOP
@@ -4427,28 +5028,25 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           l_result := greatest(gc_result_recreate, l_result);
 
           drop_index(
-            in_index_rec           => l_source_index_rec,
-            in_table_name          => in_source_table_rec.rename_rec.object_name,
-            io_frwd_alter_stmt_arr => l_frwd_drop_ddl_arr,
-            io_rlbk_alter_stmt_arr => l_rlbk_drop_ddl_arr
+            in_index_rec  => l_source_index_rec,
+            in_table_name => in_source_table_rec.rename_rec.object_name,
+            io_change_arr => l_drop_change_arr
           );
           create_index(
-            in_index_rec           => l_source_index_rec,
-            in_table_name          => in_source_table_rec.rename_rec.object_name,
-            io_frwd_alter_stmt_arr => l_frwd_create_ddl_arr,
-            io_rlbk_alter_stmt_arr => l_rlbk_create_ddl_arr
+            in_index_rec  => l_source_index_rec,
+            in_table_name => in_source_table_rec.rename_rec.object_name,
+            io_change_arr => l_create_change_arr
           );
 
         ELSE
           -- compare indexes
           l_comp_result := comp_index(
-                             in_source_table_rec    => in_source_table_rec,
-                             in_target_table_rec    => in_target_table_rec,
-                             io_source_index_rec    => l_source_index_rec,
-                             io_target_index_rec    => l_target_index_rec,
-                             in_comp_phys_attr      => CASE WHEN in_source_table_rec.iot_type IS NULL THEN TRUE ELSE FALSE END,
-                             io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                             io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                             in_source_table_rec => in_source_table_rec,
+                             in_target_table_rec => in_target_table_rec,
+                             io_source_index_rec => l_source_index_rec,
+                             io_target_index_rec => l_target_index_rec,
+                             in_comp_phys_attr   => CASE WHEN in_source_table_rec.iot_type IS NULL THEN TRUE ELSE FALSE END,
+                             io_change_arr       => io_change_arr
                            );
 
           debug('Comp index source='||l_source_index_rec.index_name||' and target='||l_target_index_rec.index_name||' result - '||l_comp_result);
@@ -4459,16 +5057,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             -- if need to recreate
             -- add DROP/CREATE INDEX statements into output arrays
             drop_index(
-              in_index_rec           => l_source_index_rec,
-              in_table_name          => in_source_table_rec.rename_rec.object_name,
-              io_frwd_alter_stmt_arr => l_frwd_drop_ddl_arr,
-              io_rlbk_alter_stmt_arr => l_rlbk_drop_ddl_arr
+              in_index_rec  => l_source_index_rec,
+              in_table_name => in_source_table_rec.rename_rec.object_name,
+              io_change_arr => l_drop_change_arr
             );
             create_index(
-              in_index_rec           => l_target_index_rec,
-              in_table_name          => in_source_table_rec.rename_rec.object_name,
-              io_frwd_alter_stmt_arr => l_frwd_create_ddl_arr,
-              io_rlbk_alter_stmt_arr => l_rlbk_create_ddl_arr
+              in_index_rec  => l_target_index_rec,
+              in_table_name => in_source_table_rec.rename_rec.object_name,
+              io_change_arr => l_create_change_arr
             );
           END IF;
         END IF;
@@ -4483,10 +5079,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           debug('Comp index: drop index source='||l_source_index_rec.index_name);
         END IF;
         drop_index(
-          in_index_rec           => l_source_index_rec,
-          in_table_name          => in_source_table_rec.rename_rec.object_name,
-          io_frwd_alter_stmt_arr => l_frwd_drop_ddl_arr,
-          io_rlbk_alter_stmt_arr => l_rlbk_drop_ddl_arr
+          in_index_rec  => l_source_index_rec,
+          in_table_name => in_source_table_rec.rename_rec.object_name,
+          io_change_arr => l_drop_change_arr
         );
       END IF;
       l_hash_index := l_source_hash_index_arr.NEXT(l_hash_index);
@@ -4503,10 +5098,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
         debug('Comp index: add index target='||l_target_index_rec.index_name);
         create_index(
-          in_index_rec           => l_target_index_rec,
-          in_table_name          => in_target_table_rec.rename_rec.object_name,
-          io_frwd_alter_stmt_arr => l_frwd_create_ddl_arr,
-          io_rlbk_alter_stmt_arr => l_rlbk_create_ddl_arr
+          in_index_rec  => l_target_index_rec,
+          in_table_name => in_target_table_rec.rename_rec.object_name,
+          io_change_arr => l_create_change_arr
         );
       END IF;
       l_hash_index := l_target_hash_index_arr.NEXT(l_hash_index);
@@ -4520,58 +5114,30 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         cort_log_pkg.echo('Warning: Join index on removed column is dropped');
         l_result := greatest(gc_result_drop, l_result);
         drop_index(
-          in_index_rec           => l_source_index_rec,
-          in_table_name          => l_source_index_rec.table_name,
-          io_frwd_alter_stmt_arr => l_frwd_drop_ddl_arr,
-          io_rlbk_alter_stmt_arr => l_rlbk_drop_ddl_arr
+          in_index_rec  => l_source_index_rec,
+          in_table_name => l_source_index_rec.table_name,
+          io_change_arr => l_drop_change_arr
         );
       ELSIF l_source_index_rec.recreate_flag THEN
         debug('join index refers renamed column. Recreate');
         l_result := greatest(gc_result_create, l_result);
         drop_index(
-          in_index_rec           => l_source_index_rec,
-          in_table_name          => l_source_index_rec.table_name,
-          io_frwd_alter_stmt_arr => l_frwd_drop_ddl_arr,
-          io_rlbk_alter_stmt_arr => l_rlbk_drop_ddl_arr
+          in_index_rec  => l_source_index_rec,
+          in_table_name => l_source_index_rec.table_name,
+          io_change_arr => l_drop_change_arr
         );
         create_index(
-          in_index_rec           => l_source_index_rec,
-          in_table_name          => l_source_index_rec.table_name,
-          io_frwd_alter_stmt_arr => l_frwd_create_ddl_arr,
-          io_rlbk_alter_stmt_arr => l_rlbk_create_ddl_arr
+          in_index_rec  => l_source_index_rec,
+          in_table_name => l_source_index_rec.table_name,
+          io_change_arr => l_create_change_arr
         );
       END IF;
     END LOOP;
 
 
     IF l_result > gc_result_alter THEN
-      FOR i IN 1..l_frwd_drop_ddl_arr.COUNT LOOP
-        add_stmt(
-          io_frwd_stmt_arr => l_frwd_ddl_arr,
-          io_rlbk_stmt_arr => l_rlbk_ddl_arr,
-          in_frwd_stmt     => l_frwd_drop_ddl_arr(i),
-          in_rlbk_stmt     => l_rlbk_drop_ddl_arr(i)
-        );
-      END LOOP;
-      FOR i IN 1..io_frwd_alter_stmt_arr.COUNT LOOP
-        add_stmt(
-          io_frwd_stmt_arr => l_frwd_ddl_arr,
-          io_rlbk_stmt_arr => l_rlbk_ddl_arr,
-          in_frwd_stmt     => io_frwd_alter_stmt_arr(i),
-          in_rlbk_stmt     => io_rlbk_alter_stmt_arr(i)
-        );
-      END LOOP;
-      FOR i IN 1..l_frwd_create_ddl_arr.COUNT LOOP
-        add_stmt(
-          io_frwd_stmt_arr => l_frwd_ddl_arr,
-          io_rlbk_stmt_arr => l_rlbk_ddl_arr,
-          in_frwd_stmt     => l_frwd_create_ddl_arr(i),
-          in_rlbk_stmt     => l_rlbk_create_ddl_arr(i)
-        );
-      END LOOP;
-
-      io_frwd_alter_stmt_arr := l_frwd_ddl_arr;
-      io_rlbk_alter_stmt_arr := l_rlbk_ddl_arr;
+      cort_exec_pkg.add_changes(io_change_arr, l_drop_change_arr);
+      cort_exec_pkg.add_changes(io_change_arr, l_create_change_arr);
     END IF;
 
     RETURN l_result;
@@ -4579,15 +5145,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- copies table indexes
   PROCEDURE copy_indexes(
-    in_source_table_rec      IN cort_exec_pkg.gt_table_rec,
-    io_target_table_rec      IN OUT cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- rollback alter statements
-    in_copy_pk_uk            IN BOOLEAN DEFAULT FALSE -- copy indexes for PK/UK
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    io_target_table_rec IN OUT cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr,
+    in_copy_pk_uk       IN BOOLEAN DEFAULT FALSE -- copy indexes for PK/UK
   )
   AS
     l_indx            PLS_INTEGER;
-    l_index_full_name VARCHAR2(65);
+    l_index_full_name arrays.gt_full_name;
     l_index_rec       cort_exec_pkg.gt_index_rec;
   BEGIN
     FOR i IN 1..in_source_table_rec.index_arr.COUNT LOOP
@@ -4609,10 +5174,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         END IF;
 
         create_index(
-          in_index_rec             => l_index_rec,
-          in_table_name            => l_index_rec.table_name,
-          io_frwd_alter_stmt_arr   => io_frwd_alter_stmt_arr,
-          io_rlbk_alter_stmt_arr   => io_rlbk_alter_stmt_arr
+          in_index_rec  => l_index_rec,
+          in_table_name => l_index_rec.table_name,
+          io_change_arr => io_change_arr
         );
         io_target_table_rec.index_arr(l_indx).rename_rec.object_name := in_source_table_rec.index_arr(i).rename_rec.object_name;
       END IF;
@@ -4626,10 +5190,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       l_index_full_name := '"'||io_target_table_rec.join_index_arr(i).owner||'"."'||io_target_table_rec.join_index_arr(i).index_name||'"';
       io_target_table_rec.join_index_indx_arr(l_index_full_name) := i;
       create_index(
-        in_index_rec             => io_target_table_rec.join_index_arr(i),
-        in_table_name            => io_target_table_rec.join_index_arr(i).table_name,
-        io_frwd_alter_stmt_arr   => io_frwd_alter_stmt_arr,
-        io_rlbk_alter_stmt_arr   => io_rlbk_alter_stmt_arr
+        in_index_rec  => io_target_table_rec.join_index_arr(i),
+        in_table_name => io_target_table_rec.join_index_arr(i).table_name,
+        io_change_arr => io_change_arr
       );
       io_target_table_rec.join_index_arr(i).rename_rec.object_name := in_source_table_rec.index_arr(i).rename_rec.object_name;
     END LOOP;
@@ -4641,16 +5204,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_target_table_rec      IN cort_exec_pkg.gt_table_rec,
     in_source_constraint_rec IN cort_exec_pkg.gt_constraint_rec,
     in_target_constraint_rec IN cort_exec_pkg.gt_constraint_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr            IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
-    l_result                 PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
-    l_frwd_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_rlbk_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_result                   PLS_INTEGER;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
+    l_change_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr   arrays.gt_xlstr_indx;
   BEGIN
     l_result := gc_result_nochange;
     IF comp_value(in_source_constraint_rec.constraint_type, in_target_constraint_rec.constraint_type) = 1 OR
@@ -4666,50 +5228,49 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       RETURN gc_result_recreate;
     END IF;
 
-    l_frwd_clause_indx_arr(gc_constraint_name) := get_clause(gc_modify_constraint, in_target_constraint_rec.rename_rec.object_name, '"', '"');
-    l_rlbk_clause_indx_arr(gc_constraint_name) := get_clause(gc_modify_constraint, in_source_constraint_rec.constraint_name, '"', '"');
+    l_change_clause_indx_arr(gc_constraint_name) := get_clause(gc_modify_constraint, in_target_constraint_rec.rename_rec.object_name, '"', '"');
+    l_revert_clause_indx_arr(gc_constraint_name) := get_clause(gc_modify_constraint, in_source_constraint_rec.constraint_name, '"', '"');
 
     IF comp_value(in_source_constraint_rec.deferred, in_target_constraint_rec.deferred) = 1 AND
        in_source_constraint_rec.deferrable = 'DEFERRABLE'
     THEN
       l_result := gc_result_alter;
       debug('Alter constraint '||in_source_constraint_rec.constraint_name||' - changed deferrable');
-      l_frwd_clause_indx_arr(gc_deferred) := get_clause(gc_deferred, in_target_constraint_rec.deferred);
-      l_rlbk_clause_indx_arr(gc_deferred) := get_clause(gc_deferred, in_source_constraint_rec.deferred);
+      l_change_clause_indx_arr(gc_deferred) := get_clause(gc_deferred, in_target_constraint_rec.deferred);
+      l_revert_clause_indx_arr(gc_deferred) := get_clause(gc_deferred, in_source_constraint_rec.deferred);
     END IF;
 
     IF comp_value(in_source_constraint_rec.status, in_target_constraint_rec.status) = 1 THEN
       l_result := gc_result_alter;
       debug('Alter constraint '||in_source_constraint_rec.constraint_name||' - changed status');
-      l_frwd_clause_indx_arr(gc_status) := get_clause(gc_status, in_target_constraint_rec.status);
-      l_rlbk_clause_indx_arr(gc_status) := get_clause(gc_status, in_source_constraint_rec.status);
+      l_change_clause_indx_arr(gc_status) := get_clause(gc_status, in_target_constraint_rec.status);
+      l_revert_clause_indx_arr(gc_status) := get_clause(gc_status, in_source_constraint_rec.status);
     END IF;
 
 
     IF comp_value(in_source_constraint_rec.validated, in_target_constraint_rec.validated) = 1 THEN
       l_result := gc_result_alter;
       debug('Alter constraint '||in_source_constraint_rec.constraint_name||' - changed validated');
-      l_frwd_clause_indx_arr(gc_validated) := get_clause(gc_validated, in_target_constraint_rec.validated);
-      l_rlbk_clause_indx_arr(gc_validated) := get_clause(gc_validated, in_source_constraint_rec.validated);
+      l_change_clause_indx_arr(gc_validated) := get_clause(gc_validated, in_target_constraint_rec.validated);
+      l_revert_clause_indx_arr(gc_validated) := get_clause(gc_validated, in_source_constraint_rec.validated);
     END IF;
 
-    l_frwd_clause := get_clause_by_name(l_frwd_clause_indx_arr, gc_constraint_name)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_deferred)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_status)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_validated);
-    l_rlbk_clause := get_clause_by_name(l_rlbk_clause_indx_arr, gc_constraint_name)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_deferred)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_status)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_validated);
+    l_change_clause := get_clause_by_name(l_change_clause_indx_arr, gc_constraint_name)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_deferred)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_status)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_validated);
+    l_revert_clause := get_clause_by_name(l_revert_clause_indx_arr, gc_constraint_name)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_deferred)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_status)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_validated);
 
     IF l_result = gc_result_alter THEN
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_table_name    => in_source_table_rec.table_name,
         in_owner         => in_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause
       );
     END IF;
 
@@ -4717,15 +5278,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
        comp_value(in_source_constraint_rec.constraint_name, in_target_constraint_rec.rename_rec.object_name) = 1
     THEN
       l_result := gc_result_alter;
-      l_frwd_clause := get_clause(gc_rename_constraint , '"'||in_source_constraint_rec.constraint_name||'" TO "'||in_target_constraint_rec.rename_rec.object_name||'"');
-      l_rlbk_clause := get_clause(gc_rename_constraint, '"'||in_target_constraint_rec.rename_rec.object_name||'" TO "'||in_source_constraint_rec.constraint_name||'"');
+      l_change_clause := get_clause(gc_rename_constraint , '"'||in_source_constraint_rec.constraint_name||'" TO "'||in_target_constraint_rec.rename_rec.object_name||'"');
+      l_revert_clause := get_clause(gc_rename_constraint, '"'||in_target_constraint_rec.rename_rec.object_name||'" TO "'||in_source_constraint_rec.constraint_name||'"');
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_table_name    => in_source_table_rec.table_name,
         in_owner         => in_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause
       );
     END IF;
 
@@ -4735,17 +5295,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- compares all supplemental logs
   FUNCTION comp_log_group(
-    in_source_table_rec      IN cort_exec_pkg.gt_table_rec,
-    in_source_log_group_rec  IN cort_exec_pkg.gt_log_group_rec,
-    in_target_log_group_rec  IN cort_exec_pkg.gt_log_group_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec     IN cort_exec_pkg.gt_table_rec,
+    in_source_log_group_rec IN cort_exec_pkg.gt_log_group_rec,
+    in_target_log_group_rec IN cort_exec_pkg.gt_log_group_rec,
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
   BEGIN
     l_result := gc_result_nochange;
     IF comp_value(in_source_log_group_rec.log_group_type, in_target_log_group_rec.log_group_type) = 1 OR
@@ -4760,15 +5319,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
        comp_value(in_source_log_group_rec.log_group_name, in_target_log_group_rec.rename_rec.object_name) = 1
     THEN
       l_result := gc_result_alter;
-      l_frwd_clause := get_clause(gc_rename_constraint , '"'||in_source_log_group_rec.log_group_name||'" TO "'||in_target_log_group_rec.rename_rec.object_name||'"');
-      l_rlbk_clause := get_clause(gc_rename_constraint, '"'||in_target_log_group_rec.rename_rec.object_name||'" TO "'||in_source_log_group_rec.log_group_name||'"');
+      l_change_clause := get_clause(gc_rename_constraint , '"'||in_source_log_group_rec.log_group_name||'" TO "'||in_target_log_group_rec.rename_rec.object_name||'"');
+      l_revert_clause := get_clause(gc_rename_constraint, '"'||in_target_log_group_rec.rename_rec.object_name||'" TO "'||in_source_log_group_rec.log_group_name||'"');
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_table_name    => in_source_table_rec.table_name,
         in_owner         => in_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause
       );
     END IF;
   END comp_log_group;
@@ -4796,11 +5354,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- returns array of FK constraints referencing on giving PK/UK constraint
   PROCEDURE drop_references(
-    in_table_rec             IN cort_exec_pkg.gt_table_rec,
-    in_pk_constraint_rec     IN cort_exec_pkg.gt_constraint_rec,
-    out_ref_constraint_arr   OUT NOCOPY cort_exec_pkg.gt_constraint_arr,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_table_rec           IN cort_exec_pkg.gt_table_rec,
+    in_pk_constraint_rec   IN cort_exec_pkg.gt_constraint_rec,
+    out_ref_constraint_arr OUT NOCOPY cort_exec_pkg.gt_constraint_arr,
+    io_change_arr          IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
   BEGIN
@@ -4811,10 +5368,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END LOOP;
     FOR i IN 1..out_ref_constraint_arr.COUNT LOOP
       drop_constraint(
-        in_constraint_rec      => out_ref_constraint_arr(i),
-        in_index_rec           => NULL,
-        io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+        in_constraint_rec => out_ref_constraint_arr(i),
+        in_index_rec      => NULL,
+        io_change_arr     => io_change_arr
       );
     END LOOP;
   END drop_references;
@@ -4823,8 +5379,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_ref_contraint_arr     IN OUT NOCOPY cort_exec_pkg.gt_constraint_arr,
     in_old_pk_constraint_rec IN cort_exec_pkg.gt_constraint_rec,
     in_new_pk_constraint_rec IN cort_exec_pkg.gt_constraint_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr            IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
     l_comp_result             PLS_INTEGER;
@@ -4883,26 +5438,26 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
 
     FOR i IN 1..io_ref_contraint_arr.COUNT LOOP
-      IF NOT cort_exec_pkg.g_params.validate.get_bool_value THEN
-        io_ref_contraint_arr(i).validated := 'NOT VALIDATED';
-        io_ref_contraint_arr(i).rename_rec.current_name := io_ref_contraint_arr(i).rename_rec.object_name;
-      END IF;
+      CASE cort_exec_pkg.g_params.references.get_value 
+        WHEN 'VALIDATE' THEN io_ref_contraint_arr(i).validated := 'VALIDATED';
+        WHEN 'NOVALIDATE' THEN io_ref_contraint_arr(i).validated := 'NOT VALIDATED';
+        ELSE NULL;
+      END CASE;
+      io_ref_contraint_arr(i).rename_rec.current_name := io_ref_contraint_arr(i).rename_rec.object_name;
 
       add_constraint(
-        in_constraint_rec      => io_ref_contraint_arr(i),
-        in_index_rec           => NULL,
-        io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+        in_constraint_rec => io_ref_contraint_arr(i),
+        in_index_rec      => NULL,
+        io_change_arr     => io_change_arr
       );
     END LOOP;
   END restore_references;
 
   -- compare all constraints
   FUNCTION comp_constraints(
-    io_source_table_rec      IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    io_target_table_rec      IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_source_table_rec IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    io_target_table_rec IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
@@ -4942,6 +5497,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_hash_index := l_source_hash_cons_arr.FIRST;
     WHILE l_hash_index IS NOT NULL LOOP
       -- if constraint exists on both tables
+      debug('Compare source index: hash = '||l_hash_index);
       IF NOT io_source_table_rec.constraint_arr(l_source_hash_cons_arr(l_hash_index)).drop_flag THEN
         IF l_target_hash_cons_arr.EXISTS(l_hash_index) THEN
           l_source_constraint_rec := io_source_table_rec.constraint_arr(l_source_hash_cons_arr(l_hash_index));
@@ -4953,14 +5509,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                l_target_constraint_rec.index_name IS NOT NULL
             THEN
               l_index_result := comp_index(
-                                  in_source_table_rec    => io_source_table_rec,
-                                  in_target_table_rec    => io_target_table_rec,
-                                  io_source_index_rec    => l_source_index_rec,
-                                  io_target_index_rec    => l_target_index_rec,
-                                  in_comp_phys_attr      => CASE WHEN io_source_table_rec.iot_type IS NULL THEN TRUE ELSE FALSE END,
-                                  io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                                  io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                                  in_source_table_rec => io_source_table_rec,
+                                  in_target_table_rec => io_target_table_rec,
+                                  io_source_index_rec => l_source_index_rec,
+                                  io_target_index_rec => l_target_index_rec,
+                                  in_comp_phys_attr   => CASE WHEN io_source_table_rec.iot_type IS NULL THEN TRUE ELSE FALSE END,
+                                  io_change_arr       => io_change_arr
                                 );
+              io_source_table_rec.index_arr(l_source_index_rec.indx) := l_source_index_rec; 
               debug('Compare constraints indexes: '||l_source_index_rec.index_name||' AND '||l_target_index_rec.index_name||' - '||l_index_result);
             ELSIF l_source_constraint_rec.index_name IS NULL AND
                   l_target_constraint_rec.index_name IS NULL THEN
@@ -4985,8 +5541,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                                in_target_table_rec      => io_target_table_rec,
                                in_source_constraint_rec => l_source_constraint_rec,
                                in_target_constraint_rec => l_target_constraint_rec,
-                               io_frwd_alter_stmt_arr   => io_frwd_alter_stmt_arr,
-                               io_rlbk_alter_stmt_arr   => io_rlbk_alter_stmt_arr
+                               io_change_arr            => io_change_arr
                              );
             debug('Compare constraint '||l_source_constraint_rec.constraint_name||' - '||l_cons_result);
           END IF;
@@ -5015,24 +5570,21 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                 in_table_rec           => io_source_table_rec,
                 in_pk_constraint_rec   => l_source_constraint_rec,
                 out_ref_constraint_arr => l_ref_constraint_arr,
-                io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                io_change_arr          => io_change_arr
               );
             END IF;
 
             drop_constraint(
-              in_constraint_rec      => l_source_constraint_rec,
-              in_index_rec           => l_source_index_rec,
-              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+              in_constraint_rec => l_source_constraint_rec,
+              in_index_rec      => l_source_index_rec,
+              io_change_arr     => io_change_arr
             );
             IF l_index_result >= gc_result_recreate THEN
               IF l_source_constraint_rec.index_name IS NOT NULL AND NOT l_dropped_index_arr.EXISTS(l_source_index_rec.index_name) THEN
                 drop_index(
-                  in_index_rec           => l_source_index_rec,
-                  in_table_name          => l_source_index_rec.table_name,
-                  io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                  io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                  in_index_rec  => l_source_index_rec,
+                  in_table_name => l_source_index_rec.table_name,
+                  io_change_arr => io_change_arr
                 );
                 l_dropped_index_arr(l_source_index_rec.index_name) := 1;
               END IF;
@@ -5041,10 +5593,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                 l_target_index_rec.table_owner := io_source_table_rec.owner;
                 l_target_index_rec.rename_rec.current_name := l_source_index_rec.constraint_name;
                 create_index(
-                  in_index_rec           => l_target_index_rec,
-                  in_table_name          => l_target_index_rec.table_name,
-                  io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                  io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                  in_index_rec  => l_target_index_rec,
+                  in_table_name => l_target_index_rec.table_name,
+                  io_change_arr => io_change_arr
                 );
                 l_dropped_index_arr.DELETE(l_source_index_rec.index_name);
               END IF;
@@ -5054,22 +5605,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             l_target_constraint_rec.rename_rec.current_name := l_target_constraint_rec.rename_rec.object_name;
             l_target_constraint_rec.table_name := io_source_table_rec.table_name;
             add_constraint(
-              in_constraint_rec      => l_target_constraint_rec,
-              in_index_rec           => l_target_index_rec,
-              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+              in_constraint_rec => l_target_constraint_rec,
+              in_index_rec      => l_target_index_rec,
+              io_change_arr     => io_change_arr
             );
             -- For PK/UK
             IF l_source_constraint_rec.constraint_type IN ('P','U') AND
-               l_source_constraint_rec.has_references AND
-               cort_exec_pkg.g_params.keep_objects.value_exists('REFERENCES')
+               l_source_constraint_rec.has_references 
             THEN
               restore_references(
-                io_ref_contraint_arr      => l_ref_constraint_arr,
-                in_old_pk_constraint_rec  => l_source_constraint_rec,
-                in_new_pk_constraint_rec  => l_target_constraint_rec,
-                io_frwd_alter_stmt_arr    => io_frwd_alter_stmt_arr,
-                io_rlbk_alter_stmt_arr    => io_rlbk_alter_stmt_arr
+                io_ref_contraint_arr     => l_ref_constraint_arr,
+                in_old_pk_constraint_rec => l_source_constraint_rec,
+                in_new_pk_constraint_rec => l_target_constraint_rec,
+                io_change_arr            => io_change_arr
               );
             END IF;
             l_result := gc_result_alter;
@@ -5092,28 +5640,25 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
               in_table_rec           => io_source_table_rec,
               in_pk_constraint_rec   => l_source_constraint_rec,
               out_ref_constraint_arr => l_ref_constraint_arr,
-              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+              io_change_arr          => io_change_arr
             );
           END IF;
           debug('Drop constraint '||l_source_constraint_rec.constraint_name);
           l_source_constraint_rec.rename_rec.current_name := l_source_constraint_rec.constraint_name;
           -- drop constraint
           drop_constraint(
-            in_constraint_rec      => l_source_constraint_rec,
-            in_index_rec           => l_source_index_rec,
-            io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-            io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+            in_constraint_rec => l_source_constraint_rec,
+            in_index_rec      => l_source_index_rec,
+            io_change_arr     => io_change_arr
           );
 
           IF l_source_constraint_rec.index_name IS NOT NULL AND NOT l_dropped_index_arr.EXISTS(l_source_index_rec.index_name) THEN
             debug('Drop index '||l_source_index_rec.index_name);
             -- drop index
             drop_index(
-              in_index_rec           => l_source_index_rec,
-              in_table_name          => l_source_index_rec.table_name,
-              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+              in_index_rec  => l_source_index_rec,
+              in_table_name => l_source_index_rec.table_name,
+              io_change_arr => io_change_arr
             );
             l_dropped_index_arr(l_source_index_rec.index_name) := 1;
           END IF;
@@ -5127,6 +5672,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     -- run loop through target constraints
     l_hash_index := l_target_hash_cons_arr.FIRST;
     WHILE l_hash_index IS NOT NULL LOOP
+      debug('Compare target index: hash = '||l_hash_index);
       -- if constraint doesn't exist on source tables
       IF NOT l_source_hash_cons_arr.EXISTS(l_hash_index) THEN
         l_target_constraint_rec := io_target_table_rec.constraint_arr(l_target_hash_cons_arr(l_hash_index));
@@ -5138,37 +5684,38 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         IF l_target_index_rec.index_name IS NOT NULL THEN
           IF io_source_table_rec.index_indx_arr.EXISTS('"'||l_target_index_rec.owner||'"."'||l_target_index_rec.rename_rec.object_name||'"') THEN
             l_indx := io_source_table_rec.index_indx_arr('"'||l_target_index_rec.owner||'"."'||l_target_index_rec.rename_rec.object_name||'"');
+            -- check if index was renamed
+            IF io_source_table_rec.index_arr(l_indx).rename_rec.object_name <> io_source_table_rec.index_arr(l_indx).index_name THEN
+              l_indx := NULL;
+            END IF;   
           ELSE
             l_indx := NULL;
           END IF;
           IF l_indx IS NOT NULL THEN
             l_source_index_rec := io_source_table_rec.index_arr(l_indx);
             l_index_result := comp_index(
-                                in_source_table_rec    => io_source_table_rec,
-                                in_target_table_rec    => io_target_table_rec,
-                                io_source_index_rec    => l_source_index_rec,
-                                io_target_index_rec    => l_target_index_rec,
-                                in_comp_phys_attr      => CASE WHEN io_source_table_rec.iot_type IS NULL THEN TRUE ELSE FALSE END,
-                                io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                                io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                                in_source_table_rec => io_source_table_rec,
+                                in_target_table_rec => io_target_table_rec,
+                                io_source_index_rec => l_source_index_rec,
+                                io_target_index_rec => l_target_index_rec,
+                                in_comp_phys_attr   => CASE WHEN io_source_table_rec.iot_type IS NULL THEN TRUE ELSE FALSE END,
+                                io_change_arr       => io_change_arr
                               );
             IF l_index_result = gc_result_recreate THEN
               IF NOT l_dropped_index_arr.EXISTS(l_source_index_rec.index_name) THEN
                 drop_index(
-                  in_index_rec           => l_source_index_rec,
-                  in_table_name          => l_source_index_rec.table_name,
-                  io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                  io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                  in_index_rec  => l_source_index_rec,
+                  in_table_name => l_source_index_rec.table_name,
+                  io_change_arr => io_change_arr
                 );
                 l_dropped_index_arr(l_source_index_rec.index_name) := 1;
               END IF;
               l_target_index_rec.table_name := io_source_table_rec.table_name;
               l_target_index_rec.table_owner := io_source_table_rec.owner;
               create_index(
-                in_index_rec           => l_target_index_rec,
-                in_table_name          => l_target_index_rec.table_name,
-                io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                in_index_rec  => l_target_index_rec,
+                in_table_name => l_target_index_rec.table_name,
+                io_change_arr => io_change_arr
               );
               l_dropped_index_arr.DELETE(l_source_index_rec.index_name);
             END IF;
@@ -5177,10 +5724,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             l_target_index_rec.table_name := io_source_table_rec.table_name;
             l_target_index_rec.table_owner := io_source_table_rec.owner;
             create_index(
-              in_index_rec           => l_target_index_rec,
-              in_table_name          => l_target_index_rec.table_name,
-              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+              in_index_rec  => l_target_index_rec,
+              in_table_name => l_target_index_rec.table_name,
+              io_change_arr => io_change_arr
             );
             l_result := gc_result_alter;
           END IF;
@@ -5188,10 +5734,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_target_constraint_rec.table_name := io_source_table_rec.table_name;
         -- add constraint
         add_constraint(
-          in_constraint_rec      => l_target_constraint_rec,
-          in_index_rec           => l_target_index_rec,
-          io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+          in_constraint_rec => l_target_constraint_rec,
+          in_index_rec      => l_target_index_rec,
+          io_change_arr     => io_change_arr
         );
         l_result := gc_result_alter;
       END IF;
@@ -5204,10 +5749,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- copy all references from source table to the target one
   PROCEDURE copy_references(
-    in_source_table_rec      IN cort_exec_pkg.gt_table_rec,
-    io_target_table_rec      IN OUT cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    io_target_table_rec IN OUT cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
     l_result                     PLS_INTEGER;
@@ -5256,10 +5800,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             l_source_ref_constraint_rec := in_source_table_rec.ref_constraint_arr(i);
             l_source_ref_constraint_rec.validated := 'NOT VALIDATED';
             drop_constraint(
-              in_constraint_rec      => l_source_ref_constraint_rec,
-              in_index_rec           => NULL,
-              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+              in_constraint_rec => l_source_ref_constraint_rec,
+              in_index_rec      => NULL,
+              io_change_arr     => io_change_arr
             );
           END IF;
         END LOOP;
@@ -5270,18 +5813,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           io_target_table_rec.ref_constraint_arr(i).r_owner := io_target_table_rec.owner;
           io_target_table_rec.ref_constraint_arr(i).r_table_name := io_target_table_rec.rename_rec.current_name;
           io_target_table_rec.ref_constraint_arr(i).r_constraint_name := l_target_constraint_rec.constraint_name;
-          IF NOT cort_exec_pkg.g_params.validate.get_bool_value THEN
-            io_target_table_rec.ref_constraint_arr(i).validated := 'NOT VALIDATED';
-          END IF;
+          io_target_table_rec.ref_constraint_arr(i).validated := 'NOT VALIDATED';
           io_target_table_rec.ref_constraint_arr(i).rename_rec.current_name := io_target_table_rec.ref_constraint_arr(i).rename_rec.temp_name;
         END LOOP;
 
         restore_references(
-          io_ref_contraint_arr      => io_target_table_rec.ref_constraint_arr,
-          in_old_pk_constraint_rec  => l_source_constraint_rec,
-          in_new_pk_constraint_rec  => l_target_constraint_rec,
-          io_frwd_alter_stmt_arr    => io_frwd_alter_stmt_arr,
-          io_rlbk_alter_stmt_arr    => io_rlbk_alter_stmt_arr
+          io_ref_contraint_arr     => io_target_table_rec.ref_constraint_arr,
+          in_old_pk_constraint_rec => l_source_constraint_rec,
+          in_new_pk_constraint_rec => l_target_constraint_rec,
+          io_change_arr            => io_change_arr
         );
 
       ELSE
@@ -5298,23 +5838,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- returns DDL to drop renamed ref and 2 step rollback: create without validation + validation
   PROCEDURE drop_references(
-    in_source_table_rec      IN cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
     l_constraint_rec         cort_exec_pkg.gt_constraint_rec;
   BEGIN
     FOR i IN 1..in_source_table_rec.ref_constraint_arr.COUNT LOOP
       l_constraint_rec := in_source_table_rec.ref_constraint_arr(i);
       l_constraint_rec.validated := 'NOT VALIDATED';
       drop_constraint(
-        in_constraint_rec      => l_constraint_rec,
-        in_index_rec           => NULL,
-        io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+        in_constraint_rec => l_constraint_rec,
+        in_index_rec      => NULL,
+        io_change_arr     => io_change_arr
       );
     END LOOP;
   END drop_references;
@@ -5327,483 +5863,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     RETURN in_log_group_rec.log_group_type||':'||convert_arr_to_str(in_log_group_rec.column_arr)||':'||convert_arr_to_str(in_log_group_rec.column_log_arr);
   END get_log_group_hash;
 
-  -- compare lob rec
-  FUNCTION comp_lob_params(
-    in_source_lob_rec    IN cort_exec_pkg.gt_lob_rec,
-    in_target_lob_rec    IN cort_exec_pkg.gt_lob_rec,
-    out_frwd_lob_parames OUT NOCOPY CLOB,
-    out_rlbk_lob_parames OUT NOCOPY CLOB
-  )
-  RETURN NUMBER
-  AS
-    l_result                 PLS_INTEGER;
-    l_comp_result            PLS_INTEGER;
-    l_frwd_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_rlbk_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_storage_frwd_clause    CLOB;
-    l_storage_rlbk_clause    CLOB;
-  BEGIN
-    l_result := gc_result_nochange;
-
-    -- move or modify
-    IF comp_value(in_source_lob_rec.pctversion, in_target_lob_rec.pctversion) = 1 AND
-       in_target_lob_rec.securefile = 'NO'
-    THEN
-      l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_pctversion) := get_clause(gc_pctversion, in_target_lob_rec.pctversion);
-      l_rlbk_clause_indx_arr(gc_pctversion) := get_clause(gc_pctversion, in_source_lob_rec.pctversion);
-    END IF;
-
-    IF comp_value(in_source_lob_rec.freepools, in_target_lob_rec.freepools) = 1 THEN
-      l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_freepools) := get_clause(gc_freepools, in_target_lob_rec.freepools);
-      l_rlbk_clause_indx_arr(gc_freepools) := get_clause(gc_freepools, in_source_lob_rec.freepools);
-    END IF;
-    IF in_target_lob_rec.securefile = 'YES' AND
-       (comp_value(in_source_lob_rec.retention, in_target_lob_rec.retention) = 1 OR
-       (in_target_lob_rec.retention = 'MIN' AND comp_value(in_source_lob_rec.min_retention, in_target_lob_rec.min_retention) = 1))
-    THEN
-      debug('in_source_lob_rec.securefile = '||in_source_lob_rec.securefile);
-      debug('in_target_lob_rec.securefile = '||in_target_lob_rec.securefile);
-      debug('in_source_lob_rec.retention = '||in_source_lob_rec.retention);
-      debug('in_target_lob_rec.retention = '||in_target_lob_rec.retention);
-      debug('in_source_lob_rec.minretention = '||in_source_lob_rec.min_retention);
-      debug('in_target_lob_rec.minretention = '||in_target_lob_rec.min_retention);
-      l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_retention) := get_clause(gc_retention, in_target_lob_rec.retention) || case when in_target_lob_rec.retention = 'MIN' then ' '||to_char(in_target_lob_rec.min_retention) end;
-      l_rlbk_clause_indx_arr(gc_retention) := get_clause(gc_retention, in_source_lob_rec.retention)|| case when in_source_lob_rec.retention = 'MIN' then ' '||to_char(in_source_lob_rec.min_retention) end;
-    END IF;
-
-    IF comp_value(in_source_lob_rec.deduplication, in_target_lob_rec.deduplication) = 1 THEN
-      l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_deduplication) := get_clause(gc_deduplication, in_target_lob_rec.deduplication);
-      l_rlbk_clause_indx_arr(gc_deduplication) := get_clause(gc_deduplication, in_source_lob_rec.deduplication);
-    END IF;
-
-    IF comp_value(in_source_lob_rec.compression, in_target_lob_rec.compression) = 1 THEN
-      l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_lob_compression) := get_clause(gc_lob_compression, in_target_lob_rec.compression);
-      l_rlbk_clause_indx_arr(gc_lob_compression) := get_clause(gc_lob_compression, in_source_lob_rec.compression);
-    END IF;
-
-    IF comp_value(in_source_lob_rec.encrypt, in_target_lob_rec.encrypt) = 1 THEN
-      l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_encrypt) := get_clause(gc_encrypt, in_target_lob_rec.encrypt);
-      l_rlbk_clause_indx_arr(gc_encrypt) := get_clause(gc_encrypt, in_source_lob_rec.encrypt);
-    END IF;
-
-    IF comp_value(in_source_lob_rec.cache, in_target_lob_rec.cache) = 1 OR
-       comp_value(in_source_lob_rec.logging, in_target_lob_rec.logging) = 1
-    THEN
-      l_result := gc_result_alter;
-    debug('in_source_lob_rec.cache = '||in_source_lob_rec.cache);
-    debug('in_target_lob_rec.cache = '||in_target_lob_rec.cache);
-    debug('in_source_lob_rec.logging = '||in_source_lob_rec.logging);
-    debug('in_target_lob_rec.logging = '||in_target_lob_rec.logging);
-      l_frwd_clause_indx_arr(gc_cache) := get_clause(gc_cache, in_target_lob_rec.cache);
-      l_rlbk_clause_indx_arr(gc_cache) := get_clause(gc_cache, in_source_lob_rec.cache);
-      l_frwd_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_target_lob_rec.logging);
-      l_rlbk_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_source_lob_rec.logging);
-    END IF;
-
-    l_comp_result := comp_storage(
-                       in_source_storage_rec => in_source_lob_rec.storage,
-                       in_target_storage_rec => in_target_lob_rec.storage,
-                       out_frwd_clause       => l_storage_frwd_clause,
-                       out_rlbk_clause       => l_storage_rlbk_clause
-                     );
-
-    CASE l_comp_result
-    WHEN gc_result_recreate THEN
-      RETURN gc_result_recreate;
-    WHEN gc_result_alter THEN
-      l_result := gc_result_alter;
-      debug('l_storage_frwd_clause = '||l_storage_frwd_clause);
-      l_frwd_clause_indx_arr(gc_storage) := get_clause(gc_storage, l_storage_frwd_clause, '(', ')');
-      l_rlbk_clause_indx_arr(gc_storage) := get_clause(gc_storage, l_storage_rlbk_clause, '(', ')');
-    ELSE
-      NULL;
-    END CASE;
-
-    -- move only
-    IF comp_value(in_source_lob_rec.chunk, in_target_lob_rec.chunk) = 1 THEN
-      l_result := gc_result_alter_move;
-      l_frwd_clause_indx_arr(gc_chunk) := get_clause(gc_chunk, in_target_lob_rec.chunk);
-      l_rlbk_clause_indx_arr(gc_chunk) := get_clause(gc_chunk, in_source_lob_rec.chunk);
-    END IF;
-
-    IF comp_value(in_source_lob_rec.in_row, in_target_lob_rec.in_row) = 1 THEN
-      l_result := gc_result_alter_move;
-      l_frwd_clause_indx_arr(gc_in_row) := get_clause(gc_in_row, in_target_lob_rec.in_row);
-      l_rlbk_clause_indx_arr(gc_in_row) := get_clause(gc_in_row, in_source_lob_rec.in_row);
-    END IF;
-
-    IF comp_value(in_source_lob_rec.tablespace_name, in_target_lob_rec.tablespace_name) = 1 THEN
-      l_result := gc_result_alter_move;
-      l_frwd_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_target_lob_rec.tablespace_name, '"', '"');
-      l_rlbk_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_source_lob_rec.tablespace_name, '"', '"');
-    END IF;
-
-    IF l_result = gc_result_alter AND cort_exec_pkg.g_params.change.get_value = 'MOVE' THEN
-      l_result := gc_result_alter_move;
-    END IF;
-
-    IF l_result = gc_result_alter_move THEN
-      out_frwd_lob_parames := get_clause_by_name(l_frwd_clause_indx_arr, gc_tablespace)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_chunk)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_in_row)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_pctversion)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_freepools)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_retention)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_deduplication)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_lob_compression)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_encrypt)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_cache)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_logging)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_storage);
-
-      out_rlbk_lob_parames := get_clause_by_name(l_rlbk_clause_indx_arr, gc_tablespace)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_chunk)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_in_row)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_pctversion)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_freepools)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_retention)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_deduplication)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_lob_compression)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_encrypt)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_cache)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_logging)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_storage);
-    ELSIF l_result = gc_result_alter THEN
-      out_frwd_lob_parames := get_clause_by_name(l_frwd_clause_indx_arr, gc_pctversion)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_freepools)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_retention)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_deduplication)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_lob_compression)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_encrypt)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_cache)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_logging)||
-                              get_clause_by_name(l_frwd_clause_indx_arr, gc_storage);
-      out_rlbk_lob_parames := get_clause_by_name(l_rlbk_clause_indx_arr, gc_pctversion)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_freepools)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_retention)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_deduplication)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_lob_compression)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_encrypt)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_cache)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_logging)||
-                              get_clause_by_name(l_rlbk_clause_indx_arr, gc_storage);
-    END IF;
-
-    RETURN l_result;
-  END comp_lob_params;
-
-  -- compare lob rec
-  FUNCTION comp_lob(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_source_lob_rec      IN cort_exec_pkg.gt_lob_rec,
-    in_target_lob_rec      IN cort_exec_pkg.gt_lob_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  RETURN NUMBER
-  AS
-    l_result                 PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
-    l_frwd_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_rlbk_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_frwd_lob_parames       CLOB;
-    l_rlbk_lob_parames       CLOB;
-    l_column_rec             cort_exec_pkg.gt_column_rec;
-    l_column_name            arrays.gt_name;
-  BEGIN
-    l_result := gc_result_nochange;
-
-    l_column_rec := in_source_table_rec.column_arr(in_source_lob_rec.column_indx);
-    l_column_name := NVL(l_column_rec.new_column_name,l_column_rec.column_name);
-
-    l_result := comp_lob_params(
-                  in_source_lob_rec    => in_source_lob_rec,
-                  in_target_lob_rec    => in_target_lob_rec,
-                  out_frwd_lob_parames => l_frwd_lob_parames,
-                  out_rlbk_lob_parames => l_rlbk_lob_parames
-                );
-    IF l_result > gc_result_nochange AND
-       l_frwd_lob_parames IS NOT NULL AND
-       l_rlbk_lob_parames IS NOT NULL
-    THEN
-      l_frwd_clause_indx_arr(gc_lob_params) := get_clause(gc_lob_params, l_frwd_lob_parames, '(', ')');
-      l_rlbk_clause_indx_arr(gc_lob_params) := get_clause(gc_lob_params, l_rlbk_lob_parames, '(', ')');
-    END IF;
-
-    -- move only
-    IF comp_value(in_source_lob_rec.securefile, in_target_lob_rec.securefile) = 1 THEN
-      l_result := gc_result_alter_move;
-    END IF;
-
-    IF l_result = gc_result_alter_move THEN
-
-      l_frwd_clause := gc_move||
-                       -- use new_column_name in case column was renamed
-                       get_clause(gc_lob_item, l_column_name, '(', ')')||
-                       get_clause(gc_store_as, get_clause(gc_securefile, in_target_lob_rec.securefile))||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_lob_params)||
-                       get_clause(gc_parallel, cort_exec_pkg.g_params.parallel.get_value);
-
-      l_rlbk_clause := gc_move||
-                       -- use new_column_name in case column was renamed
-                       get_clause(gc_lob_item, l_column_name, '(', ')')||
-                       get_clause(gc_store_as, get_clause(gc_securefile, in_source_lob_rec.securefile))||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_lob_params)||
-                       get_clause(gc_parallel, cort_exec_pkg.g_params.parallel.get_value);
-
-      add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-        in_table_name    => in_source_table_rec.table_name,
-        in_owner         => in_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
-      );
-    ELSIF l_result = gc_result_alter THEN
-      -- use new_column_name in case column was renamed
-      l_frwd_clause := get_clause(gc_modify_lob_item, l_column_name, '(', ')')||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_lob_params);
-      l_rlbk_clause := get_clause(gc_modify_lob_item, l_column_name, '(', ')')||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_lob_params);
-
-      add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-        in_table_name    => in_source_table_rec.table_name,
-        in_owner         => in_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
-      );
-    END IF;
-
-    RETURN l_result;
-  END comp_lob;
-
-  -- compare lob columns (CLOB/BLOB/BFILE) - lobs.
-  -- Why not to include into compare_columns ????
-  FUNCTION comp_lobs(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  RETURN PLS_INTEGER
-  AS
-    l_result       PLS_INTEGER;
-    l_comp_result  PLS_INTEGER;
-    l_target_indx  PLS_INTEGER;
-    l_source_indx  PLS_INTEGER;
-    l_column_name  VARCHAR2(4000);
-  BEGIN
-    l_result := gc_result_nochange;
-    l_column_name := in_target_table_rec.lob_indx_arr.FIRST;
-    WHILE l_column_name IS NOT NULL LOOP
-      IF in_source_table_rec.lob_indx_arr.EXISTS(l_column_name)
-      THEN
-        l_target_indx := in_target_table_rec.lob_indx_arr(l_column_name);
-        l_source_indx := in_source_table_rec.lob_indx_arr(l_column_name);
-
-        -- existing lob columns
-        l_comp_result := comp_lob(
-                           in_source_table_rec    => in_source_table_rec,
-                           in_target_table_rec    => in_target_table_rec,
-                           in_source_lob_rec      => in_source_table_rec.lob_arr(l_source_indx),
-                           in_target_lob_rec      => in_target_table_rec.lob_arr(l_target_indx),
-                           io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                           io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
-                         );
-        debug('compare lob '||in_source_table_rec.lob_arr(l_source_indx).column_name||' - '||l_comp_result);
-        l_result := GREATEST(l_result, l_comp_result);
-      END IF;
-
-      IF l_result = gc_result_recreate THEN
-        RETURN l_result;
-      END IF;
-
-      l_column_name := in_target_table_rec.lob_indx_arr.NEXT(l_column_name);
-    END LOOP;
-    RETURN l_result;
-  END comp_lobs;
-
-  -- compare xml rec
-  FUNCTION comp_xml(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_source_xml_rec      IN cort_exec_pkg.gt_xml_col_rec,
-    in_target_xml_rec      IN cort_exec_pkg.gt_xml_col_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  RETURN NUMBER
-  AS
-    l_result                 PLS_INTEGER;
-    l_comp_result            PLS_INTEGER;
-  BEGIN
-    l_result := gc_result_nochange;
-
-    IF comp_value(in_source_xml_rec.xmlschema, in_target_xml_rec.xmlschema) = 1 OR
-       comp_value(in_source_xml_rec.schema_owner, in_target_xml_rec.schema_owner) = 1 OR
-       comp_value(in_source_xml_rec.element_name, in_target_xml_rec.element_name) = 1 OR
-       comp_value(in_source_xml_rec.storage_type, in_target_xml_rec.storage_type) = 1 OR
-       comp_value(in_source_xml_rec.anyschema, in_target_xml_rec.anyschema) = 1 OR
-       comp_value(in_source_xml_rec.nonschema, in_target_xml_rec.nonschema) = 1
-    THEN
-      RETURN gc_result_recreate;
-    END IF;
-
-    IF in_source_xml_rec.lob_column_indx IS NOT NULL AND
-       in_target_xml_rec.lob_column_indx IS NOT NULL
-    THEN
-      l_result := comp_lob(
-                    in_source_table_rec    => in_source_table_rec,
-                    in_target_table_rec    => in_target_table_rec,
-                    in_source_lob_rec      => in_source_table_rec.lob_arr(in_source_xml_rec.lob_column_indx),
-                    in_target_lob_rec      => in_target_table_rec.lob_arr(in_target_xml_rec.lob_column_indx),
-                    io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                    io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
-                  );
-      debug('compare xml lob '||in_source_xml_rec.column_name||' - '||l_result);
-    END IF;
-
-    RETURN l_result;
-  END comp_xml;
-
-  -- compare xml columns
-  FUNCTION comp_xml_columns(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  RETURN PLS_INTEGER
-  AS
-    l_result       PLS_INTEGER;
-    l_comp_result  PLS_INTEGER;
-    l_indx         PLS_INTEGER;
-  BEGIN
-    l_result := gc_result_nochange;
-    l_indx := in_target_table_rec.xml_col_arr.FIRST;
-    WHILE l_indx IS NOT NULL LOOP
-      IF in_source_table_rec.xml_col_arr.EXISTS(l_indx) THEN
-        l_comp_result := comp_xml(
-                           in_source_table_rec    => in_source_table_rec,
-                           in_target_table_rec    => in_target_table_rec,
-                           in_source_xml_rec      => in_source_table_rec.xml_col_arr(l_indx),
-                           in_target_xml_rec      => in_target_table_rec.xml_col_arr(l_indx),
-                           io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                           io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
-                         );
-        debug('compare xml '||in_source_table_rec.xml_col_arr(l_indx).column_name||' - '||l_comp_result);
-        l_result := GREATEST(l_result, l_comp_result);
-
-        IF l_result = gc_result_recreate THEN
-          RETURN l_result;
-        END IF;
-      END IF;
-
-      l_indx := in_target_table_rec.xml_col_arr.NEXT(l_indx);
-    END LOOP;
-
-    RETURN l_result;
-  END comp_xml_columns;
-
-  -- compare varray rec
-  FUNCTION comp_varray(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_source_varray_rec   IN cort_exec_pkg.gt_varray_rec,
-    in_target_varray_rec   IN cort_exec_pkg.gt_varray_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  RETURN PLS_INTEGER
-  AS
-    l_result                 PLS_INTEGER;
-  BEGIN
-    l_result := gc_result_nochange;
-
-    IF comp_value(in_source_varray_rec.type_owner, in_target_varray_rec.type_owner) = 1 OR
-       comp_value(in_source_varray_rec.type_name, in_target_varray_rec.type_name) = 1 OR
-       (in_source_varray_rec.lob_name IS NULL AND in_target_varray_rec.lob_name IS NOT NULL) OR
-       (in_source_varray_rec.lob_name IS NOT NULL AND in_target_varray_rec.lob_name IS NULL) OR
-       comp_value(in_source_varray_rec.storage_spec, in_target_varray_rec.storage_spec) = 1 OR
-       comp_value(in_source_varray_rec.return_type, in_target_varray_rec.return_type) = 1 OR
-       comp_value(in_source_varray_rec.element_substitutable, in_target_varray_rec.element_substitutable) = 1
-    THEN
-      RETURN gc_result_recreate;
-    END IF;
-
-    IF in_source_varray_rec.lob_column_indx IS NOT NULL AND
-       in_target_varray_rec.lob_column_indx IS NOT NULL
-    THEN
-      l_result := comp_lob(
-                    in_source_table_rec    => in_source_table_rec,
-                    in_target_table_rec    => in_target_table_rec,
-                    in_source_lob_rec      => in_source_table_rec.lob_arr(in_source_varray_rec.lob_column_indx),
-                    in_target_lob_rec      => in_target_table_rec.lob_arr(in_target_varray_rec.lob_column_indx),
-                    io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                    io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
-                  );
-      debug('compare varray lob '||in_source_varray_rec.column_name||' - '||l_result);
-    END IF;
-
-    RETURN l_result;
-  END comp_varray;
-
-  -- compare varray columns
-  FUNCTION comp_varray_columns(
-    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec    IN cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  RETURN PLS_INTEGER
-  AS
-    l_result       PLS_INTEGER;
-    l_comp_result  PLS_INTEGER;
-    l_column_indx  PLS_INTEGER;
-    l_indx         PLS_INTEGER;
-  BEGIN
-    l_result := gc_result_nochange;
-    l_indx := in_target_table_rec.varray_arr.FIRST;
-    WHILE l_indx IS NOT NULL LOOP
-      IF in_source_table_rec.varray_arr.EXISTS(l_indx) THEN
-        l_comp_result := comp_varray(
-                           in_source_table_rec    => in_source_table_rec,
-                           in_target_table_rec    => in_target_table_rec,
-                           in_source_varray_rec   => in_source_table_rec.varray_arr(l_indx),
-                           in_target_varray_rec   => in_target_table_rec.varray_arr(l_indx),
-                           io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                           io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
-                         );
-        debug('compare varray '||in_source_table_rec.varray_arr(l_indx).column_name||' - '||l_comp_result);
-        l_result := GREATEST(l_result, l_comp_result);
-
-        IF l_result = gc_result_recreate THEN
-          RETURN l_result;
-        END IF;
-      END IF;
-
-      l_indx := in_target_table_rec.varray_arr.NEXT(l_indx);
-    END LOOP;
-
-    RETURN l_result;
-  END comp_varray_columns;
-
   -- compare all supplemental logs
   FUNCTION comp_log_groups(
-    io_source_table_rec      IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    io_target_table_rec      IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_source_table_rec IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    io_target_table_rec IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
@@ -5837,28 +5901,25 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           l_target_log_group_rec := io_target_table_rec.log_group_arr(l_target_hash_logs_arr(l_hash_index));
           -- compare log_groups
           l_log_result := comp_log_group(
-                            in_source_table_rec      => io_source_table_rec,
-                            in_source_log_group_rec  => l_source_log_group_rec,
-                            in_target_log_group_rec  => l_target_log_group_rec,
-                            io_frwd_alter_stmt_arr   => io_frwd_alter_stmt_arr,
-                            io_rlbk_alter_stmt_arr   => io_rlbk_alter_stmt_arr
+                            in_source_table_rec     => io_source_table_rec,
+                            in_source_log_group_rec => l_source_log_group_rec,
+                            in_target_log_group_rec => l_target_log_group_rec,
+                            io_change_arr           => io_change_arr
                           );
           IF l_log_result = gc_result_recreate THEN
             -- if log_group need to be recreated
             -- recreate log_group
             drop_log_group(
-              in_log_group_rec       => l_source_log_group_rec,
-              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+              in_log_group_rec => l_source_log_group_rec,
+              io_change_arr    => io_change_arr
             );
 
             l_target_log_group_rec.table_name := io_source_table_rec.table_name;
             l_target_log_group_rec.owner := io_source_table_rec.owner;
 
             add_log_group(
-              in_log_group_rec       => l_target_log_group_rec,
-              io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-              io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+              in_log_group_rec => l_target_log_group_rec,
+              io_change_arr    => io_change_arr
             );
             l_result := gc_result_alter;
           ELSE
@@ -5870,9 +5931,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
           -- drop log_group
           drop_log_group(
-            in_log_group_rec       => l_source_log_group_rec,
-            io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-            io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+            in_log_group_rec => l_source_log_group_rec,
+            io_change_arr    => io_change_arr
           );
 
           io_source_table_rec.log_group_arr(l_source_hash_logs_arr(l_hash_index)).drop_flag := TRUE;
@@ -5893,9 +5953,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_target_log_group_rec.owner := io_source_table_rec.owner;
         -- add log_group
         add_log_group(
-          in_log_group_rec       => l_target_log_group_rec,
-          io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+          in_log_group_rec => l_target_log_group_rec,
+          io_change_arr    => io_change_arr
         );
         l_result := gc_result_alter;
       END IF;
@@ -5904,6 +5963,91 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
     RETURN l_result;
   END comp_log_groups;
+  
+  -- compare lob partitions
+  FUNCTION comp_lob_partition(
+    in_source_table_rec     IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec     IN cort_exec_pkg.gt_table_rec,
+    in_source_partition_rec IN cort_exec_pkg.gt_partition_rec,
+    in_target_partition_rec IN cort_exec_pkg.gt_partition_rec,
+    out_change_clause       OUT CLOB,
+    out_revert_clause       OUT CLOB
+  )
+  RETURN PLS_INTEGER
+  AS
+    l_result       PLS_INTEGER;
+    l_comp_result  PLS_INTEGER;
+    l_column_indx  PLS_INTEGER;
+    l_change_clause  CLOB;
+    l_revert_clause  CLOB;
+    l_column_rec             cort_exec_pkg.gt_column_rec;
+    l_column_name            arrays.gt_name;
+  BEGIN
+    l_result := gc_result_nochange;
+    l_column_indx := in_target_partition_rec.lob_arr.FIRST;
+    WHILE l_column_indx IS NOT NULL LOOP
+      IF in_source_partition_rec.lob_arr.EXISTS(l_column_indx) THEN
+        -- existing lob columns
+          IF in_source_partition_rec.partition_type = 'HASH' THEN
+            IF comp_value(in_source_partition_rec.lob_arr(l_column_indx).tablespace_name, in_target_partition_rec.lob_arr(l_column_indx).tablespace_name) = 1 THEN
+              l_result := gc_result_alter_move;
+              l_column_rec := in_source_table_rec.column_arr(l_column_indx);
+              l_column_name := NVL(l_column_rec.new_column_name,l_column_rec.column_name);
+              l_change_clause := -- use new_column_name in case column was renamed
+                                 get_clause(gc_lob_item, l_column_name, '("', '")')||
+                                 get_clause(gc_store_as, ' ')||
+                                 get_clause(gc_tablespace, in_target_partition_rec.lob_arr(l_column_indx).tablespace_name)||
+                                 get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_value);
+
+              l_revert_clause := -- use new_column_name in case column was renamed
+                                 get_clause(gc_lob_item, l_column_name, '("', '")')||
+                                 get_clause(gc_store_as, ' ')||
+                                 get_clause(gc_tablespace, in_source_partition_rec.lob_arr(l_column_indx).tablespace_name)||
+                                 get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_value);
+            ELSE
+              l_comp_result := comp_lob(
+                                 in_source_table_rec => in_source_table_rec,
+                                 in_target_table_rec => in_target_table_rec,
+                                 in_source_lob_rec   => in_source_partition_rec.lob_arr(l_column_indx),
+                                 in_target_lob_rec   => in_target_partition_rec.lob_arr(l_column_indx),
+                                 out_change_clause   => l_change_clause,
+                                 out_revert_clause   => l_revert_clause
+                               );
+              IF l_comp_result > gc_result_alter THEN
+                debug('Partition lob compare '||in_source_partition_rec.lob_arr(l_column_indx).column_name||' result - '||l_comp_result||'. Will be changed to 5 because TABLESPACE is the only valid option for a HASH partition or subpartition.');
+                RETURN gc_result_recreate;          
+              END IF;
+            END IF;
+          ELSE 
+            l_comp_result := comp_lob(
+                               in_source_table_rec => in_source_table_rec,
+                               in_target_table_rec => in_target_table_rec,
+                               in_source_lob_rec   => in_source_partition_rec.lob_arr(l_column_indx),
+                               in_target_lob_rec   => in_target_partition_rec.lob_arr(l_column_indx),
+                               out_change_clause   => l_change_clause,
+                               out_revert_clause   => l_revert_clause
+                             );
+          END IF;    
+
+        l_result := GREATEST(l_result, l_comp_result);
+        
+        IF l_comp_result IN (gc_result_alter,gc_result_alter_move) THEN
+          out_change_clause := out_change_clause||l_change_clause;
+          out_revert_clause := out_revert_clause||l_revert_clause;
+          debug('Partition lob compare  '||in_source_partition_rec.lob_arr(l_column_indx).column_name||' result - '||l_comp_result, out_change_clause);
+        END IF;
+        
+      END IF;
+
+      IF l_result = gc_result_recreate THEN
+        RETURN l_result;
+      END IF;
+
+      l_column_indx := in_target_table_rec.lob_arr.NEXT(l_column_indx);
+    END LOOP;
+    RETURN l_result;
+  END comp_lob_partition;
+  
 
   FUNCTION get_partition_hash(in_partition_rec IN cort_exec_pkg.gt_partition_rec)
   RETURN VARCHAR2
@@ -5918,18 +6062,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_clause_indx_arr         arrays.gt_xlstr_indx;
   BEGIN
     -- Tablespace
-    IF cort_exec_pkg.g_params.tablespace.value_exists(in_partition_rec.partition_level) THEN
-      l_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_partition_rec.tablespace_name, '"', '"');
-      -- Overflow Tablespace
-      l_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_overflow_tablespace, in_partition_rec.overflow_tablespace, '"', '"');
-    END IF;
+    l_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_partition_rec.tablespace_name, '"', '"');
+    -- Overflow Tablespace
+    l_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_overflow_tablespace, in_partition_rec.overflow_tablespace, '"', '"');
     -- Compression
     IF in_partition_rec.iot_key_compression IS NOT NULL THEN
       l_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, in_partition_rec.iot_key_compression);
     ELSE
-      IF cort_exec_pkg.g_params.compression.value_exists(in_partition_rec.partition_level) THEN 
       l_clause_indx_arr(gc_compression) := get_compress_clause(in_partition_rec.compression_rec);
-      END IF;  
     END IF;
     -- Lob partitioning storage
     -- varray
@@ -5977,16 +6117,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       l_clause_indx_arr(gc_logging) := get_clause(gc_logging, in_partition_rec.logging);
     END IF;
     -- Tablespace
-    IF cort_exec_pkg.g_params.tablespace.value_exists(in_partition_rec.partition_level) THEN
-      l_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_partition_rec.tablespace_name, '"', '"');
-    END IF;
+    l_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, in_partition_rec.tablespace_name, '"', '"');
     -- compression
     IF in_partition_rec.iot_key_compression IS NOT NULL THEN
       l_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, in_partition_rec.iot_key_compression);
     ELSE
-      IF cort_exec_pkg.g_params.compression.value_exists(in_partition_rec.partition_level) THEN 
       l_clause_indx_arr(gc_compression) := get_compress_clause(in_partition_rec.compression_rec);
-      END IF;  
     END IF;
 
     -- Overflow
@@ -5994,8 +6130,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
        in_partition_rec.partition_level = 'PARTITION'
     THEN
       l_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_overflow_tablespace, in_partition_rec.overflow_tablespace, '"', '"');
-      -- Physical attrs
-      l_clause_indx_arr(gc_overflow_physical_attr) := get_index_physical_attr_clause(in_partition_rec.overflow_physical_attr_rec);
+      
+      IF cort_exec_pkg.g_params.physical_attr.exist('OVERFLOW_PARTITION') THEN
+        -- Physical attrs
+        l_clause_indx_arr(gc_overflow_physical_attr) := get_index_physical_attr_clause(in_partition_rec.overflow_physical_attr_rec);
+      END IF;
       -- logging
       l_clause_indx_arr(gc_overflow_logging) := get_clause(gc_logging, in_partition_rec.overflow_logging);
     END IF;
@@ -6038,8 +6177,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_rec IN OUT NOCOPY cort_exec_pkg.gt_partition_rec,
     io_target_partition_rec IN OUT NOCOPY cort_exec_pkg.gt_partition_rec,
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER;
 
@@ -6049,115 +6187,100 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_rec IN OUT NOCOPY cort_exec_pkg.gt_partition_rec,
     io_target_partition_rec IN OUT NOCOPY cort_exec_pkg.gt_partition_rec,
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
-    l_result                 PLS_INTEGER;
-    l_comp_result            PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
-    l_frwd_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_rlbk_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_move                   BOOLEAN := FALSE;
+    l_result                   PLS_INTEGER;
+    l_comp_result              PLS_INTEGER;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
+    l_change_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr   arrays.gt_xlstr_indx;
   BEGIN
     l_result := gc_result_nochange;
 
-    debug('compare partititons: '||io_source_partition_rec.partition_name||' -- '||io_target_partition_rec.partition_name);
-
-    io_source_partition_rec.comp_result := gc_result_nochange;
-    io_target_partition_rec.comp_result := gc_result_nochange;
+    -- Logging
+    IF comp_value(io_source_partition_rec.logging, io_target_partition_rec.logging) = 1 THEN
+      l_result := gc_result_alter;
+      l_change_clause_indx_arr(gc_logging) := get_clause(gc_logging, io_target_partition_rec.logging);
+      l_revert_clause_indx_arr(gc_logging) := get_clause(gc_logging, io_source_partition_rec.logging);
+    END IF;
 
     -- Physical attrs
-    IF cort_exec_pkg.g_params.physical_attr.value_exists(io_source_partition_rec.partition_level) THEN
+    IF cort_exec_pkg.g_params.physical_attr.exist(io_source_partition_rec.partition_level) THEN
       l_comp_result := comp_physical_attr(
                          in_source_physical_attr_rec => io_source_partition_rec.physical_attr_rec,
                          in_target_physical_attr_rec => io_target_partition_rec.physical_attr_rec,
-                         out_frwd_clause             => l_frwd_clause,
-                         out_rlbk_clause             => l_rlbk_clause
+                         out_change_clause           => l_change_clause,
+                         out_revert_clause           => l_revert_clause
                        );
 
-      io_source_partition_rec.comp_result := l_comp_result;
-      io_target_partition_rec.comp_result := l_comp_result;
 
-      CASE l_comp_result
-      WHEN gc_result_recreate THEN
+      CASE 
+      WHEN l_comp_result = gc_result_recreate THEN
         debug('Compare partition physical_attr_rec - recreate');
         RETURN gc_result_part_exchange;
-      WHEN gc_result_alter THEN
-        debug('Compare partition physical_attr_rec - alter');
-        l_result := gc_result_alter;
-        l_frwd_clause_indx_arr(gc_physical_attr) := l_frwd_clause;
-        l_rlbk_clause_indx_arr(gc_physical_attr) := l_rlbk_clause;
+      WHEN l_comp_result IN (gc_result_alter, gc_result_alter_move) THEN
+        debug('Compare partition physical_attr_rec - '||l_comp_result);
+        l_result := GREATEST(l_result, l_comp_result);
+        l_change_clause_indx_arr(gc_physical_attr) := l_change_clause;
+        l_revert_clause_indx_arr(gc_physical_attr) := l_revert_clause;
       ELSE
         NULL;
       END CASE;
     END IF;
-    -- Logging
-    IF comp_value(io_source_partition_rec.logging, io_target_partition_rec.logging) = 1 THEN
-      l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_logging) := get_clause(gc_logging, io_target_partition_rec.logging);
-      l_rlbk_clause_indx_arr(gc_logging) := get_clause(gc_logging, io_source_partition_rec.logging);
-    END IF;
 
     -- Tablespace
-    IF cort_exec_pkg.g_params.tablespace.value_exists(io_source_partition_rec.partition_level) AND
-       comp_value(io_source_partition_rec.tablespace_name, io_target_partition_rec.tablespace_name) = 1
+    IF comp_value(io_source_partition_rec.tablespace_name, io_target_partition_rec.tablespace_name) = 1
     THEN
-      l_result := gc_result_alter;
-      l_move := TRUE;
-      l_frwd_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, io_target_partition_rec.tablespace_name, '"', '"');
-      l_rlbk_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, io_source_partition_rec.tablespace_name, '"', '"');
+      l_result := gc_result_alter_move;
+      l_change_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, io_target_partition_rec.tablespace_name, '"', '"');
+      l_revert_clause_indx_arr(gc_tablespace) := get_clause(gc_tablespace, io_source_partition_rec.tablespace_name, '"', '"');
     END IF;
 
     -- Compression
-    IF cort_exec_pkg.g_params.compression.value_exists(io_source_partition_rec.partition_level) AND 
-       comp_compression(
+    IF comp_compression(
          in_source_compression_rec  => io_source_partition_rec.compression_rec,
          in_target_compression_rec  => io_target_partition_rec.compression_rec,
-         out_frwd_clause            => l_frwd_clause,
-         out_rlbk_clause            => l_rlbk_clause
+         out_change_clause          => l_change_clause,
+         out_revert_clause          => l_revert_clause
        ) = 1
     THEN
-      l_result := gc_result_alter;
-      l_move := TRUE;
-      l_frwd_clause_indx_arr(gc_compression) := l_frwd_clause;
-      l_rlbk_clause_indx_arr(gc_compression) := l_rlbk_clause;
+      l_result := gc_result_alter_move;
+      l_change_clause_indx_arr(gc_compression) := l_change_clause;
+      l_revert_clause_indx_arr(gc_compression) := l_revert_clause;
     END IF;
 
     -- Key compression
     IF comp_value(io_source_partition_rec.iot_key_compression, io_target_partition_rec.iot_key_compression) = 1 THEN
-      l_result := gc_result_alter;
-      l_move := TRUE;
-      l_frwd_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, io_target_partition_rec.iot_key_compression);
-      l_rlbk_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, io_source_partition_rec.iot_key_compression);
+      l_result := gc_result_alter_move;
+      l_change_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, io_target_partition_rec.iot_key_compression);
+      l_revert_clause_indx_arr(gc_key_compression) := get_clause(gc_key_compression, io_source_partition_rec.iot_key_compression);
     END IF;
 
 
     -- Overflow
     IF io_source_table_rec.overflow_table_name IS NOT NULL THEN
-      l_frwd_clause_indx_arr(gc_overflow) := get_clause(gc_overflow, ' ');
-      l_rlbk_clause_indx_arr(gc_overflow) := get_clause(gc_overflow, ' ');
+      l_change_clause_indx_arr(gc_overflow) := get_clause(gc_overflow, ' ');
+      l_revert_clause_indx_arr(gc_overflow) := get_clause(gc_overflow, ' ');
       IF io_source_partition_rec.partition_level = 'PARTITION' THEN
         -- Physical attrs
-        IF cort_exec_pkg.g_params.physical_attr.value_exists('INDEX_PARTITION') THEN
+        IF cort_exec_pkg.g_params.physical_attr.exist('INDEX_PARTITION') THEN
           l_comp_result := comp_index_physical_attr(
                              in_source_physical_attr_rec => io_source_partition_rec.overflow_physical_attr_rec,
                              in_target_physical_attr_rec => io_target_partition_rec.overflow_physical_attr_rec,
-                             out_frwd_clause             => l_frwd_clause,
-                             out_rlbk_clause             => l_rlbk_clause
+                             out_change_clause           => l_change_clause,
+                             out_revert_clause           => l_revert_clause
                            );
-          io_source_partition_rec.comp_result := l_comp_result;
-          io_target_partition_rec.comp_result := l_comp_result;
-          CASE l_comp_result
-          WHEN gc_result_recreate THEN
+          CASE 
+          WHEN l_comp_result = gc_result_recreate THEN
             debug('Compare partition overflow physical_attr_rec - 1');
             RETURN gc_result_part_exchange;
-          WHEN gc_result_alter THEN
-            l_result := gc_result_alter;
-            l_frwd_clause_indx_arr(gc_overflow_physical_attr) := l_frwd_clause;
-            l_rlbk_clause_indx_arr(gc_overflow_physical_attr) := l_rlbk_clause;
+          WHEN l_comp_result In (gc_result_alter, gc_result_alter_move) THEN
+            l_result := GREATEST(l_result, l_comp_result);
+            l_change_clause_indx_arr(gc_overflow_physical_attr) := l_change_clause;
+            l_revert_clause_indx_arr(gc_overflow_physical_attr) := l_revert_clause;
           ELSE
             NULL;
           END CASE;
@@ -6166,75 +6289,111 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
       -- Logging
       IF comp_value(io_source_partition_rec.overflow_logging, io_target_partition_rec.overflow_logging) = 1 THEN
-        l_result := gc_result_alter;
-        l_frwd_clause_indx_arr(gc_overflow_logging) := get_clause(gc_logging, io_target_partition_rec.overflow_logging);
-        l_rlbk_clause_indx_arr(gc_overflow_logging) := get_clause(gc_logging, io_source_partition_rec.overflow_logging);
+        l_result := GREATEST(l_result, gc_result_alter);
+        l_change_clause_indx_arr(gc_overflow_logging) := get_clause(gc_logging, io_target_partition_rec.overflow_logging);
+        l_revert_clause_indx_arr(gc_overflow_logging) := get_clause(gc_logging, io_source_partition_rec.overflow_logging);
       END IF;
 
       -- Tablespace
-      IF cort_exec_pkg.g_params.tablespace.value_exists(io_source_partition_rec.partition_level) AND
+      IF io_source_partition_rec.partition_level = 'PARTITION' AND
          comp_value(io_source_partition_rec.overflow_tablespace, io_target_partition_rec.overflow_tablespace) = 1
       THEN
-        l_result := gc_result_alter;
-        l_move := TRUE;
-        l_frwd_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_tablespace, io_target_partition_rec.overflow_tablespace, '"', '"');
-        l_rlbk_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_tablespace, io_source_partition_rec.overflow_tablespace, '"', '"');
+        l_result := gc_result_alter_move;
+        l_change_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_overflow_tablespace, io_target_partition_rec.overflow_tablespace, '"', '"');
+        l_revert_clause_indx_arr(gc_overflow_tablespace) := get_clause(gc_overflow_tablespace, io_source_partition_rec.overflow_tablespace, '"', '"');
       END IF;
     END IF;
-
-    IF l_result = gc_result_alter THEN
-      IF l_move THEN
-        l_frwd_clause_indx_arr(gc_move_partition) := get_clause(gc_move||io_source_partition_rec.partition_level, io_source_partition_rec.partition_name, '"', '"');
-        l_rlbk_clause_indx_arr(gc_move_partition) := get_clause(gc_move||io_source_partition_rec.partition_level, io_source_partition_rec.partition_name, '"', '"');
-        l_frwd_clause := get_clause_by_name(l_frwd_clause_indx_arr, gc_move_partition)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_physical_attr)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_logging)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_tablespace)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_compression)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_key_compression)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_physical_attr)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_logging)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_tablespace);
-        l_rlbk_clause := get_clause_by_name(l_rlbk_clause_indx_arr, gc_move_partition)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_physical_attr)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_logging)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_tablespace)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_compression)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_key_compression)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_physical_attr)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_logging)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_tablespace);
+    
+    -- LOB
+    IF cort_exec_pkg.g_params.physical_attr.exist('LOB_'||io_source_partition_rec.partition_level) THEN
+      l_comp_result := comp_lob_partition(
+                         in_source_table_rec     => io_source_table_rec,
+                         in_target_table_rec     => io_target_table_rec,
+                         in_source_partition_rec => io_source_partition_rec,
+                         in_target_partition_rec => io_target_partition_rec,
+                         out_change_clause       => l_change_clause,
+                         out_revert_clause       => l_revert_clause
+                       );
+      CASE 
+      WHEN l_comp_result = gc_result_recreate THEN
+        RETURN gc_result_part_exchange;
+      WHEN l_comp_result IN (gc_result_alter, gc_result_alter_move) THEN
+        l_result := GREATEST(l_result, l_comp_result);
+        l_change_clause_indx_arr(gc_lob_params) := l_change_clause;
+        l_revert_clause_indx_arr(gc_lob_params) := l_revert_clause;
       ELSE
-        l_frwd_clause_indx_arr(gc_modify_partition) := get_clause(gc_modify||io_source_partition_rec.partition_level, io_source_partition_rec.partition_name, '"', '"');
-        l_rlbk_clause_indx_arr(gc_modify_partition) := get_clause(gc_modify||io_source_partition_rec.partition_level, io_source_partition_rec.partition_name, '"', '"');
-        l_frwd_clause := get_clause_by_name(l_frwd_clause_indx_arr, gc_modify_partition)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_physical_attr)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_logging)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_compression)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_physical_attr)||
-                         get_clause_by_name(l_frwd_clause_indx_arr, gc_overflow_logging);
-        l_rlbk_clause := get_clause_by_name(l_rlbk_clause_indx_arr, gc_modify_partition)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_physical_attr)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_logging)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_compression)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_physical_attr)||
-                         get_clause_by_name(l_rlbk_clause_indx_arr, gc_overflow_logging);
-      END IF;
+        NULL;
+      END CASE;
+    END IF;
+
+    IF l_result = gc_result_alter_move AND io_source_partition_rec.partition_level = 'PARTITION' AND (io_source_partition_rec.partition_type NOT IN ('RANGE','LIST','SYSTEM','HASH') OR io_source_partition_rec.composite <> 'NO')  
+    THEN
+      debug('ORA-14257: cannot move partition other than a Range, List, System, or Hash partition. Recreate instead with part exchange');
+      RETURN gc_result_part_exchange;
+    END IF;
+
+
+    CASE 
+    WHEN l_result = gc_result_alter_move THEN
+      l_change_clause_indx_arr(gc_move_partition) := get_clause(gc_move||io_source_partition_rec.partition_level, io_source_partition_rec.partition_name, '"', '"');
+      l_revert_clause_indx_arr(gc_move_partition) := get_clause(gc_move||io_source_partition_rec.partition_level, io_source_partition_rec.partition_name, '"', '"');
+      l_change_clause := get_clause_by_name(l_change_clause_indx_arr, gc_move_partition)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_physical_attr)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_logging)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_tablespace)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_key_compression)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_physical_attr)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_logging)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_tablespace)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_compression)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_lob_params)||
+                         get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_value);
+      l_revert_clause := get_clause_by_name(l_revert_clause_indx_arr, gc_move_partition)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_physical_attr)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_logging)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_tablespace)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_key_compression)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_physical_attr)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_logging)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_tablespace)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_compression)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_lob_params)||
+                         get_clause(gc_parallel, cort_exec_pkg.g_run_params.parallel.get_value);
+    WHEN l_result = gc_result_alter THEN 
+      l_change_clause_indx_arr(gc_modify_partition) := get_clause(gc_modify||io_source_partition_rec.partition_level, io_source_partition_rec.partition_name, '"', '"');
+      l_revert_clause_indx_arr(gc_modify_partition) := get_clause(gc_modify||io_source_partition_rec.partition_level, io_source_partition_rec.partition_name, '"', '"');
+      l_change_clause := get_clause_by_name(l_change_clause_indx_arr, gc_modify_partition)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_physical_attr)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_logging)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_compression)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_physical_attr)||
+                         get_clause_by_name(l_change_clause_indx_arr, gc_overflow_logging);
+      l_revert_clause := get_clause_by_name(l_revert_clause_indx_arr, gc_modify_partition)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_physical_attr)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_logging)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_compression)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_physical_attr)||
+                         get_clause_by_name(l_revert_clause_indx_arr, gc_overflow_logging);
+    ELSE 
+      NULL;
+    END CASE;
+
+    IF l_result IN (gc_result_alter, gc_result_alter_move) THEN
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_table_name    => io_source_table_rec.table_name,
         in_owner         => io_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause,
+        in_group_type    => 'MODIFY PARTITION'
       );
-    END IF;
+    END IF;  
 
-    debug('partition comp = '||l_result);
+    debug('compare '||lower(io_source_partition_rec.partition_level)||': '||io_source_partition_rec.partition_name||' -- '||io_target_partition_rec.partition_name||' result = '||l_result);
 
     IF io_source_partition_rec.partition_level = 'PARTITION' AND
        io_source_table_rec.subpartitioning_type <> 'NONE' AND
@@ -6245,8 +6404,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                          io_target_table_rec     => io_target_table_rec,
                          io_source_partition_rec => io_source_partition_rec,
                          io_target_partition_rec => io_target_partition_rec,
-                         io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr,
-                         io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
+                         io_change_arr           => io_change_arr
                        );
       io_source_partition_rec.subpart_comp_result := l_comp_result;
       io_target_partition_rec.subpart_comp_result := l_comp_result;
@@ -6263,15 +6421,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     IF comp_value(io_source_partition_rec.partition_name, io_target_partition_rec.partition_name) = 1 AND
        io_target_partition_rec.partition_name NOT LIKE 'SYS\_%' ESCAPE '\' THEN
       -- rename partition
-      l_frwd_clause := get_clause(gc_rename||io_source_partition_rec.partition_level, '"'||io_source_partition_rec.partition_name||'" TO "'||io_target_partition_rec.partition_name||'"');
-      l_rlbk_clause := get_clause(gc_rename||io_source_partition_rec.partition_level, '"'||io_target_partition_rec.partition_name||'" TO "'||io_source_partition_rec.partition_name||'"');
+      l_change_clause := get_clause(gc_rename||io_source_partition_rec.partition_level, '"'||io_source_partition_rec.partition_name||'" TO "'||io_target_partition_rec.partition_name||'"');
+      l_revert_clause := get_clause(gc_rename||io_source_partition_rec.partition_level, '"'||io_target_partition_rec.partition_name||'" TO "'||io_source_partition_rec.partition_name||'"');
       add_alter_table_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_table_name    => io_source_table_rec.table_name,
         in_owner         => io_source_table_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause,
+        in_group_type    => 'RENAME PARTITION'
       );
       l_result := gc_result_alter;
     END IF;
@@ -6285,15 +6443,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
     io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
     l_part_result            PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause          CLOB;
+    l_revert_clause          CLOB;
   BEGIN
     l_result := gc_result_nochange;
     FOR i IN 1..LEAST(io_target_partition_arr.COUNT,io_source_partition_arr.COUNT) LOOP
@@ -6302,8 +6459,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                           io_target_table_rec     => io_target_table_rec,
                           io_source_partition_rec => io_source_partition_arr(i),
                           io_target_partition_rec => io_target_partition_arr(i),
-                          io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr,
-                          io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
+                          io_change_arr           => io_change_arr
                         );
       io_target_partition_arr(i).matching_indx := io_source_partition_arr(i).indx;
       io_source_partition_arr(i).matching_indx := io_target_partition_arr(i).indx;
@@ -6317,23 +6473,23 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_result := gc_result_alter;
         CASE io_source_partition_arr(i).partition_level
         WHEN 'PARTITION' THEN
-          l_frwd_clause := get_clause(gc_coalesce_partition, ' ');
-          l_rlbk_clause := get_clause(gc_add_partition, io_source_partition_arr(i).partition_name, '"', '"')||
-                           get_partition_storage_clause(io_source_partition_arr(i));
+          l_change_clause := get_clause(gc_coalesce_partition, ' ');
+          l_revert_clause := get_clause(gc_add_partition, io_source_partition_arr(i).partition_name, '"', '"')||
+                             get_partition_storage_clause(io_source_partition_arr(i));
         WHEN 'SUBPARTITION' THEN
-          l_frwd_clause := get_clause(gc_modify_partition, io_source_partition_arr(i).parent_partition_name, '"', '"')||
-                           get_clause(gc_coalesce_subpartition, ' ' );
-          l_rlbk_clause := get_clause(gc_modify_partition, io_source_partition_arr(i).parent_partition_name, '"', '"')||
-                           get_clause(gc_add_subpartition, io_source_partition_arr(i).partition_name, '"', '"')||
-                           get_partition_storage_clause(io_source_partition_arr(i));
+          l_change_clause := get_clause(gc_modify_partition, io_source_partition_arr(i).parent_partition_name, '"', '"')||
+                             get_clause(gc_coalesce_subpartition, ' ' );
+          l_revert_clause := get_clause(gc_modify_partition, io_source_partition_arr(i).parent_partition_name, '"', '"')||
+                             get_clause(gc_add_subpartition, io_source_partition_arr(i).partition_name, '"', '"')||
+                             get_partition_storage_clause(io_source_partition_arr(i));
         END CASE;
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_table_name    => io_source_table_rec.table_name,
           in_owner         => io_source_table_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          in_change_clause => l_change_clause,
+          in_revert_clause => l_revert_clause,
+          in_group_type    => 'DROP PARTITION'
         );
       END LOOP;
     ELSIF io_source_partition_arr.COUNT < io_target_partition_arr.COUNT THEN
@@ -6341,23 +6497,23 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_result := gc_result_alter;
         CASE io_target_partition_arr(i).partition_level
         WHEN 'PARTITION' THEN
-          l_frwd_clause := get_clause(gc_add_partition, io_target_partition_arr(i).partition_name, '"', '"')||
-                           get_partition_storage_clause(io_target_partition_arr(i));
-          l_rlbk_clause := get_clause(gc_coalesce_partition, ' ');
+          l_change_clause := get_clause(gc_add_partition, io_target_partition_arr(i).partition_name, '"', '"')||
+                             get_partition_storage_clause(io_target_partition_arr(i));
+          l_revert_clause := get_clause(gc_coalesce_partition, ' ');
         WHEN 'SUBPARTITION' THEN
-          l_frwd_clause := get_clause(gc_modify_partition, io_target_partition_arr(i).parent_partition_name, '"', '"')||
-                           get_clause(gc_add_subpartition, io_target_partition_arr(i).partition_name, '"', '"')||
-                           get_partition_storage_clause(io_target_partition_arr(i));
-          l_rlbk_clause := get_clause(gc_modify_partition, io_target_partition_arr(i).parent_partition_name, '"', '"')||
-                           get_clause(gc_coalesce_subpartition, ' ');
+          l_change_clause := get_clause(gc_modify_partition, io_target_partition_arr(i).parent_partition_name, '"', '"')||
+                             get_clause(gc_add_subpartition, io_target_partition_arr(i).partition_name, '"', '"')||
+                             get_partition_storage_clause(io_target_partition_arr(i));
+          l_revert_clause := get_clause(gc_modify_partition, io_target_partition_arr(i).parent_partition_name, '"', '"')||
+                             get_clause(gc_coalesce_subpartition, ' ');
         END CASE;
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_table_name    => io_source_table_rec.table_name,
           in_owner         => io_source_table_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          in_change_clause => l_change_clause,
+          in_revert_clause => l_revert_clause,
+          in_group_type    => 'ADD PARTITION'
         );
       END LOOP;
     END IF;
@@ -6370,15 +6526,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
     io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
     l_part_result            PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause          CLOB;
+    l_revert_clause          CLOB;
   BEGIN
     l_result := gc_result_nochange;
     FOR i IN 1..LEAST(io_target_partition_arr.COUNT,io_source_partition_arr.COUNT) LOOP
@@ -6387,8 +6542,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                           io_target_table_rec     => io_target_table_rec,
                           io_source_partition_rec => io_source_partition_arr(i),
                           io_target_partition_rec => io_target_partition_arr(i),
-                          io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr,
-                          io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
+                          io_change_arr           => io_change_arr
                         );
       io_target_partition_arr(i).matching_indx := i;
       io_source_partition_arr(i).matching_indx := i;
@@ -6401,31 +6555,31 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     IF io_source_partition_arr.COUNT > io_target_partition_arr.COUNT THEN
       FOR i IN io_target_partition_arr.COUNT+1..io_source_partition_arr.COUNT LOOP
         l_result := gc_result_alter;
-        l_frwd_clause := get_clause(gc_drop_partition, io_source_partition_arr(i).partition_name, '"', '"');
-        l_rlbk_clause := get_clause(gc_add_partition, io_source_partition_arr(i).partition_name, '"', '"')||
-                         get_partition_desc_clause(io_source_partition_arr(i), io_source_table_rec.subpartition_arr);
+        l_change_clause := get_clause(gc_drop_partition, io_source_partition_arr(i).partition_name, '"', '"');
+        l_revert_clause := get_clause(gc_add_partition, io_source_partition_arr(i).partition_name, '"', '"')||
+                           get_partition_desc_clause(io_source_partition_arr(i), io_source_table_rec.subpartition_arr);
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_table_name    => io_source_table_rec.table_name,
           in_owner         => io_source_table_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          in_change_clause => l_change_clause,
+          in_revert_clause => l_revert_clause,
+          in_group_type    => 'DROP PARTITION'
         );
       END LOOP;
     ELSIF io_source_partition_arr.COUNT < io_target_partition_arr.COUNT THEN
       FOR i IN io_source_partition_arr.COUNT+1..io_target_partition_arr.COUNT LOOP
         l_result := gc_result_alter;
-        l_frwd_clause := get_clause(gc_add_partition, io_target_partition_arr(i).partition_name, '"', '"')||
-                         get_partition_desc_clause(io_target_partition_arr(i), io_target_table_rec.subpartition_arr);
-        l_rlbk_clause := get_clause(gc_drop_partition, io_target_partition_arr(i).partition_name, '"', '"');
+        l_change_clause := get_clause(gc_add_partition, io_target_partition_arr(i).partition_name, '"', '"')||
+                           get_partition_desc_clause(io_target_partition_arr(i), io_target_table_rec.subpartition_arr);
+        l_revert_clause := get_clause(gc_drop_partition, io_target_partition_arr(i).partition_name, '"', '"');
         add_alter_table_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_table_name    => io_source_table_rec.table_name,
           in_owner         => io_source_table_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          in_change_clause => l_change_clause,
+          in_revert_clause => l_revert_clause,
+          in_group_type    => 'ADD PARTITION'
         );
       END LOOP;
     END IF;
@@ -6438,8 +6592,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
     io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
@@ -6457,8 +6610,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                          io_target_table_rec     => io_target_table_rec,
                          io_source_partition_rec => io_source_partition_arr(i),
                          io_target_partition_rec => io_target_partition_arr(i),
-                         io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr,
-                         io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
+                         io_change_arr           => io_change_arr
                        );
       io_target_partition_arr(i).matching_indx := i;
       io_source_partition_arr(i).matching_indx := i;
@@ -6473,53 +6625,44 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
     io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
     l_part_result            PLS_INTEGER;
-    l_source_partition_arr   partition_utils.gt_partition_arr;
-    l_target_partition_arr   partition_utils.gt_partition_arr;
     l_source_high_value_str  VARCHAR2(32767);
     l_target_high_value_str  VARCHAR2(32767);
+    l_source_partition_arr   partition_utils.gt_partition_arr;
+    l_target_partition_arr   partition_utils.gt_partition_arr;
     l_source_xref_arr        arrays.gt_int_arr;
     l_source_partition_indx  arrays.gt_int_indx;
     l_add_partition_arr      arrays.gt_int_arr;
     l_indx                   PLS_INTEGER;
     l_match_indx             PLS_INTEGER;
+    l_match_cnt              PLS_INTEGER;
     l_def_part_exists        BOOLEAN;
     l_before_partition_name  arrays.gt_name;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause          CLOB;
+    l_revert_clause          CLOB;
+    l_forward_ddl            arrays.gt_clob_arr;
+    l_rollback_ddl           arrays.gt_clob_arr;
   BEGIN
     l_result := gc_result_nochange;
 
     FOR i IN 1..io_source_partition_arr.COUNT LOOP
-      l_source_partition_arr(i).object_type := 'TABLE';
-      l_source_partition_arr(i).object_name := io_source_partition_arr(i).table_name;
-      l_source_partition_arr(i).object_owner := io_source_partition_arr(i).table_owner;
-      l_source_partition_arr(i).partition_name := io_source_partition_arr(i).partition_name;
-      l_source_partition_arr(i).parent_part_name := io_source_partition_arr(i).parent_partition_name;
-      l_source_partition_arr(i).position := io_source_partition_arr(i).position;
-      partition_utils.parse_high_value_str(io_source_partition_arr(i).high_value, l_source_partition_arr(i).high_values);
-      l_source_high_value_str := partition_utils.convert_to_string(l_source_partition_arr(i).high_values);
+      l_source_partition_arr(i) := io_source_partition_arr(i).partition_rec;
+      l_source_high_value_str := partition_utils.as_literal(io_source_partition_arr(i).partition_rec.high_values);
       l_source_partition_indx(l_source_high_value_str) := i;
     END LOOP;
 
     l_def_part_exists := FALSE;
-    l_match_indx := null;
+    l_match_indx := NULL;
+    l_match_cnt := 0;
     FOR i IN 1..io_target_partition_arr.COUNT LOOP
-      l_target_partition_arr(i).object_type := 'TABLE';
-      l_target_partition_arr(i).object_name := io_target_partition_arr(i).table_name;
-      l_target_partition_arr(i).object_owner := io_target_partition_arr(i).table_owner;
-      l_target_partition_arr(i).partition_name := io_target_partition_arr(i).partition_name;
-      l_target_partition_arr(i).parent_part_name := io_target_partition_arr(i).parent_partition_name;
-      l_target_partition_arr(i).position := io_target_partition_arr(i).position;
-      partition_utils.parse_high_value_str(io_target_partition_arr(i).high_value, l_target_partition_arr(i).high_values);
-      l_target_high_value_str := partition_utils.convert_to_string(l_target_partition_arr(i).high_values);
-      IF l_target_partition_arr(i).high_values(1).typecode = partition_utils.typecode_default THEN
+      l_target_partition_arr(i) := io_target_partition_arr(i).partition_rec;
+      l_target_high_value_str := partition_utils.as_literal(io_target_partition_arr(i).partition_rec.high_values);
+      IF io_target_partition_arr(i).partition_rec.high_values(1).typecode = partition_utils.typecode_default THEN
         l_def_part_exists := TRUE;
       END IF;
 
@@ -6529,16 +6672,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
         debug('Match target partition '||to_char(i)||')'||io_target_partition_arr(i).partition_name||' to source partition '||to_char(l_indx)||')'||io_source_partition_arr(l_indx).partition_name);
 
-        IF l_target_partition_arr(i).high_values(1).typecode = partition_utils.typecode_default AND l_add_partition_arr.COUNT > 0 AND NOT io_source_partition_arr(l_indx).is_partition_empty THEN
-          l_part_result := cort_comp_pkg.gc_result_part_exchange;
+        IF io_target_partition_arr(i).partition_rec.high_values(1).typecode = partition_utils.typecode_default AND l_add_partition_arr.COUNT > 0 AND NOT io_source_partition_arr(l_indx).is_partition_empty THEN
+          l_part_result := gc_result_part_exchange;
         ELSE
           l_part_result := comp_partition(
                              io_source_table_rec     => io_source_table_rec,
                              io_target_table_rec     => io_target_table_rec,
                              io_source_partition_rec => io_source_partition_arr(l_indx),
                              io_target_partition_rec => io_target_partition_arr(i),
-                             io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr,
-                             io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
+                             io_change_arr           => io_change_arr
                            );
           io_target_partition_arr(i).matching_indx := io_source_partition_arr(l_indx).indx;
           io_source_partition_arr(l_indx).matching_indx := io_target_partition_arr(i).indx;
@@ -6546,9 +6688,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_result := greatest(l_result, l_part_result);
 
         -- partiton moved to another position
-        IF l_indx < l_match_indx AND NOT cort_exec_pkg.g_params.compare.value_exists('IGNORE_ORDER') THEN
+        IF l_indx < l_match_indx AND NOT cort_exec_pkg.g_params.compare.exist('IGNORE_ORDER') THEN
           debug('partition '||io_target_partition_arr(i).partition_name||' exists but moved to another position. Need to recreate');
-          l_result := cort_comp_pkg.gc_result_part_exchange;
+          l_result := gc_result_part_exchange;
         END IF;
         l_match_indx := l_indx;
       ELSE
@@ -6571,35 +6713,39 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
             l_before_partition_name := NULL;
           END IF;
           debug('Before partition name '||l_before_partition_name);*/
-          debug('Drop partition '||l_source_partition_arr(i).partition_name);
+          debug('Drop partition '||io_source_partition_arr(i).partition_name);
           --
           CASE io_source_partition_arr(i).partition_level
           WHEN 'PARTITION' THEN
-            l_frwd_clause := get_clause(gc_drop_partition, io_source_partition_arr(i).partition_name, '"', '"');
-            l_rlbk_clause := null;
+            l_change_clause := get_clause(gc_drop_partition, io_source_partition_arr(i).partition_name, '"', '"');
+            l_revert_clause := null;
           WHEN 'SUBPARTITION' THEN
-            l_frwd_clause := get_clause(gc_drop_subpartition, io_source_partition_arr(i).partition_name, '"', '"');
-            l_rlbk_clause := null;
+            l_change_clause := get_clause(gc_drop_subpartition, io_source_partition_arr(i).partition_name, '"', '"');
+            l_revert_clause := null;
           END CASE;
           add_alter_table_stmt(
-            io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-            io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+            io_change_arr    => io_change_arr,
             in_table_name    => io_source_table_rec.table_name,
             in_owner         => io_source_table_rec.owner,
-            in_frwd_clause   => l_frwd_clause,
-            in_rlbk_clause   => l_rlbk_clause
+            in_change_clause => l_change_clause,
+            in_revert_clause => l_revert_clause,
+            in_group_type    => 'DROP PARTITION'
           );
         ELSE
-          debug('merge partition '||l_source_partition_arr(i).partition_name);
+          debug('merge partition '||io_source_partition_arr(i).partition_name);
           l_result := gc_result_part_exchange;
           io_source_partition_arr(i).matching_indx := NULL;
         END IF;
       END IF;
     END LOOP;
 
-    IF l_result = cort_comp_pkg.gc_result_part_exchange THEN
+    IF l_result = gc_result_part_exchange THEN
       debug('Some target partitions are removed. Need to recreate');
-      RETURN gc_result_part_exchange;
+      IF l_source_xref_arr.COUNT > 0 THEN 
+        RETURN gc_result_part_exchange;
+      ELSE
+        RETURN gc_result_recreate;
+      END IF;  
     END IF;
 
     l_match_indx := NULL;
@@ -6613,7 +6759,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       IF l_match_indx IS NOT NULL THEN
         l_match_indx := l_source_xref_arr(l_match_indx);
 
-        l_before_partition_name := l_source_partition_arr(l_match_indx).partition_name;
+        l_before_partition_name := io_source_partition_arr(l_match_indx).partition_name;
         debug('Inserting partition '||l_target_partition_arr(l_indx).partition_name||' before partition '||l_before_partition_name);
       ELSE
         l_before_partition_name := NULL;
@@ -6628,8 +6774,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           in_partition_name   => l_target_partition_arr(l_indx).partition_name,
           in_partition_desc   => get_partition_desc_clause(io_target_partition_arr(l_indx), io_target_table_rec.subpartition_arr),
           in_before_partition => l_before_partition_name,
-          io_forward_ddl      => io_frwd_alter_stmt_arr,
-          io_rollback_ddl     => io_rlbk_alter_stmt_arr
+          io_forward_ddl      => l_forward_ddl,
+          io_rollback_ddl     => l_rollback_ddl
         );
       WHEN 'SUBPARTITION' THEN
         partition_utils.insert_list_subpartition_ddl(
@@ -6639,13 +6785,23 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           in_subpartition_name => l_target_partition_arr(l_indx).partition_name,
           in_subpartition_desc => get_partition_desc_clause(io_target_partition_arr(l_indx), empty_partition_arr),
           in_before_partition  => l_before_partition_name,
-          io_forward_ddl       => io_frwd_alter_stmt_arr,
-          io_rollback_ddl      => io_rlbk_alter_stmt_arr
+          io_forward_ddl       => l_forward_ddl,
+          io_rollback_ddl      => l_rollback_ddl
         );
       END CASE;
 
       l_indx := l_add_partition_arr.NEXT(l_indx);
     END LOOP;
+    FOR i IN 1..l_forward_ddl.COUNT LOOP
+      cort_exec_pkg.add_change(
+        io_change_arr,
+        cort_exec_pkg.change_rec(
+          in_group_type => 'ADD PARTITION',
+          in_change_sql => l_forward_ddl(i),
+          in_revert_sql => l_rollback_ddl(i)
+        )   
+      );  
+    END LOOP;  
 
     RETURN l_result;
   END comp_list_partitions;
@@ -6656,8 +6812,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
     io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
@@ -6669,28 +6824,18 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_src_indx               PLS_INTEGER;
     l_last_src_indx          PLS_INTEGER;
     l_split_src_indx         PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause          CLOB;
+    l_revert_clause          CLOB;
+    l_forward_ddl            arrays.gt_clob_arr;
+    l_rollback_ddl           arrays.gt_clob_arr;
   BEGIN
     l_result := gc_result_nochange;
     FOR i IN 1..io_target_partition_arr.COUNT LOOP
-      l_target_partition_arr(i).object_type := 'TABLE';
-      l_target_partition_arr(i).object_name := io_target_partition_arr(i).table_name;
-      l_target_partition_arr(i).object_owner := io_target_partition_arr(i).table_owner;
-      l_target_partition_arr(i).partition_name := io_target_partition_arr(i).partition_name;
-      l_target_partition_arr(i).parent_part_name := io_target_partition_arr(i).parent_partition_name;
-      l_target_partition_arr(i).position := io_target_partition_arr(i).position;
-      partition_utils.parse_high_value_str(io_target_partition_arr(i).high_value, l_target_partition_arr(i).high_values);
+      l_target_partition_arr(i) := io_target_partition_arr(i).partition_rec;
     END LOOP;
 
     FOR i IN 1..io_source_partition_arr.COUNT LOOP
-      l_source_partition_arr(i).object_type := 'TABLE';
-      l_source_partition_arr(i).object_name := io_source_partition_arr(i).table_name;
-      l_source_partition_arr(i).object_owner := io_source_partition_arr(i).table_owner;
-      l_source_partition_arr(i).partition_name := io_source_partition_arr(i).partition_name;
-      l_source_partition_arr(i).parent_part_name := io_source_partition_arr(i).parent_partition_name;
-      l_source_partition_arr(i).position := io_source_partition_arr(i).position;
-      partition_utils.parse_high_value_str(io_source_partition_arr(i).high_value, l_source_partition_arr(i).high_values);
+      l_source_partition_arr(i) := io_source_partition_arr(i).partition_rec;
     END LOOP;
 
 
@@ -6720,8 +6865,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                                io_target_table_rec     => io_target_table_rec,
                                io_source_partition_rec => io_source_partition_arr(l_src_indx),
                                io_target_partition_rec => io_target_partition_arr(i),
-                               io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr,
-                               io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
+                               io_change_arr           => io_change_arr
                              );
             IF l_split_src_indx IS NULL THEN
               io_target_partition_arr(i).matching_indx := io_source_partition_arr(l_src_indx).indx;
@@ -6741,8 +6885,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
               in_high_values      => l_target_partition_arr(i).high_values,
               in_partition_name   => l_target_partition_arr(i).partition_name,
               in_partition_desc   => get_partition_desc_clause(io_target_partition_arr(i), empty_partition_arr),
-              io_forward_ddl      => io_frwd_alter_stmt_arr,
-              io_rollback_ddl     => io_rlbk_alter_stmt_arr
+              io_forward_ddl      => l_forward_ddl,
+              io_rollback_ddl     => l_rollback_ddl
             );
             -- Mark next source partition for recreate (split)
             l_split_src_indx := l_src_indx;
@@ -6761,19 +6905,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
               --
               CASE io_source_partition_arr(i).partition_level
               WHEN 'PARTITION' THEN
-                l_frwd_clause := get_clause(gc_drop_partition, io_source_partition_arr(i).partition_name, '"', '"');
-                l_rlbk_clause := null;
+                l_change_clause := get_clause(gc_drop_partition, io_source_partition_arr(i).partition_name, '"', '"');
+                l_revert_clause := null;
               WHEN 'SUBPARTITION' THEN
-                l_frwd_clause := get_clause(gc_drop_subpartition, io_source_partition_arr(i).partition_name, '"', '"');
-                l_rlbk_clause := null;
+                l_change_clause := get_clause(gc_drop_subpartition, io_source_partition_arr(i).partition_name, '"', '"');
+                l_revert_clause := null;
               END CASE;
               add_alter_table_stmt(
-                io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-                io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+                io_change_arr    => io_change_arr,
                 in_table_name    => io_source_table_rec.table_name,
                 in_owner         => io_source_table_rec.owner,
-                in_frwd_clause   => l_frwd_clause,
-                in_rlbk_clause   => l_rlbk_clause
+                in_change_clause => l_change_clause,
+                in_revert_clause => l_revert_clause,
+                in_group_type    => 'DROP PARTITION'
               );
             ELSE
               debug('merge partition '||io_source_partition_arr(l_src_indx).partition_name);
@@ -6794,12 +6938,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           in_high_values      => l_target_partition_arr(i).high_values,
           in_partition_name   => l_target_partition_arr(i).partition_name,
           in_partition_desc   => get_partition_desc_clause(io_target_partition_arr(i), empty_partition_arr),
-          io_forward_ddl      => io_frwd_alter_stmt_arr,
-          io_rollback_ddl     => io_rlbk_alter_stmt_arr
+          io_forward_ddl      => l_forward_ddl,
+          io_rollback_ddl     => l_rollback_ddl
         );
       END IF;
 
     END LOOP;
+    FOR i IN 1..l_forward_ddl.COUNT LOOP
+      cort_exec_pkg.add_change(
+        io_change_arr,
+        cort_exec_pkg.change_rec(
+          in_group_type => 'ADD PARTITION',
+          in_change_sql => l_forward_ddl(i),
+          in_revert_sql => l_rollback_ddl(i)
+        )   
+      );  
+    END LOOP;  
 
     RETURN l_result;
   END comp_range_partitions;
@@ -6811,16 +6965,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
     io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr,
     in_partitioning_type    IN VARCHAR2, -- HASH/LIST/RANGE/SYSTEM/REFERENCE
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
-    l_result                 PLS_INTEGER;
-    l_partitioning_type      VARCHAR2(30);
-    l_frwd_alter_stmt_arr    arrays.gt_clob_arr; -- forward alter statements
-    l_rlbk_alter_stmt_arr    arrays.gt_clob_arr;  -- rollback alter statements
+    l_result             PLS_INTEGER;
+    l_change_sql_arr     cort_exec_pkg.gt_change_arr;
   BEGIN
+    l_result := gc_result_nochange;
+    
     CASE in_partitioning_type
     WHEN 'HASH' THEN
       l_result := comp_hash_partitions(
@@ -6828,8 +6981,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     io_target_table_rec     => io_target_table_rec,
                     io_source_partition_arr => io_source_partition_arr,
                     io_target_partition_arr => io_target_partition_arr,
-                    io_frwd_alter_stmt_arr  => l_frwd_alter_stmt_arr,
-                    io_rlbk_alter_stmt_arr  => l_rlbk_alter_stmt_arr
+                    io_change_arr           => l_change_sql_arr
                   );
     WHEN 'SYSTEM' THEN
       l_result := comp_system_partitions(
@@ -6837,8 +6989,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     io_target_table_rec     => io_target_table_rec,
                     io_source_partition_arr => io_source_partition_arr,
                     io_target_partition_arr => io_target_partition_arr,
-                    io_frwd_alter_stmt_arr  => l_frwd_alter_stmt_arr,
-                    io_rlbk_alter_stmt_arr  => l_rlbk_alter_stmt_arr
+                    io_change_arr           => l_change_sql_arr
                   );
     WHEN 'REFERENCE' THEN
       l_result := comp_reference_partitions(
@@ -6846,8 +6997,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     io_target_table_rec     => io_target_table_rec,
                     io_source_partition_arr => io_source_partition_arr,
                     io_target_partition_arr => io_target_partition_arr,
-                    io_frwd_alter_stmt_arr  => l_frwd_alter_stmt_arr,
-                    io_rlbk_alter_stmt_arr  => l_rlbk_alter_stmt_arr
+                    io_change_arr           => l_change_sql_arr
                   );
     WHEN 'LIST' THEN
       l_result := comp_list_partitions(
@@ -6855,8 +7005,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     io_target_table_rec     => io_target_table_rec,
                     io_source_partition_arr => io_source_partition_arr,
                     io_target_partition_arr => io_target_partition_arr,
-                    io_frwd_alter_stmt_arr  => l_frwd_alter_stmt_arr,
-                    io_rlbk_alter_stmt_arr  => l_rlbk_alter_stmt_arr
+                    io_change_arr           => l_change_sql_arr
                   );
     WHEN 'RANGE' THEN
       l_result := comp_range_partitions(
@@ -6864,20 +7013,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     io_target_table_rec     => io_target_table_rec,
                     io_source_partition_arr => io_source_partition_arr,
                     io_target_partition_arr => io_target_partition_arr,
-                    io_frwd_alter_stmt_arr  => l_frwd_alter_stmt_arr,
-                    io_rlbk_alter_stmt_arr  => l_rlbk_alter_stmt_arr
+                    io_change_arr           => l_change_sql_arr
                   );
     ELSE
-      NULL;
+      l_result := gc_result_recreate; 
     END CASE;
 
     IF l_result in (gc_result_alter, gc_result_alter_move) THEN
-      FOR i IN 1..l_frwd_alter_stmt_arr.COUNT LOOP
-        io_frwd_alter_stmt_arr(io_frwd_alter_stmt_arr.COUNT+1) := l_frwd_alter_stmt_arr(i);
-      END LOOP;
-      FOR i IN 1..l_rlbk_alter_stmt_arr.COUNT LOOP
-        io_rlbk_alter_stmt_arr(io_rlbk_alter_stmt_arr.COUNT+1) := l_rlbk_alter_stmt_arr(i);
-      END LOOP;
+      cort_exec_pkg.add_changes(io_change_arr, l_change_sql_arr);
     END IF;
 
     RETURN l_result;
@@ -6889,25 +7032,23 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr, 
     io_target_partition_arr IN OUT NOCOPY cort_exec_pkg.gt_partition_arr, 
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
   BEGIN
-    cort_exec_pkg.start_timer;    
+    cort_log_pkg.start_timer('COMP_PARTITIONS');    
 
     l_result := int_comp_partition_segments(
                   io_source_table_rec     => io_source_table_rec,
                   io_target_table_rec     => io_target_table_rec,
                   io_source_partition_arr => io_source_partition_arr, 
                   io_target_partition_arr => io_target_partition_arr, 
-                  in_partitioning_type    => io_source_table_rec.partitioning_type,
-                  io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr, 
-                  io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
+                  in_partitioning_type    => io_target_table_rec.partitioning_type,
+                  io_change_arr           => io_change_arr
                 );
-    cort_exec_pkg.stop_timer;
+    cort_log_pkg.stop_timer('COMP_PARTITIONS');
 
     RETURN l_result;
   END comp_partitions;
@@ -6918,8 +7059,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
     io_source_partition_rec IN OUT NOCOPY cort_exec_pkg.gt_partition_rec,
     io_target_partition_rec IN OUT NOCOPY cort_exec_pkg.gt_partition_rec,
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr           IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
@@ -6952,8 +7092,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                   io_source_partition_arr => l_source_subpartition_arr,
                   io_target_partition_arr => l_target_subpartition_arr,
                   in_partitioning_type    => io_source_table_rec.subpartitioning_type,
-                  io_frwd_alter_stmt_arr  => io_frwd_alter_stmt_arr,
-                  io_rlbk_alter_stmt_arr  => io_rlbk_alter_stmt_arr
+                  io_change_arr           => io_change_arr
                 );
 
     l_index := 1;
@@ -6991,17 +7130,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END CASE;
    RETURN l_new_name;
   END get_new_name;
-
+  
   -- create swap table for given table (and partition - optionaly)
   PROCEDURE create_swap_table_sql(
-    in_table_rec        IN cort_exec_pkg.gt_table_rec,
-    in_swap_table_rec   IN cort_exec_pkg.gt_table_rec,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_table_rec       IN cort_exec_pkg.gt_table_rec,
+    in_swap_table_rec  IN cort_exec_pkg.gt_table_rec,
+    io_change_arr      IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_create_sql     CLOB;
-    l_drop_sql       CLOB;
     l_partition_sql  CLOB;
     l_indx           PLS_INTEGER;
     l_columns_list   VARCHAR2(32767);
@@ -7015,8 +7151,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_col_properties VARCHAR2(32767);
   BEGIN
     FOR i IN 1..in_table_rec.column_arr.COUNT LOOP
-      IF in_table_rec.column_arr(i).virtual_column = 'NO' AND
-         in_table_rec.column_arr(i).hidden_column = 'NO'
+      IF in_table_rec.column_arr(i).user_generated = 'YES'
       THEN
         l_columns_list := l_columns_list||CHR(10)||'  '||RTRIM(get_column_clause(in_table_rec, in_table_rec.column_arr(i)))||',';
         l_col_prop := get_column_properties(
@@ -7078,16 +7213,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
 
     -- create swap table
-    l_create_sql := 'CREATE TABLE "'||in_swap_table_rec.owner||'"."'||in_swap_table_rec.table_name||'" ('||l_columns_list||CHR(10)||')'||
-                    l_col_properties||CHR(10)||l_iot_clause||l_partition_sql;
-
-    l_drop_sql := 'DROP TABLE "'||in_swap_table_rec.owner||'"."'||in_swap_table_rec.table_name||'"';
-
-    add_stmt(
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr,
-      in_frwd_stmt     => l_create_sql,
-      in_rlbk_stmt     => l_drop_sql
+    cort_exec_pkg.add_change(
+      io_change_arr,
+      cort_exec_pkg.change_rec(
+        in_group_type => 'EXHCNAGE PARTITION',
+        in_change_sql => 'CREATE TABLE "'||in_swap_table_rec.owner||'"."'||in_swap_table_rec.table_name||'" ('||l_columns_list||CHR(10)||')'||
+                         l_col_properties||CHR(10)||l_iot_clause||l_partition_sql,
+        in_revert_sql => get_drop_table_ddl(in_swap_table_rec.table_name, in_swap_table_rec.owner)
+      )   
     );
 
 
@@ -7101,24 +7234,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_index_rec := NULL;
       END IF;
       create_index(
-        in_index_rec             => l_index_rec,
-        in_table_name            => l_index_rec.table_name,
-        io_frwd_alter_stmt_arr   => io_frwd_stmt_arr,
-        io_rlbk_alter_stmt_arr   => io_rlbk_stmt_arr
+        in_index_rec  => l_index_rec,
+        in_table_name => l_index_rec.table_name,
+        io_change_arr => io_change_arr
       );
       IF l_index_rec.constraint_name IS NOT NULL AND
          in_table_rec.constraint_indx_arr.EXISTS(l_index_rec.constraint_name)
       THEN
         l_indx := in_table_rec.constraint_indx_arr(l_index_rec.constraint_name);
-        l_constraint_rec := in_swap_table_rec.constraint_arr(l_indx);
+        l_constraint_rec := in_table_rec.constraint_arr(l_indx);
         l_constraint_rec.table_name := in_swap_table_rec.table_name;
         l_constraint_rec.constraint_name := in_swap_table_rec.table_name||'$C'||TO_CHAR(i,'fm0XXX');
         l_constraint_rec.rename_rec.current_name := in_swap_table_rec.table_name||'$C'||TO_CHAR(i,'fm0XXX');
         add_constraint(
-          in_constraint_rec        => l_constraint_rec,
-          in_index_rec             => l_index_rec,
-          io_frwd_alter_stmt_arr   => io_frwd_stmt_arr,
-          io_rlbk_alter_stmt_arr   => io_rlbk_stmt_arr
+          in_constraint_rec => l_constraint_rec,
+          in_index_rec      => l_index_rec,
+          io_change_arr     => io_change_arr
         );
       END IF;
       l_indx := l_indx + 1;
@@ -7126,132 +7257,24 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   END create_swap_table_sql;
 
-  -- create clone table for given table
-  PROCEDURE create_clone_table_sql(
-    in_table_rec       IN cort_exec_pkg.gt_table_rec,
-    in_simple_mode     IN BOOLEAN DEFAULT FALSE,
-    in_rename_mode     IN VARCHAR2 DEFAULT 'TO_TEMP',
-    in_all_partitions  IN BOOLEAN DEFAULT TRUE,
-    io_frwd_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  AS
-    l_create_sql     CLOB;
-    l_drop_sql       CLOB;
-    l_partition_sql  CLOB;
-    l_columns_list   VARCHAR2(32767);
-    l_iot_clause     VARCHAR2(32767);
-    l_constraint_rec cort_exec_pkg.gt_constraint_rec;
-    l_col_prop       VARCHAR2(32767);
-    l_col_properties VARCHAR2(32767);
-  BEGIN
-    FOR i IN 1..in_table_rec.column_arr.COUNT LOOP
-      IF in_table_rec.column_arr(i).hidden_column = 'NO'
-      THEN
-        l_columns_list := l_columns_list||CHR(10)||'  '||RTRIM(get_column_clause(in_table_rec, in_table_rec.column_arr(i)))||',';
-        l_col_prop := get_column_properties(
-                        in_table_rec  => in_table_rec,
-                        in_column_rec => in_table_rec.column_arr(i)
-                      );
-        IF l_col_prop IS NOT NULL THEN
-          l_col_properties := l_col_properties||CHR(10)||l_col_prop;
-        END IF;
-      END IF;
-    END LOOP;
-
-    IF NOT in_simple_mode THEN
-      FOR i IN 1..in_table_rec.constraint_arr.COUNT LOOP
-        l_constraint_rec := in_table_rec.constraint_arr(i);
-        l_constraint_rec.table_name := get_new_name(in_table_rec.rename_rec, in_rename_mode);
-        l_constraint_rec.constraint_name := get_new_name(in_table_rec.constraint_arr(i).rename_rec, in_rename_mode);
-        l_constraint_rec.rename_rec.current_name := get_new_name(in_table_rec.constraint_arr(i).rename_rec, in_rename_mode);
-
-        l_columns_list := l_columns_list||CHR(10)||REGEXP_REPLACE(get_add_constraint_clause(l_constraint_rec, NULL), 'ADD CONSTRAINT', 'CONSTRAINT', 1, 1)||',';
-      END LOOP;
-    END IF;
-    l_columns_list := TRIM(',' FROM l_columns_list);
-
-    IF NOT in_simple_mode AND in_table_rec.iot_name IS NOT NULL
-    THEN
-      l_iot_clause := 'ORGANIZATION INDEX '||
-                      get_clause(gc_pct_threshold, in_table_rec.iot_pct_threshold)||
-                      get_clause(gc_key_compression, in_table_rec.iot_key_compression, NULL, ' '||in_table_rec.iot_prefix_length)||
-                      get_clause(gc_mapping, in_table_rec.mapping_table);
-      IF in_table_rec.iot_include_column IS NOT NULL OR
-         in_table_rec.overflow_tablespace IS NOT NULL OR
-         in_table_rec.overflow_logging IS NOT NULL
-      THEN
-        l_iot_clause := l_iot_clause ||' '||
-                        gc_overflow ||' '||
-                        get_clause(gc_including_column, in_table_rec.iot_include_column)||
-                        get_clause(gc_tablespace, in_table_rec.overflow_tablespace, '"', '"')||
-                        get_clause(gc_logging, in_table_rec.overflow_logging);
-      END IF;
-    END IF;
-
-    IF in_table_rec.partitioned = 'YES' AND in_table_rec.subpartitioning_type = 'NONE'
-    THEN
-      l_partition_sql := 'PARTITION BY '||in_table_rec.partitioning_type||'('||convert_arr_to_str(in_table_rec.part_key_column_arr)||') ';
-      IF NOT in_all_partitions THEN
-        IF in_table_rec.partitioning_type IN ('RANGE', 'LIST', 'SYSTEM') THEN
-          l_partition_sql := l_partition_sql || '('||CHR(10)||get_partition_clause(in_table_rec.partition_arr(1), 'PARTITION') ||
-                              get_partition_desc_clause(
-                                in_partition_rec    => in_table_rec.partition_arr(1),
-                                in_subpartition_arr => in_table_rec.subpartition_arr
-                              )||CHR(10)||')';
-        END IF;
-      ELSE
-        l_partition_sql := l_partition_sql || '('||CHR(10)||get_partitions_sql(in_table_rec.partition_arr, in_table_rec.subpartition_arr)||CHR(10)||')';
-      END IF;
-    ELSIF in_table_rec.partitioned = 'YES' AND in_table_rec.subpartitioning_type <> 'NONE' THEN
-      l_partition_sql := 'PARTITION BY '||in_table_rec.partitioning_type||'('||convert_arr_to_str(in_table_rec.part_key_column_arr)||')'||CHR(10)||
-      '  SUBPARTITION BY '||in_table_rec.subpartitioning_type||'('||convert_arr_to_str(in_table_rec.subpart_key_column_arr)||')  ';
-      IF NOT in_all_partitions THEN
-        IF in_table_rec.partitioning_type IN ('RANGE', 'LIST', 'SYSTEM') THEN
-          l_partition_sql := l_partition_sql || '('||CHR(10)||get_partition_clause(in_table_rec.partition_arr(1), 'PARTITION') ||
-                              get_partition_desc_clause(
-                                in_partition_rec    => in_table_rec.partition_arr(1),
-                                in_subpartition_arr => in_table_rec.subpartition_arr
-                              )||CHR(10)||')';
-        END IF;
-      ELSE
-        l_partition_sql := l_partition_sql || '('||CHR(10)||get_partitions_sql(in_table_rec.partition_arr, in_table_rec.subpartition_arr)||CHR(10)||')';
-      END IF;
-    END IF;
-
-    l_create_sql := 'CREATE TABLE "'||in_table_rec.owner||'"."'||get_new_name(in_table_rec.rename_rec, in_rename_mode)||'" ('||l_columns_list||CHR(10)||')'||
-                    l_col_properties||CHR(10)||l_iot_clause||l_partition_sql;
-
-    l_drop_sql := 'DROP TABLE "'||in_table_rec.owner||'"."'||get_new_name(in_table_rec.rename_rec, in_rename_mode)||'"';
-
-    add_stmt(
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr,
-      in_frwd_stmt     => l_create_sql,
-      in_rlbk_stmt     => l_drop_sql
-    );
-
-  END create_clone_table_sql;
-
   -- exchanges source table partition (in_partition_name) with target table
   PROCEDURE exchange_partition(
     in_source_table_rec IN cort_exec_pkg.gt_table_rec,
     in_target_table_rec IN cort_exec_pkg.gt_table_rec,
     in_partition_rec    IN cort_exec_pkg.gt_partition_rec,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
     l_sql   VARCHAR2(32767);
   BEGIN
     l_sql := ' EXCHANGE '||in_partition_rec.partition_level||' '||in_partition_rec.partition_name||' WITH TABLE "'||in_target_table_rec.owner||'"."'||in_target_table_rec.rename_rec.current_name||'" INCLUDING INDEXES WITHOUT VALIDATION';
     add_alter_table_stmt(
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr,
+      io_change_arr    => io_change_arr,
       in_table_name    => in_source_table_rec.rename_rec.current_name,
       in_owner         => in_source_table_rec.owner,
-      in_frwd_clause   => l_sql,
-      in_rlbk_clause   => l_sql
+      in_change_clause => l_sql,
+      in_revert_clause => l_sql,
+      in_group_type    => 'EXCHANGE PARTITION'
     );
   END exchange_partition;
 
@@ -7278,7 +7301,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                 get_clause_by_name(l_clause_indx_arr, gc_hierarchy_option)||
                 get_clause_by_name(l_clause_indx_arr, gc_grant_option);
 
-    RETURN l_clause;
+    RETURN TRIM(l_clause);
 
   END get_grant_privilege_clause;
 
@@ -7298,72 +7321,31 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                 get_clause_by_name(l_clause_indx_arr, gc_on_table)||
                 get_clause_by_name(l_clause_indx_arr, gc_from);
 
-    RETURN l_clause;
+    RETURN TRIM(l_clause);
 
   END get_revoke_privilege_clause;
 
   -- return privileges statements
   PROCEDURE get_privileges_stmt(
-    in_privilege_arr         IN cort_exec_pkg.gt_privilege_arr,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_privilege_arr IN cort_exec_pkg.gt_privilege_arr,
+    io_change_arr    IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause VARCHAR2(32767);
-    l_rlbk_clause VARCHAR2(32767);
   BEGIN
     FOR i IN 1..in_privilege_arr.COUNT LOOP
       IF in_privilege_arr(i).grantee <> user THEN
-        l_frwd_clause := get_grant_privilege_clause(in_privilege_arr(i));
-        l_rlbk_clause := get_revoke_privilege_clause(in_privilege_arr(i));
-        io_frwd_alter_stmt_arr(io_frwd_alter_stmt_arr.COUNT+1) := TRIM(l_frwd_clause);
-        io_rlbk_alter_stmt_arr(io_rlbk_alter_stmt_arr.COUNT+1) := TRIM(l_rlbk_clause);
+        cort_exec_pkg.add_change(
+          io_change_arr,
+          cort_exec_pkg.change_rec(
+            in_group_type => 'PRIVILEGES',
+            in_change_sql => get_grant_privilege_clause(in_privilege_arr(i)),
+            in_revert_sql => get_revoke_privilege_clause(in_privilege_arr(i))
+          )
+        );
       END IF;
     END LOOP;
   END get_privileges_stmt;
 
-
-  -- copies table privileges
-  PROCEDURE copy_privileges(
-    in_source_table_rec      IN cort_exec_pkg.gt_table_rec,
-    io_target_table_rec      IN OUT cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  AS
-    l_indx        PLS_INTEGER;
-    l_col_name    arrays.gt_name;
-  BEGIN
-   io_target_table_rec.privilege_arr.DELETE;
-    FOR i IN 1..in_source_table_rec.privilege_arr.COUNT LOOP
-      l_col_name := in_source_table_rec.privilege_arr(i).column_name;
-      IF l_col_name IS NOT NULL THEN
-        IF in_source_table_rec.column_indx_arr.EXISTS(l_col_name) THEN
-          l_indx := in_source_table_rec.column_indx_arr(l_col_name);
-          l_col_name := NVL(in_source_table_rec.column_arr(l_indx).new_column_name,in_source_table_rec.column_arr(l_indx).column_name);
-          IF io_target_table_rec.column_indx_arr.EXISTS(l_col_name) THEN
-            l_indx := io_target_table_rec.privilege_arr.COUNT+1;
-            io_target_table_rec.privilege_arr(l_indx) := in_source_table_rec.privilege_arr(i);
-            io_target_table_rec.privilege_arr(l_indx).table_schema := io_target_table_rec.owner;
-            io_target_table_rec.privilege_arr(l_indx).table_name := io_target_table_rec.table_name;
-            io_target_table_rec.privilege_arr(l_indx).column_name := l_col_name;
-          END IF;
-        END IF;
-      ELSE
-        l_indx := io_target_table_rec.privilege_arr.COUNT+1;
-        io_target_table_rec.privilege_arr(l_indx) := in_source_table_rec.privilege_arr(i);
-        io_target_table_rec.privilege_arr(l_indx).table_schema := io_target_table_rec.owner;
-        io_target_table_rec.privilege_arr(l_indx).table_name := io_target_table_rec.table_name;
-      END IF;
-    END LOOP;
-
-    get_privileges_stmt(
-      in_privilege_arr         => io_target_table_rec.privilege_arr,
-      io_frwd_alter_stmt_arr   => io_frwd_alter_stmt_arr,
-      io_rlbk_alter_stmt_arr   => io_rlbk_alter_stmt_arr
-    );
-
-  END copy_privileges;
 
   FUNCTION get_create_trigger_clause(
     in_table_rec      IN cort_exec_pkg.gt_table_rec,
@@ -7404,88 +7386,63 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     RETURN l_clause;
   END get_create_trigger_clause;
 
-  FUNCTION get_drop_trigger_clause(
-    in_trigger_rec         IN cort_exec_pkg.gt_trigger_rec
-  )
-  RETURN CLOB
-  AS
-    l_clause            CLOB;
-  BEGIN
-    l_clause := TRIM(get_clause(gc_drop_trigger, in_trigger_rec.owner||'"."'||in_trigger_rec.rename_rec.current_name, '"','"'));
-    RETURN l_clause;
-  END get_drop_trigger_clause;
-
-  -- updates trigger
-  PROCEDURE update_trigger(
-    in_table_rec             IN cort_exec_pkg.gt_table_rec,
-    in_trigger_rec           IN cort_exec_pkg.gt_trigger_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  AS
-  BEGIN
-    io_frwd_alter_stmt_arr(io_frwd_alter_stmt_arr.COUNT+1) := get_create_trigger_clause(in_table_rec, in_trigger_rec);
-    io_frwd_alter_stmt_arr(io_frwd_alter_stmt_arr.COUNT+1) := get_drop_trigger_clause(in_trigger_rec);
-    io_rlbk_alter_stmt_arr(io_rlbk_alter_stmt_arr.COUNT+1) := NULL;
-    io_rlbk_alter_stmt_arr(io_rlbk_alter_stmt_arr.COUNT+1) := NULL;
-  END update_trigger;
 
   -- drops table triggers
   PROCEDURE drop_triggers(
-    in_table_rec             IN cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_table_rec  IN cort_exec_pkg.gt_table_rec,
+    io_change_arr IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause CLOB;
-    l_rlbk_clause CLOB;
   BEGIN
     FOR i IN 1..in_table_rec.trigger_arr.COUNT LOOP
-      l_frwd_clause := get_drop_trigger_clause(in_table_rec.trigger_arr(i));
-      l_rlbk_clause := get_create_trigger_clause(in_table_rec, in_table_rec.trigger_arr(i));
-      io_frwd_alter_stmt_arr(io_frwd_alter_stmt_arr.COUNT+1) := l_frwd_clause;
-      io_rlbk_alter_stmt_arr(io_rlbk_alter_stmt_arr.COUNT+1) := l_rlbk_clause;
+      cort_exec_pkg.add_change(
+        io_change_arr,
+        cort_exec_pkg.change_rec(
+          in_group_type => 'DROP TRIGGERS',
+          in_change_sql => get_drop_object_ddl('TRIGGER', in_table_rec.trigger_arr(i).rename_rec.current_name, in_table_rec.trigger_arr(i).owner),
+          in_revert_sql => get_create_trigger_clause(in_table_rec, in_table_rec.trigger_arr(i))
+        )
+      );
     END LOOP;
   END drop_triggers;
 
 
   -- copies table triggers
   PROCEDURE copy_triggers(
-    in_source_table_rec      IN cort_exec_pkg.gt_table_rec,
-    io_target_table_rec      IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    io_target_table_rec IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
-    l_frwd_clause CLOB;
-    l_rlbk_clause CLOB;
   BEGIN
     io_target_table_rec.trigger_arr := in_source_table_rec.trigger_arr;
     io_target_table_rec.trigger_indx_arr := in_source_table_rec.trigger_indx_arr;
     FOR i IN 1..io_target_table_rec.trigger_arr.COUNT LOOP
       io_target_table_rec.trigger_arr(i).table_name := io_target_table_rec.table_name;
       io_target_table_rec.trigger_arr(i).table_owner := io_target_table_rec.owner;
-
-      l_frwd_clause := get_create_trigger_clause(io_target_table_rec, io_target_table_rec.trigger_arr(i));
-      l_rlbk_clause := get_drop_trigger_clause(io_target_table_rec.trigger_arr(i));
-      io_frwd_alter_stmt_arr(io_frwd_alter_stmt_arr.COUNT+1) := l_frwd_clause;
-      io_rlbk_alter_stmt_arr(io_rlbk_alter_stmt_arr.COUNT+1) := l_rlbk_clause;
+      cort_exec_pkg.add_change(
+        io_change_arr,
+        cort_exec_pkg.change_rec(
+          in_group_type => 'COPY TRIGGERS',
+          in_change_sql => get_create_trigger_clause(io_target_table_rec, io_target_table_rec.trigger_arr(i)),
+          in_revert_sql => get_drop_object_ddl('TRIGGER', io_target_table_rec.trigger_arr(i).rename_rec.current_name, io_target_table_rec.trigger_arr(i).owner)
+        )
+      );
     END LOOP;
   END copy_triggers;
 
   -- copies table policies
   PROCEDURE copy_policies(
-    in_source_table_rec      IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec      IN cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr   IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
+    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
+    io_change_arr       IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
     l_policy_function  VARCHAR2(100);
     l_statement_types  VARCHAR2(100);
     l_rel_cols         VARCHAR2(32767);
-    l_frwd_clause      CLOB;
-    l_rlbk_clause      CLOB;
+    l_change_clause    CLOB;
+    l_revert_clause    CLOB;
   BEGIN
     FOR i IN 1..in_source_table_rec.policy_arr.COUNT LOOP
       IF in_source_table_rec.policy_arr(i).package IS NOT NULL THEN
@@ -7515,7 +7472,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       END LOOP;
       l_rel_cols := TRIM(',' FROM l_rel_cols);
 
-      l_frwd_clause := '
+      l_change_clause := '
   BEGIN
     DBMS_RLS.ADD_GROUPED_POLICY (
       object_schema         => ''"'||in_target_table_rec.owner||'"'',
@@ -7535,7 +7492,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     );
   END;';
 
-      l_rlbk_clause := '
+      l_revert_clause := '
   BEGIN
     DBMS_RLS.DROP_GROUPED_POLICY (
       object_schema         => '''||in_target_table_rec.owner||''',
@@ -7545,11 +7502,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     );
   END;';
 
-      io_frwd_alter_stmt_arr(io_frwd_alter_stmt_arr.COUNT+1) := l_frwd_clause;
-      io_rlbk_alter_stmt_arr(io_rlbk_alter_stmt_arr.COUNT+1) := l_rlbk_clause;
+      cort_exec_pkg.add_change(
+        io_change_arr,
+        cort_exec_pkg.change_rec(
+          in_group_type => 'COPY POLICIES',
+          in_change_sql => l_change_clause,
+          in_revert_sql => l_revert_clause
+        )
+      );
     END LOOP;
   END copy_policies;
-
+  
 
   -- returns list of individual partitions clauses
   FUNCTION get_partitions_sql(
@@ -7709,6 +7672,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_result          VARCHAR2(32767);
     l_source_type     VARCHAR2(30);
     l_target_type     VARCHAR2(30);
+    l_adt_rec         cort_exec_pkg.gt_adt_rec;
   BEGIN
     l_source_type := in_source_column_rec.data_type;
     l_target_type := in_target_column_rec.data_type;
@@ -7734,61 +7698,18 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       IF in_source_column_rec.data_type = in_target_column_rec.data_type AND
          in_source_column_rec.data_type_owner = in_target_column_rec.data_type_owner
       THEN
-        debug('Convert data type '||in_source_column_rec.data_type_owner||'.'||l_source_type||' to '||in_target_column_rec.data_type_owner||'.'||l_target_type||' for column '||in_source_column_rec.column_name);
         l_result := '"'||in_source_column_rec.column_name||'"';
-      ELSE
+      ELSIF in_source_column_rec.data_type = 'VARCHAR2' AND in_source_column_rec.data_default LIKE 'CAST DATA AS "%"."%"' THEN
+        l_adt_rec := cort_exec_pkg.get_adt_rec(in_target_column_rec.data_type_owner, in_target_column_rec.data_type); 
+      
+        debug('Convert data type '||in_source_column_rec.data_type_owner||'.'||l_source_type||' to '||in_target_column_rec.data_type_owner||'.'||l_target_type||' for column '||in_source_column_rec.column_name);
+        
         l_result := 'NULL';
       END IF;
     END IF;
     RETURN l_result;
   END get_type_convert_expression;
-
-
-  -- Returns list of column name for INSERT statement and list of column values for SELECT statement from source table
-  PROCEDURE get_column_values_list(
-    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
-    out_columns_list    OUT NOCOPY CLOB,
-    out_values_list     OUT NOCOPY CLOB
-  )
-  AS
-    l_column_indx   PLS_INTEGER;
-    l_column_alias  VARCHAR2(100);
-  BEGIN
-    FOR i IN 1..in_target_table_rec.column_arr.COUNT LOOP
-      IF in_target_table_rec.column_arr(i).virtual_column = 'NO' AND
-         in_target_table_rec.column_arr(i).hidden_column = 'NO'
-      THEN
-        debug('Copying data for nonhidden, nonvirtual column '||in_target_table_rec.column_arr(i).column_name);
-        out_columns_list := out_columns_list||'"'||in_target_table_rec.column_arr(i).column_name||'",';
-        l_column_alias := ' AS "'||in_target_table_rec.column_arr(i).column_name||'",';
-        IF in_source_table_rec.column_indx_arr.EXISTS(in_target_table_rec.column_arr(i).column_name) THEN
-          -- existing column
-          l_column_indx := in_source_table_rec.column_indx_arr(in_target_table_rec.column_arr(i).column_name);
-          -- column type was change or force to change data
-          IF in_target_table_rec.column_arr(i).cort_value IS NOT NULL AND
-             (in_target_table_rec.column_arr(i).cort_value_force OR comp_data_type(in_source_table_rec.column_arr(l_column_indx), in_target_table_rec.column_arr(i)) = 1)
-          THEN
-            -- update value
-            out_values_list := out_values_list||in_target_table_rec.column_arr(i).cort_value||l_column_alias;
-          ELSE
-            -- convert data type
-            out_values_list := out_values_list||get_type_convert_expression(in_source_table_rec.column_arr(l_column_indx), in_target_table_rec.column_arr(i), cort_exec_pkg.g_params.alias.get_value)||l_column_alias;
-          END IF;
-        ELSIF in_target_table_rec.column_arr(i).cort_value IS NOT NULL
-        THEN
-          out_values_list := out_values_list||in_target_table_rec.column_arr(i).cort_value||l_column_alias;
-        ELSE
-          out_values_list := out_values_list||NVL(in_target_table_rec.column_arr(i).data_default,'NULL')||l_column_alias;
-        END IF;
-      ELSE
-        debug('Not copying data for hidden or virtual column '||in_target_table_rec.column_arr(i).column_name);
-      END IF;
-    END LOOP;
-    out_values_list := TRIM(',' FROM out_values_list);
-    out_columns_list := TRIM(',' FROM out_columns_list);
-  END get_column_values_list;
-
+  
 
   -- Returns rename table DDL
   FUNCTION get_rename_table_ddl(
@@ -7867,57 +7788,121 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- rename object
   PROCEDURE rename_object(
-    in_rename_mode   IN VARCHAR2,
-    io_rename_rec    IN OUT NOCOPY cort_exec_pkg.gt_rename_rec,
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_rename_mode IN VARCHAR2,
+    io_rename_rec  IN OUT NOCOPY cort_exec_pkg.gt_rename_rec,
+    io_change_arr  IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   AS
     l_new_name arrays.gt_name;
   BEGIN
     l_new_name := get_new_name(io_rename_rec, in_rename_mode);
     IF io_rename_rec.current_name <> l_new_name THEN
-      CASE io_rename_rec.object_type
+      CASE io_rename_rec.object_type 
       WHEN 'TABLE' THEN
-        io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := get_rename_table_ddl(io_rename_rec.object_owner, io_rename_rec.current_name, l_new_name);
-        io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := get_rename_table_ddl(io_rename_rec.object_owner, l_new_name, io_rename_rec.current_name);
+        cort_exec_pkg.add_change(
+          io_change_arr,
+          cort_exec_pkg.change_rec(
+            in_group_type => 'RENAME TABLE',
+            in_change_sql => get_rename_table_ddl(io_rename_rec.object_owner, io_rename_rec.current_name, l_new_name),
+            in_revert_sql => get_rename_table_ddl(io_rename_rec.object_owner, l_new_name, io_rename_rec.current_name)
+          )
+        );
       WHEN 'INDEX' THEN
-        io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := get_rename_index_ddl(io_rename_rec.object_owner, io_rename_rec.current_name, l_new_name);
-        io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := get_rename_index_ddl(io_rename_rec.object_owner, l_new_name, io_rename_rec.current_name);
+        cort_exec_pkg.add_change(
+          io_change_arr,
+          cort_exec_pkg.change_rec(
+            in_group_type => 'RENAME INDEX',
+            in_change_sql => get_rename_index_ddl(io_rename_rec.object_owner, io_rename_rec.current_name, l_new_name),
+            in_revert_sql => get_rename_index_ddl(io_rename_rec.object_owner, l_new_name, io_rename_rec.current_name)
+          )
+        );
       WHEN 'CONSTRAINT' THEN
-        io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := get_rename_constraint_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.current_name, l_new_name);
-        io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := get_rename_constraint_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, l_new_name, io_rename_rec.current_name);
+        cort_exec_pkg.add_change(
+          io_change_arr,
+          cort_exec_pkg.change_rec(
+            in_group_type => 'RENAME CONSTRAINT',
+            in_change_sql => get_rename_constraint_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.current_name, l_new_name),
+            in_revert_sql => get_rename_constraint_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, l_new_name, io_rename_rec.current_name)
+          )
+        );
       WHEN 'REFERENCE' THEN
-        io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := get_rename_constraint_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.current_name, l_new_name);
-        io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := get_rename_constraint_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, l_new_name, io_rename_rec.current_name);
+        cort_exec_pkg.add_change(
+          io_change_arr,
+          cort_exec_pkg.change_rec(
+            in_group_type => 'RENAME REF CONSTRAINT',
+            in_change_sql => get_rename_constraint_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.current_name, l_new_name),
+            in_revert_sql => get_rename_constraint_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, l_new_name, io_rename_rec.current_name)
+          )
+        );
       WHEN 'TRIGGER' THEN
-        io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := get_rename_trigger_ddl(io_rename_rec.object_owner, io_rename_rec.current_name, l_new_name);
-        io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := get_rename_trigger_ddl(io_rename_rec.object_owner, l_new_name, io_rename_rec.current_name);
+        cort_exec_pkg.add_change(
+          io_change_arr,
+          cort_exec_pkg.change_rec(
+            in_group_type => 'RENAME TRUGGER',
+            in_change_sql => get_rename_trigger_ddl(io_rename_rec.object_owner, io_rename_rec.current_name, l_new_name),
+            in_revert_sql => get_rename_trigger_ddl(io_rename_rec.object_owner, l_new_name, io_rename_rec.current_name)
+          )
+        );
       WHEN 'LOB' THEN
-        io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := get_rename_lob_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.lob_column_name, l_new_name);
-        io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := get_rename_lob_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.lob_column_name, io_rename_rec.current_name);
+        cort_exec_pkg.add_change(
+          io_change_arr,
+          cort_exec_pkg.change_rec(
+            in_group_type => 'RENAME LOB',
+            in_change_sql => get_rename_lob_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.lob_column_name, l_new_name),
+            in_revert_sql => get_rename_lob_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.lob_column_name, io_rename_rec.current_name)
+          )
+        );
       WHEN 'VARRAY' THEN
-        io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := get_rename_varray_lob_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.lob_column_name, l_new_name);
-        io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := get_rename_varray_lob_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.lob_column_name, io_rename_rec.current_name);
+        cort_exec_pkg.add_change(
+          io_change_arr,
+          cort_exec_pkg.change_rec(
+            in_group_type => 'RENAME VARRAY',
+            in_change_sql => get_rename_varray_lob_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.lob_column_name, l_new_name),
+            in_revert_sql => get_rename_varray_lob_ddl(io_rename_rec.object_owner, io_rename_rec.parent_object_name, io_rename_rec.lob_column_name, io_rename_rec.current_name)
+          )
+        );
       END CASE;
       io_rename_rec.current_name := l_new_name;
     END IF;
   END rename_object;
 
+  PROCEDURE rename_log_group(
+    in_rename_mode IN VARCHAR2,
+    io_log_group   IN OUT NOCOPY cort_exec_pkg.gt_log_group_rec,
+    io_change_arr  IN OUT NOCOPY cort_exec_pkg.gt_change_arr
+  )
+  AS
+    l_new_name arrays.gt_name;
+  BEGIN
+    l_new_name := get_new_name(io_log_group.rename_rec, in_rename_mode);
+    
+    drop_log_group(
+      in_log_group_rec => io_log_group,
+      io_change_arr    => io_change_arr
+    );
+    
+    io_log_group.log_group_name := l_new_name; 
+
+    add_log_group(
+      in_log_group_rec => io_log_group,
+      io_change_arr    => io_change_arr
+    );
+  END rename_log_group;
+  
+
   -- compares two structures of sequences.
   FUNCTION comp_sequences(
     in_source_sequence_rec IN cort_exec_pkg.gt_sequence_rec,
     in_target_sequence_rec IN cort_exec_pkg.gt_sequence_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_change_arr          IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
-    l_frwd_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_rlbk_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
+    l_change_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr   arrays.gt_xlstr_indx;
   BEGIN
     l_result := gc_result_nochange;
 
@@ -7928,68 +7913,67 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     -- min_value
     IF comp_value(in_source_sequence_rec.min_value, in_target_sequence_rec.min_value) = 1 THEN
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_min_value) := get_clause(gc_min_value, in_target_sequence_rec.min_value);
-      l_rlbk_clause_indx_arr(gc_min_value) := get_clause(gc_min_value, in_source_sequence_rec.min_value);
+      l_change_clause_indx_arr(gc_min_value) := get_clause(gc_min_value, in_target_sequence_rec.min_value);
+      l_revert_clause_indx_arr(gc_min_value) := get_clause(gc_min_value, in_source_sequence_rec.min_value);
     END IF;
 
     -- max_value
     IF comp_value(in_source_sequence_rec.max_value, in_target_sequence_rec.max_value) = 1 THEN
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_max_value) := get_clause(gc_max_value, in_target_sequence_rec.max_value);
-      l_rlbk_clause_indx_arr(gc_max_value) := get_clause(gc_max_value, in_source_sequence_rec.max_value);
+      l_change_clause_indx_arr(gc_max_value) := get_clause(gc_max_value, in_target_sequence_rec.max_value);
+      l_revert_clause_indx_arr(gc_max_value) := get_clause(gc_max_value, in_source_sequence_rec.max_value);
     END IF;
 
     -- increment_by
     IF comp_value(in_source_sequence_rec.increment_by, in_target_sequence_rec.increment_by) = 1 THEN
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_increment_by) := get_clause(gc_increment_by, in_target_sequence_rec.increment_by);
-      l_rlbk_clause_indx_arr(gc_increment_by) := get_clause(gc_increment_by, in_source_sequence_rec.increment_by);
+      l_change_clause_indx_arr(gc_increment_by) := get_clause(gc_increment_by, in_target_sequence_rec.increment_by);
+      l_revert_clause_indx_arr(gc_increment_by) := get_clause(gc_increment_by, in_source_sequence_rec.increment_by);
     END IF;
 
     -- cycle_flag
     IF comp_value(in_source_sequence_rec.cycle_flag, in_target_sequence_rec.cycle_flag) = 1 THEN
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_cycle_flag) := get_clause(gc_cycle_flag, in_target_sequence_rec.cycle_flag);
-      l_rlbk_clause_indx_arr(gc_cycle_flag) := get_clause(gc_cycle_flag, in_source_sequence_rec.cycle_flag);
+      l_change_clause_indx_arr(gc_cycle_flag) := get_clause(gc_cycle_flag, in_target_sequence_rec.cycle_flag);
+      l_revert_clause_indx_arr(gc_cycle_flag) := get_clause(gc_cycle_flag, in_source_sequence_rec.cycle_flag);
     END IF;
 
     -- order_flag
     IF comp_value(in_source_sequence_rec.order_flag, in_target_sequence_rec.order_flag) = 1 THEN
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_order_flag) := get_clause(gc_order_flag, in_target_sequence_rec.order_flag);
-      l_rlbk_clause_indx_arr(gc_order_flag) := get_clause(gc_order_flag, in_source_sequence_rec.order_flag);
+      l_change_clause_indx_arr(gc_order_flag) := get_clause(gc_order_flag, in_target_sequence_rec.order_flag);
+      l_revert_clause_indx_arr(gc_order_flag) := get_clause(gc_order_flag, in_source_sequence_rec.order_flag);
     END IF;
 
     -- cache_size
     IF comp_value(in_source_sequence_rec.cache_size, in_target_sequence_rec.cache_size) = 1 THEN
       l_result := gc_result_alter;
-      l_frwd_clause_indx_arr(gc_cache_size) := get_clause(gc_cache_size, in_target_sequence_rec.cache_size);
-      l_rlbk_clause_indx_arr(gc_cache_size) := get_clause(gc_cache_size, in_source_sequence_rec.cache_size);
+      l_change_clause_indx_arr(gc_cache_size) := get_clause(gc_cache_size, in_target_sequence_rec.cache_size);
+      l_revert_clause_indx_arr(gc_cache_size) := get_clause(gc_cache_size, in_source_sequence_rec.cache_size);
     END IF;
 
-    l_frwd_clause := get_clause_by_name(l_frwd_clause_indx_arr, gc_min_value)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_max_value)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_increment_by)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_cycle_flag)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_order_flag)||
-                     get_clause_by_name(l_frwd_clause_indx_arr, gc_cache_size);
+    l_change_clause := get_clause_by_name(l_change_clause_indx_arr, gc_min_value)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_max_value)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_increment_by)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_cycle_flag)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_order_flag)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_cache_size);
 
 
-    l_rlbk_clause := get_clause_by_name(l_rlbk_clause_indx_arr, gc_min_value)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_max_value)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_increment_by)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_cycle_flag)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_order_flag)||
-                     get_clause_by_name(l_rlbk_clause_indx_arr, gc_cache_size);
+    l_revert_clause := get_clause_by_name(l_revert_clause_indx_arr, gc_min_value)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_max_value)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_increment_by)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_cycle_flag)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_order_flag)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_cache_size);
 
     IF l_result = gc_result_alter THEN
       add_alter_sequence_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
-        in_sequence_name => in_source_sequence_rec.sequence_name,
-        in_owner         => in_source_sequence_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        io_change_arr     => io_change_arr,
+        in_sequence_name  => in_source_sequence_rec.sequence_name,
+        in_owner          => in_source_sequence_rec.owner,
+        in_change_clause  => l_change_clause,
+        in_revert_clause  => l_revert_clause
       );
     END IF;
 
@@ -8016,18 +8000,37 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     RETURN l_clause;
   END get_sequence_sql;
 
+  -- returns type attribute clause
+  FUNCTION get_type_attribute(in_attribute_rec IN cort_exec_pkg.gt_type_attr_rec)
+  RETURN VARCHAR2
+  AS
+    l_clause VARCHAR2(32767);
+  BEGIN
+    IF in_attribute_rec.length IS NOT NULL THEN
+      l_clause := '"'||in_attribute_rec.attr_name||'" '||in_attribute_rec.attr_type_name||'('||in_attribute_rec.length||')';
+    ELSIF in_attribute_rec.precision IS NOT NULL THEN
+      l_clause := '"'||in_attribute_rec.attr_name||'" '||in_attribute_rec.attr_type_name||'('||in_attribute_rec.precision||','||in_attribute_rec.scale||')';
+    ELSIF in_attribute_rec.scale IS NOT NULL AND in_attribute_rec.precision IS NULL THEN
+      l_clause := '"'||in_attribute_rec.attr_name||'" '||in_attribute_rec.attr_type_name||'('||in_attribute_rec.scale||')';
+    ELSIF in_attribute_rec.attr_type_owner IS NOT NULL THEN
+      l_clause := '"'||in_attribute_rec.attr_name||'" '||in_attribute_rec.attr_type_mod||' "'||in_attribute_rec.attr_type_owner||'"."'||in_attribute_rec.attr_type_name||'"';
+    ELSE
+      l_clause := '"'||in_attribute_rec.attr_name||'" '||in_attribute_rec.attr_type_name;
+    END IF;
+    RETURN l_clause;
+  END get_type_attribute;
+
   -- compares type attributes.
   FUNCTION comp_type_attributes(
-    in_source_type_rec     IN cort_exec_pkg.gt_type_rec,
-    in_target_type_rec     IN cort_exec_pkg.gt_type_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_type_rec IN cort_exec_pkg.gt_adt_rec,
+    in_target_type_rec IN cort_exec_pkg.gt_adt_rec,
+    io_change_arr      IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
     l_result                 PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
+    l_change_clause          CLOB;
+    l_revert_clause          CLOB;
     l_indx                   PLS_INTEGER;
     l_drop_cnt               PLS_INTEGER;
     l_name                   arrays.gt_name;
@@ -8040,9 +8043,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       l_name := in_source_type_rec.attribute_arr(i).attr_name;
       debug('checking attribute '||l_name);
       IF in_target_type_rec.attribute_ind_arr.EXISTS(l_name) THEN
-        debug('attribute '||l_name||' found in new table');
+        debug('attribute '||l_name||' found in new type');
         IF in_target_type_rec.attribute_ind_arr(l_name) = l_indx THEN
-          debug('attribute '||l_name||' found in new table on position '||l_indx);
+          debug('attribute '||l_name||' found in new type on position '||l_indx);
           IF comp_value(in_source_type_rec.attribute_arr(i).attr_name, in_target_type_rec.attribute_arr(l_indx).attr_name) = 1 OR
              comp_value(in_source_type_rec.attribute_arr(i).attr_type_mod, in_target_type_rec.attribute_arr(l_indx).attr_type_mod) = 1 OR
              comp_value(in_source_type_rec.attribute_arr(i).attr_type_owner, in_target_type_rec.attribute_arr(l_indx).attr_type_owner) = 1 OR
@@ -8065,15 +8068,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                  RETURN gc_result_recreate;
                ELSE
                  debug('Modifying attribute '||in_source_type_rec.attribute_arr(i).attr_name);
-                 l_frwd_clause := 'MODIFY ATTRIBUTE '||in_source_type_rec.attribute_arr(i).attr_name||' '||in_source_type_rec.attribute_arr(i).attr_type_name||'('||in_target_type_rec.attribute_arr(l_indx).length||') CASCADE';
-                 l_rlbk_clause := null;
+                 l_change_clause := 'MODIFY ATTRIBUTE "'||in_source_type_rec.attribute_arr(i).attr_name||'" '||in_source_type_rec.attribute_arr(i).attr_type_name||'('||in_target_type_rec.attribute_arr(l_indx).length||') CASCADE';
+                 l_revert_clause := null;
                  add_alter_type_stmt(
-                   io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-                   io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+                   io_change_arr    => io_change_arr,
                    in_type_name     => in_source_type_rec.type_name,
                    in_owner         => in_source_type_rec.owner,
-                   in_frwd_clause   => l_frwd_clause,
-                   in_rlbk_clause   => l_rlbk_clause
+                   in_change_clause => l_change_clause,
+                   in_revert_clause => l_revert_clause
                  );
                 l_result := gc_result_alter;
                END IF;
@@ -8093,15 +8095,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                  RETURN gc_result_recreate;
                ELSE
                  debug('Modifying attribute '||in_source_type_rec.attribute_arr(i).attr_name);
-                 l_frwd_clause := 'MODIFY ATTRIBUTE '||in_source_type_rec.attribute_arr(i).attr_name||' '||in_source_type_rec.attribute_arr(i).attr_type_name||'('||in_target_type_rec.attribute_arr(l_indx).precision||','||in_target_type_rec.attribute_arr(l_indx).scale||') CASCADE';
-                 l_rlbk_clause := null;
+                 l_change_clause := 'MODIFY ATTRIBUTE "'||in_source_type_rec.attribute_arr(i).attr_name||'" '||in_source_type_rec.attribute_arr(i).attr_type_name||'('||in_target_type_rec.attribute_arr(l_indx).precision||','||in_target_type_rec.attribute_arr(l_indx).scale||') CASCADE';
+                 l_revert_clause := null;
                  add_alter_type_stmt(
-                   io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-                   io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+                   io_change_arr    => io_change_arr,
                    in_type_name     => in_source_type_rec.type_name,
                    in_owner         => in_source_type_rec.owner,
-                   in_frwd_clause   => l_frwd_clause,
-                   in_rlbk_clause   => l_rlbk_clause
+                   in_change_clause => l_change_clause,
+                   in_revert_clause => l_revert_clause
                  );
                  l_result := gc_result_alter;
                END IF;
@@ -8114,7 +8115,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           RETURN gc_result_recreate;
         END IF;
       ELSE
-        debug('attribute '||l_name||' not found in new table');
+        debug('attribute '||l_name||' not found in new type');
         -- drop
         debug('Dropping attribute '||in_source_type_rec.attribute_arr(i).attr_name);
         IF in_source_type_rec.attribute_arr(i).cluster_key OR
@@ -8124,15 +8125,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           debug('Attribute '||in_source_type_rec.attribute_arr(i).attr_name||' is part of the key');
           RETURN gc_result_recreate;
         END IF;
-        l_frwd_clause := 'DROP ATTRIBUTE '||in_source_type_rec.attribute_arr(i).attr_name||' CASCADE';
-        l_rlbk_clause := null;
+        l_change_clause := 'DROP ATTRIBUTE '||in_source_type_rec.attribute_arr(i).attr_name||' CASCADE';
+        l_revert_clause := 'ADD ATTRIBUTE '||get_type_attribute(in_source_type_rec.attribute_arr(i))||' CASCADE';
         add_alter_type_stmt(
-          io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+          io_change_arr    => io_change_arr,
           in_type_name     => in_source_type_rec.type_name,
           in_owner         => in_source_type_rec.owner,
-          in_frwd_clause   => l_frwd_clause,
-          in_rlbk_clause   => l_rlbk_clause
+          in_change_clause => l_change_clause,
+          in_revert_clause => l_revert_clause
         );
         l_result := gc_result_alter;
         l_drop_cnt := l_drop_cnt + 1;
@@ -8148,24 +8148,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     FOR i IN l_indx..in_target_type_rec.attribute_arr.COUNT LOOP
       -- add
       debug('Adding attribute '||in_target_type_rec.attribute_arr(i).attr_name);
-      IF in_target_type_rec.attribute_arr(i).length IS NOT NULL THEN
-        l_frwd_clause := 'ADD ATTRIBUTE '||in_target_type_rec.attribute_arr(i).attr_name||' '||in_target_type_rec.attribute_arr(i).attr_type_name||'('||in_target_type_rec.attribute_arr(i).length||') CASCADE';
-      ELSIF in_target_type_rec.attribute_arr(i).precision IS NOT NULL THEN
-        l_frwd_clause := 'ADD ATTRIBUTE '||in_target_type_rec.attribute_arr(i).attr_name||' '||in_target_type_rec.attribute_arr(i).attr_type_name||'('||in_target_type_rec.attribute_arr(i).precision||','||in_target_type_rec.attribute_arr(i).scale||') CASCADE';
-      ELSIF in_target_type_rec.attribute_arr(i).scale IS NOT NULL AND in_target_type_rec.attribute_arr(i).precision IS NULL THEN
-        l_frwd_clause := 'ADD ATTRIBUTE '||in_target_type_rec.attribute_arr(i).attr_name||' '||in_target_type_rec.attribute_arr(i).attr_type_name||'('||in_target_type_rec.attribute_arr(i).scale||') CASCADE';
-      ELSE
-        l_frwd_clause := 'ADD ATTRIBUTE '||in_target_type_rec.attribute_arr(i).attr_name||' '||in_target_type_rec.attribute_arr(i).attr_type_name||' CASCADE';
-      END IF;
-
-      l_rlbk_clause := 'DROP ATTRIBUTE '||in_target_type_rec.attribute_arr(i).attr_name||' CASCADE';
+      l_change_clause := 'ADD ATTRIBUTE '||get_type_attribute(in_target_type_rec.attribute_arr(i))||' CASCADE';
+      l_revert_clause := 'DROP ATTRIBUTE '||in_target_type_rec.attribute_arr(i).attr_name||' CASCADE';
       add_alter_type_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_type_name     => in_source_type_rec.type_name,
         in_owner         => in_source_type_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause
       );
       l_result := gc_result_alter;
     END LOOP;
@@ -8241,9 +8231,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         l_params := l_params ||'
         '|| in_method_rec.parameter_arr(i).param_name||' '||in_method_rec.parameter_arr(i).param_mode||' '||in_method_rec.parameter_arr(i).param_type_mod||' ';
         IF in_method_rec.parameter_arr(i).param_type_owner IS NOT NULL THEN
-          l_params := l_params || '"'||in_method_rec.parameter_arr(i).param_type_owner||'".';
+          l_params := l_params || '"'||in_method_rec.parameter_arr(i).param_type_owner||'"."'||in_method_rec.parameter_arr(i).param_type_name||'",';
+        ELSE
+          l_params := l_params || in_method_rec.parameter_arr(i).param_type_name||',';
         END IF;
-        l_params := l_params || '"'||in_method_rec.parameter_arr(i).param_type_name||'",';
       END LOOP;
       IF l_params IS NOT NULL THEN
         l_params := TRIM(',' FROM l_params);
@@ -8324,10 +8315,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   END is_same_method;
 
   FUNCTION comp_type_methods(
-    in_source_type_rec     IN cort_exec_pkg.gt_type_rec,
-    in_target_type_rec     IN cort_exec_pkg.gt_type_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_type_rec IN cort_exec_pkg.gt_type_rec,
+    in_target_type_rec IN cort_exec_pkg.gt_type_rec,
+    io_change_arr      IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
@@ -8385,12 +8375,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
 
     add_alter_type_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+      io_change_arr    => io_change_arr,
       in_type_name     => in_source_type_rec.type_name,
       in_owner         => in_source_type_rec.owner,
-      in_frwd_clause   => l_drop_sql,
-      in_rlbk_clause   => l_add_sql
+      in_change_clause => l_drop_sql,
+      in_revert_clause => l_add_sql
     );
 
     l_add_sql := NULL;
@@ -8416,91 +8405,103 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
 
     add_alter_type_stmt(
-      io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+      io_change_arr    => io_change_arr,
       in_type_name     => in_source_type_rec.type_name,
       in_owner         => in_source_type_rec.owner,
-      in_frwd_clause   => l_add_sql,
-      in_rlbk_clause   => l_drop_sql
+      in_change_clause => l_add_sql,
+      in_revert_clause => l_drop_sql
     );
     RETURN l_result;
   END comp_type_methods;
 
   -- compares two structures of types.
   FUNCTION comp_types(
-    in_source_type_rec     IN cort_exec_pkg.gt_type_rec,
-    in_target_type_rec     IN cort_exec_pkg.gt_type_rec,
-    io_frwd_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    in_source_type_rec IN cort_exec_pkg.gt_type_rec,
+    in_target_type_rec IN cort_exec_pkg.gt_type_rec,
+    io_change_arr      IN OUT NOCOPY cort_exec_pkg.gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
-    l_result                 PLS_INTEGER;
-    l_comp_result            PLS_INTEGER;
-    l_frwd_clause            CLOB;
-    l_rlbk_clause            CLOB;
-    l_frwd_clause_indx_arr   arrays.gt_xlstr_indx;
-    l_rlbk_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_result                   PLS_INTEGER;
+    l_comp_result              PLS_INTEGER;
+    l_change_clause            CLOB;
+    l_revert_clause            CLOB;
+    l_change_clause_indx_arr   arrays.gt_xlstr_indx;
+    l_revert_clause_indx_arr   arrays.gt_xlstr_indx;
   BEGIN
     l_result := gc_result_nochange;
 
-    IF comp_value(in_source_type_rec.incomplete, in_target_type_rec.incomplete) = 1 OR
-       comp_value(in_source_type_rec.supertype_owner, in_target_type_rec.supertype_owner) = 1 OR
+    IF comp_value(in_source_type_rec.typecode, in_target_type_rec.typecode) = 1 THEN
+      debug('Typecode compare = '||gc_result_recreate);
+      RETURN gc_result_recreate;
+    END IF;
+    
+    IF comp_value(in_source_type_rec.supertype_owner, in_target_type_rec.supertype_owner) = 1 OR
        comp_value(in_source_type_rec.supertype_name, in_target_type_rec.supertype_name) = 1
     THEN
-      debug('Basic compare = '||gc_result_recreate);
+      debug('Super type compare = '||gc_result_recreate);
       RETURN gc_result_recreate;
     END IF;
 
     IF comp_value(in_source_type_rec.final, in_target_type_rec.final) = 1 THEN
-      IF in_source_type_rec.subtype_dependency THEN
+      IF in_source_type_rec.type_dependency_arr.COUNT > 1 THEN
         l_result := gc_result_create;
       ELSE
         l_result := gc_result_alter;
-        l_frwd_clause_indx_arr(gc_final) := get_clause(gc_final, in_target_type_rec.final);
-        l_rlbk_clause_indx_arr(gc_final) := get_clause(gc_final, in_source_type_rec.final);
+        l_change_clause_indx_arr(gc_final) := get_clause(gc_final, in_target_type_rec.final);
+        l_revert_clause_indx_arr(gc_final) := get_clause(gc_final, in_source_type_rec.final);
       END IF;
     END IF;
 
     IF comp_value(in_source_type_rec.instantiable, in_target_type_rec.instantiable) = 1 THEN
-      IF in_source_type_rec.table_dependency THEN
+      IF in_source_type_rec.table_dependency_arr.COUNT > 1 THEN
         l_result := gc_result_create;
       ELSE
         l_result := gc_result_alter;
-        l_frwd_clause_indx_arr(gc_instantiable) := get_clause(gc_instantiable, in_target_type_rec.instantiable);
-        l_rlbk_clause_indx_arr(gc_instantiable) := get_clause(gc_instantiable, in_source_type_rec.instantiable);
+        l_change_clause_indx_arr(gc_instantiable) := get_clause(gc_instantiable, in_target_type_rec.instantiable);
+        l_revert_clause_indx_arr(gc_instantiable) := get_clause(gc_instantiable, in_source_type_rec.instantiable);
       END IF;
     END IF;
 
+    $IF dbms_db_version.version >= 18 $THEN
+    IF comp_value(in_source_type_rec.persistable, in_target_type_rec.persistable) = 1 THEN
+      IF in_source_type_rec.table_dependency_arr.COUNT > 1 AND in_target_type_rec.persistable = 'YES' THEN
+        l_result := gc_result_create;
+      ELSE
+        l_result := gc_result_alter;
+        l_change_clause_indx_arr(gc_persistable) := get_clause(gc_persistable, in_target_type_rec.persistable);
+        l_revert_clause_indx_arr(gc_persistable) := get_clause(gc_persistable, in_source_type_rec.persistable);
+      END IF;
+    END IF;
+    $END
+
     IF l_result = gc_result_alter THEN
-      l_frwd_clause := get_clause_by_name(l_frwd_clause_indx_arr, gc_final)||
-                       get_clause_by_name(l_frwd_clause_indx_arr, gc_instantiable)||
+      l_change_clause := get_clause_by_name(l_change_clause_indx_arr, gc_final)||
+                       get_clause_by_name(l_change_clause_indx_arr, gc_instantiable)||
                        ' CASCADE INCLUDING TABLE DATA ';
 
 
-      l_rlbk_clause := get_clause_by_name(l_rlbk_clause_indx_arr, gc_final)||
-                       get_clause_by_name(l_rlbk_clause_indx_arr, gc_instantiable)||
+      l_revert_clause := get_clause_by_name(l_revert_clause_indx_arr, gc_final)||
+                       get_clause_by_name(l_revert_clause_indx_arr, gc_instantiable)||
                        ' CASCADE INCLUDING TABLE DATA ';
     END IF;
 
     IF l_result = gc_result_alter THEN
       add_alter_type_stmt(
-        io_frwd_stmt_arr => io_frwd_alter_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_alter_stmt_arr,
+        io_change_arr    => io_change_arr,
         in_type_name     => in_source_type_rec.type_name,
         in_owner         => in_source_type_rec.owner,
-        in_frwd_clause   => l_frwd_clause,
-        in_rlbk_clause   => l_rlbk_clause
+        in_change_clause => l_change_clause,
+        in_revert_clause => l_revert_clause
       );
     END IF;
 
     debug('Compare type params = '||l_result);
 
     l_comp_result := comp_type_attributes(
-                       in_source_type_rec     => in_source_type_rec,
-                       in_target_type_rec     => in_target_type_rec,
-                       io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                       io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                       in_source_type_rec => cort_exec_pkg.get_adt_rec(in_source_type_rec.owner,in_source_type_rec.type_name),
+                       in_target_type_rec => cort_exec_pkg.get_adt_rec(in_target_type_rec.owner,in_target_type_rec.type_name),
+                       io_change_arr      => io_change_arr
                      );
     l_result := GREATEST(l_result,l_comp_result);
     debug('Compare type attributes = '||l_comp_result);
@@ -8509,10 +8510,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END IF;
 
     l_comp_result := comp_type_methods(
-                       in_source_type_rec     => in_source_type_rec,
-                       in_target_type_rec     => in_target_type_rec,
-                       io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                       io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                       in_source_type_rec => in_source_type_rec,
+                       in_target_type_rec => in_target_type_rec,
+                       io_change_arr      => io_change_arr
                      );
     l_result := GREATEST(l_result,l_comp_result);
     debug('Compare type methods = '||l_comp_result);
@@ -8520,6 +8520,141 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     RETURN l_result;
 
   END comp_types;
+
+  -- returns create type sql
+  PROCEDURE create_type_sql(
+    in_type_rec        IN cort_exec_pkg.gt_type_rec,
+    io_change_arr      IN OUT NOCOPY cort_exec_pkg.gt_change_arr
+  )
+  AS
+    l_adt_rec cort_exec_pkg.gt_adt_rec;
+    l_sql     CLOB;
+  BEGIN
+    l_sql := 'CREATE TYPE "'||in_type_rec.owner||'"."'||in_type_rec.type_name||'" ';
+  
+    CASE in_type_rec.typecode
+    WHEN 'OBJECT' THEN
+      IF in_type_rec.supertype_name IS NULL THEN
+        l_sql := l_sql || ' AS OBJECT (';
+      ELSE
+        l_sql := l_sql || ' UNDER "'||in_type_rec.supertype_owner||'"."'||in_type_rec.supertype_name||'" (';
+      END IF;  
+      IF in_type_rec.local_attributes > 0 THEN 
+        l_adt_rec := cort_exec_pkg.get_adt_rec(in_type_rec.owner, in_type_rec.type_name);
+        FOR i IN 1..l_adt_rec.attribute_arr.COUNT LOOP
+          IF l_adt_rec.attribute_arr(i).inherited = 'NO' THEN
+            l_sql := l_sql || '
+  '||get_type_attribute(l_adt_rec.attribute_arr(i))||',';
+          END IF;
+        END LOOP;
+      END IF;
+      IF in_type_rec.local_methods > 0 THEN 
+        FOR i IN 1..in_type_rec.method_arr.COUNT LOOP
+          IF in_type_rec.method_arr(i).inherited = 'NO' THEN
+            l_sql := l_sql || '
+  '||get_method_clause(in_type_rec.method_arr(i))||',';
+          END IF;
+        END LOOP;
+      END IF;
+      l_sql := TRIM(',' FROM l_sql);
+      l_sql := l_sql || ')'||chr(13)||
+      get_clause(gc_final, in_type_rec.final)||chr(13)||
+      get_clause(gc_instantiable, in_type_rec.instantiable);
+      $IF dbms_db_version.version >= 18 $THEN
+      IF in_type_rec.supertype_name IS NULL THEN   
+        l_sql := l_sql ||chr(13)||get_clause(gc_persistable, in_type_rec.persistable);
+      END IF;
+      $END  
+    WHEN 'COLLECTION' THEN
+      cort_exec_pkg.raise_error('Objects with typecode '||in_type_rec.typecode||' are not supported');
+    ELSE
+      cort_exec_pkg.raise_error('Objects with typecode '||in_type_rec.typecode||' are not supported');
+    END CASE;
+
+    cort_exec_pkg.add_change(
+      io_change_arr,
+      cort_exec_pkg.change_rec(
+        in_group_type => 'RECREATE_TYPE',
+        in_change_sql => l_sql,  
+        in_revert_sql => get_drop_type_ddl(
+                           in_type_name => in_type_rec.type_name,
+                           in_owner     => in_type_rec.owner,
+                           in_force     => TRUE
+                         )
+      )
+    );
+
+    get_privileges_stmt(
+      in_privilege_arr => in_type_rec.privilege_arr,
+      io_change_arr    => io_change_arr
+    );
+
+  END create_type_sql;
+
+
+  -- returns create table sql
+  PROCEDURE create_table_sql(
+    in_table_rec       IN cort_exec_pkg.gt_table_rec,
+    io_change_arr      IN OUT NOCOPY cort_exec_pkg.gt_change_arr
+  )
+  AS
+    l_partition_sql  CLOB;
+    l_columns_list   VARCHAR2(32767);
+    l_col_prop       VARCHAR2(32767);
+    l_col_properties VARCHAR2(32767);
+  BEGIN
+    FOR i IN 1..in_table_rec.column_arr.COUNT LOOP
+      IF in_table_rec.column_arr(i).user_generated = 'YES' 
+      THEN
+        l_columns_list := l_columns_list||CHR(10)||'  '||RTRIM(get_column_clause(in_table_rec, in_table_rec.column_arr(i)))||',';
+        l_col_prop := get_column_properties(
+                        in_table_rec  => in_table_rec,
+                        in_column_rec => in_table_rec.column_arr(i)
+                      );
+        IF l_col_prop IS NOT NULL THEN
+          l_col_properties := l_col_properties||CHR(10)||l_col_prop;
+        END IF;
+      END IF;
+    END LOOP;
+    l_columns_list := TRIM(',' FROM l_columns_list);
+    
+    IF in_table_rec.partitioned = 'YES' AND in_table_rec.subpartitioning_type = 'NONE'
+    THEN
+      l_partition_sql := 'PARTITION BY '||in_table_rec.partitioning_type||'('||convert_arr_to_str(in_table_rec.part_key_column_arr)||') ';
+      l_partition_sql := l_partition_sql || '('||CHR(10)||get_partitions_sql(in_table_rec.partition_arr, in_table_rec.subpartition_arr)||CHR(10)||')';
+    ELSIF in_table_rec.partitioned = 'YES' AND in_table_rec.subpartitioning_type <> 'NONE' THEN
+      l_partition_sql := 'PARTITION BY '||in_table_rec.partitioning_type||'('||convert_arr_to_str(in_table_rec.part_key_column_arr)||')'||CHR(10)||
+      '  SUBPARTITION BY '||in_table_rec.subpartitioning_type||'('||convert_arr_to_str(in_table_rec.subpart_key_column_arr)||')  ';
+      l_partition_sql := l_partition_sql || '('||CHR(10)||get_partitions_sql(in_table_rec.partition_arr, in_table_rec.subpartition_arr)||CHR(10)||')';
+    END IF;
+
+    cort_exec_pkg.add_change(
+      io_change_arr,
+      cort_exec_pkg.change_rec(
+        in_group_type => 'CLONE TABLE',
+        in_change_sql => 'CREATE TABLE "'||in_table_rec.owner||'"."'||in_table_rec.rename_rec.temp_name||'" ('||l_columns_list||CHR(10)||')'||
+                         l_col_properties||CHR(10)||l_partition_sql,
+        in_revert_sql => get_drop_table_ddl(
+                           in_table_name => in_table_rec.table_name,
+                           in_owner      => in_table_rec.owner
+                         )
+      )
+    );
+
+    FOR i IN 1..in_table_rec.column_arr.COUNT LOOP
+      IF in_table_rec.column_arr(i).col_comment IS NOT NULL THEN
+        cort_exec_pkg.add_change(
+          io_change_arr, 
+          cort_exec_pkg.change_rec('COPY COMMENTS',  'COMMENT ON COLUMN "'||in_table_rec.owner||'"."'||in_table_rec.table_name||'"."'||in_table_rec.column_arr(i).column_name||'" IS Q''{'||in_table_rec.column_arr(i).col_comment||'}''')
+        );
+      END IF;
+    END LOOP;  
+
+    get_privileges_stmt(
+      in_privilege_arr => in_table_rec.privilege_arr,
+      io_change_arr    => io_change_arr
+    );
+  END create_table_sql;
 
   FUNCTION get_create_view_sql(in_view_rec IN cort_exec_pkg.gt_view_rec)
   RETURN CLOB

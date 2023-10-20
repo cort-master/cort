@@ -4,7 +4,7 @@ AS
 /*
 PL/SQL Utilities - Predefined PL/SQL Collection types 
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech

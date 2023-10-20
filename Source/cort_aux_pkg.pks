@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -36,7 +36,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
-  TYPE gt_object_metadata IS TABLE OF cort_objects%ROWTYPE INDEX BY PLS_INTEGER;
+  TYPE gt_object_changes IS TABLE OF cort_objects%ROWTYPE INDEX BY PLS_INTEGER;
+  
 
   /* Converts CLOB to strings arrays dbms_sql.varchar2a */
   PROCEDURE clob_to_varchar2a(
@@ -56,6 +57,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_delim    IN VARCHAR2 DEFAULT CHR(10),
     out_clob    OUT NOCOPY CLOB
   );
+
+  -- dbms_output for CLOB
+  PROCEDURE output(in_value IN CLOB);
 
   -- Check if objects was renamed in given release  
   FUNCTION is_object_renamed(
@@ -93,7 +97,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   RETURN VARCHAR2;
 
-  FUNCTION get_object_metadata(
+  FUNCTION get_object_changes(
     in_object_type   IN VARCHAR2,
     in_object_name   IN VARCHAR2,
     in_object_owner  IN VARCHAR2,
@@ -101,34 +105,26 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_release       IN VARCHAR2, 
     in_build         IN VARCHAR2 DEFAULT NULL 
   )
-  RETURN gt_object_metadata;
-
-  -- register object change in cort_objects table
+  RETURN gt_object_changes;
+  
+  -- register object change in cort_object, cort_sql tables
   PROCEDURE register_change(
-    in_object_type    IN VARCHAR2,
-    in_object_name    IN VARCHAR2,
-    in_object_owner   IN VARCHAR2,
     in_job_rec        IN cort_jobs%ROWTYPE,
-    in_sql            IN CLOB,
-    in_last_ddl_time  IN DATE,
     in_change_type    IN NUMBER,
-    in_revert_name    IN VARCHAR2,
-    in_last_ddl_index IN PLS_INTEGER,
-    in_frwd_stmt_arr  IN arrays.gt_clob_arr,
-    in_rlbk_stmt_arr  IN arrays.gt_clob_arr,
-    in_rename_name    IN VARCHAR2 DEFAULT NULL
+    in_revert_name    IN VARCHAR2 DEFAULT NULL
   );
 
-  PROCEDURE update_change(
-    in_rec IN cort_objects%ROWTYPE
-  );
+  FUNCTION get_change_sql(
+    in_job_id         IN TIMESTAMP
+  ) 
+  RETURN cort_exec_pkg.gt_change_arr;
 
   -- unregister object last change from cort_objects table
   PROCEDURE unregister_change(
-    in_object_type   IN VARCHAR2,
-    in_object_name   IN VARCHAR2,
-    in_object_owner  IN VARCHAR2,
-    in_exec_time     IN TIMESTAMP
+    in_job_id         IN TIMESTAMP,
+    in_object_type    IN VARCHAR2,
+    in_object_name    IN VARCHAR2,
+    in_object_owner   IN VARCHAR2
   );
   
   PROCEDURE copy_stats(
@@ -210,8 +206,26 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   -- revoke all grants on cort objects
   PROCEDURE revoke_grants(in_user_name in VARCHAR2);
 
-  -- return schema name where CORT is installed
-  FUNCTION get_cort_schema RETURN VARCHAR2;
+  -- bulk save sql statements into cort_sql table
+  PROCEDURE save_sql(
+    io_change_sql_arr IN OUT NOCOPY cort_exec_pkg.gt_change_arr
+  );
   
+  -- read status and timings from cort_sql table into collection
+  PROCEDURE read_sql(
+    io_change_sql_arr IN OUT NOCOPY cort_exec_pkg.gt_change_arr
+  );
+
+  PROCEDURE update_sql(
+    in_change_sql_arr IN cort_exec_pkg.gt_change_arr
+  );
+
+  PROCEDURE update_sql(
+    in_change_sql_rec IN cort_exec_pkg.gt_change_rec
+  );
+
+  -- return sql text by explain plan mask
+  FUNCTION get_explain_sql(in_xplan IN VARCHAR2) RETURN VARCHAR2;
+
 END cort_aux_pkg;
 /

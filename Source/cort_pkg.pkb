@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -34,11 +34,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   17.00   | Rustam Kafarov    | Use cort_jobs for rename/drop API
   19.00   | Rustam Kafarov    | Revised parameters
   20.00   | Rustam Kafarov    | Added support of long names introduced in Oracle 12.2 
+  21.00   | Rustam Kafarov    | Added get_cort_ddl, install, deinstall, compare_release_numbers routines
   ----------------------------------------------------------------------------------------------------------------------
 */
 
-  g_current_release         varchar2(20);
-  g_current_application     varchar2(20);
 
   /* Private */
   PROCEDURE check_param_is_not_null(
@@ -78,112 +77,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   /* Public */
 
-  -- Generic execution procedure which is called from job
-  PROCEDURE execute_action(
-    in_sid IN VARCHAR2
-  )
-  AS
-    l_rec        cort_jobs%ROWTYPE;
-    l_sql        CLOB;
-  BEGIN
-    -- assign job to current session
-    l_rec := cort_job_pkg.assign_job(
-               in_sid => in_sid
-             );
-    dbms_application_info.set_client_info('CORT_BUILD='||l_rec.build);
-
-    BEGIN
-      cort_aux_pkg.set_context(l_rec.action||'_'||l_rec.object_type,l_rec.object_name);
-      cort_session_pkg.disable;
-      cort_exec_pkg.init(
-        in_job_rec => l_rec
-      );
-
-      IF l_rec.sql_text IS NOT NULL THEN
-        dbms_lob.createtemporary(l_sql, true, dbms_lob.call);
-        dbms_lob.copy(l_sql, l_rec.sql_text, dbms_lob.getlength(l_rec.sql_text));
-        l_rec.sql_text := l_sql;
-        dbms_lob.freetemporary(l_sql);
-      END IF;
-
-      CASE l_rec.action
-      WHEN 'CREATE_OR_REPLACE' THEN
-        cort_exec_pkg.create_or_replace(
-          in_job_rec    => l_rec
-        );
-      WHEN 'EXPLAIN_PLAN_FOR' THEN
-        cort_exec_pkg.create_or_replace(
-          in_job_rec    => l_rec
-        );
-      WHEN 'DATA_COPY' THEN
-        cort_exec_pkg.resume_change(
-          in_job_rec    => l_rec
-        );
-      WHEN 'REGISTER' THEN
-        cort_exec_pkg.before_create_or_replace(
-          in_job_rec    => l_rec
-        );
-      WHEN 'RENAME' THEN
-        cort_exec_pkg.rename_table(
-          in_job_rec    => l_rec
-        );
-      WHEN 'ALTER' THEN
-        cort_exec_pkg.alter_object(
-          in_job_rec    => l_rec
-        );
-      WHEN 'DROP' THEN
-        cort_exec_pkg.drop_object(
-          in_job_rec    => l_rec
-        );
-      WHEN 'REVERT' THEN
-        cort_exec_pkg.revert_object(
-          in_job_rec    => l_rec
-        );
-      WHEN 'RESET' THEN
-        cort_exec_pkg.reset_object(
-          in_job_rec    => l_rec
-        );
-      $IF cort_options_pkg.gc_threading $THEN
-      WHEN 'THREADING' THEN
-        cort_thread_exec_pkg.process_thread(
-          in_job_rec    => l_rec
-        );
-      $END
-      END CASE;
-
-      cort_aux_pkg.set_context(l_rec.action||'_'||l_rec.object_type,NULL);
-      cort_session_pkg.enable;
-      l_rec := cort_job_pkg.get_job_rec(
-                 in_sid          => l_rec.sid,
-                 in_object_name  => l_rec.object_name,
-                 in_object_owner => l_rec.object_owner
-               );
-
-      IF l_rec.status = 'RUNNING' THEN
-        cort_job_pkg.success_job(in_rec => l_rec);
-      END IF;
-
-    EXCEPTION
-      WHEN OTHERS THEN
-        cort_log_pkg.error('Failed cort_pkg.execute_action');
-        IF sqlcode = -20900 THEN
-          cort_job_pkg.cancel_job(
-            in_rec             => l_rec,
-            in_error_message   => sqlerrm
-          );
-        ELSE
-          cort_job_pkg.fail_job(
-            in_rec             => l_rec,
-            in_error_message   => sqlerrm
-          );
-        END IF;
-        dbms_application_info.set_client_info(NULL);
-        cort_aux_pkg.set_context(l_rec.action||'_'||l_rec.object_type,NULL);
-        cort_session_pkg.enable;
-        RAISE;
-    END;
-  END execute_action;
-
   -- permanently enable CORT
   PROCEDURE enable
   AS
@@ -221,7 +114,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_object_type  IN VARCHAR2,
     in_object_name  IN VARCHAR2,
     in_object_owner IN VARCHAR2 ,
-    in_params_rec   IN cort_params_pkg.gt_params_rec
+    in_params_rec   IN cort_params_pkg.gt_run_params_rec
   )
   AS
     l_sql          CLOB;
@@ -266,7 +159,7 @@ END;';
     in_test         IN BOOLEAN  DEFAULT NULL   -- NULL - take from session param
   )
   AS
-    l_params_rec cort_params_pkg.gt_params_rec := cort_session_pkg.get_params;
+    l_params_rec cort_params_pkg.gt_run_params_rec := cort_session_pkg.get_params;
   BEGIN
     if in_test is not null then
       l_params_rec.test.set_value(in_test);
@@ -307,16 +200,13 @@ END;';
     BEGIN
       SELECT *
         INTO l_rec
-        FROM (SELECT *
-                FROM cort_objects
-               WHERE sid = dbms_session.unique_session_id
-               ORDER BY exec_time DESC)
-       WHERE ROWNUM = 1;
-    EXCEPTION
+        FROM cort_objects
+       WHERE job_id IN (SELECT MAX(job_id) FROM cort_jobs WHERE sid = dbms_session.unique_session_id);   
+     EXCEPTION
       WHEN NO_DATA_FOUND THEN
         cort_exec_pkg.raise_error('No CORT changes in current session');
     END;
-    IF l_rec.revert_ddl IS NOT NULL THEN
+    IF l_rec.object_name IS NOT NULL THEN
       revert_object(
         in_object_type  => l_rec.object_type,
         in_object_name  => l_rec.object_name,
@@ -343,15 +233,8 @@ END;';
 
     IF l_rec.action = 'CREATE_OR_REPLACE' THEN
 
-      l_rec.action := 'DATA_COPY';
-      l_rec.resume_action := 'RESUME_CHANGE';
-      l_rec.sql_text :=
-'BEGIN
-  cort_pkg.resume(
-    in_object_name   => '''||in_object_name||''',
-    in_object_owner  => '''||in_object_owner||'''
-  );
-END;';
+      l_rec.action := 'RESUME_RECREATE';
+      l_rec.sid := dbms_session.unique_session_id;
 
       cort_event_exec_pkg.resume_process(
         in_rec => l_rec
@@ -366,10 +249,12 @@ END;';
   PROCEDURE drop_object(
     in_object_type  IN VARCHAR2,
     in_object_name  IN VARCHAR2,
-    in_object_owner IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+    in_object_owner IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
+    in_purge        IN BOOLEAN DEFAULT NULL
   )
   AS
     l_sql          CLOB;
+    l_params_rec   cort_params_pkg.gt_run_params_rec;
   BEGIN
     l_sql :=
 'BEGIN
@@ -380,35 +265,44 @@ END;';
   );
 END;';
 
+    l_params_rec := cort_session_pkg.get_params;
+    IF in_purge IS NOT NULL THEN
+      l_params_rec.purge.set_value(in_purge);
+    END IF;
+    
     cort_event_exec_pkg.process_event(
       in_async        => FALSE,
       in_action       => 'DROP',
       in_object_type  => in_object_type,
       in_object_name  => in_object_name,
       in_object_owner => in_object_owner,
-      in_sql          => l_sql
+      in_sql          => l_sql,
+      in_params_rec   => l_params_rec
     );
   END drop_object;
 
   -- Wrapper for tables
   PROCEDURE drop_table(
     in_table_name   IN VARCHAR2,
-    in_table_owner  IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+    in_table_owner  IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
+    in_purge        IN BOOLEAN DEFAULT NULL
   )
   AS
   BEGIN
     drop_object(
       in_object_type  => 'TABLE',
       in_object_name  => in_table_name,
-      in_object_owner => in_table_owner
+      in_object_owner => in_table_owner,
+      in_purge        => in_purge
     );
   END drop_table;
 
   -- drop revert table if it exists
   PROCEDURE drop_revert_table(
-    in_table_name  IN VARCHAR2,
-    in_table_owner IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
-  )
+    in_table_name   IN VARCHAR2,
+    in_table_owner  IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
+    in_purge        IN BOOLEAN DEFAULT NULL
+)
   AS
     l_revert_name arrays.gt_name;
   BEGIN
@@ -421,7 +315,8 @@ END;';
     IF l_revert_name IS NOT NULL THEN
       drop_table(
         in_table_name   => l_revert_name,
-        in_table_owner  => in_table_owner
+        in_table_owner  => in_table_owner,
+        in_purge        => in_purge
       );
     END IF;
   END drop_revert_table;
@@ -538,7 +433,7 @@ END;';
   )
   AS
     l_rec             cort_releases%ROWTYPE;
-    l_object_metadata cort_aux_pkg.gt_object_metadata;
+    l_object_changes  cort_aux_pkg.gt_object_changes;
     l_application     cort_applications.application%TYPE;
   BEGIN
     check_param_is_not_null('in_release', in_release);
@@ -555,7 +450,7 @@ END;';
     IF (l_rec.release IS NULL) OR (in_release <> l_rec.release) THEN
 
       -- drop all revert tables and rename synonyms
-      l_object_metadata := cort_aux_pkg.get_object_metadata(
+      l_object_changes := cort_aux_pkg.get_object_changes(
                              in_object_type   => 'TABLE',
                              in_object_name   => NULL, -- all objects
                              in_object_owner  => NULL, -- all schemas
@@ -563,20 +458,20 @@ END;';
                              in_release       => l_rec.release
                            );
       -- drop temp objects from prev release
-      FOR i IN 1..l_object_metadata.COUNT LOOP
+      FOR i IN 1..l_object_changes.COUNT LOOP
         cort_event_exec_pkg.process_event(
           in_async        => FALSE,
           in_action       => 'RESET',
           in_object_type  => 'TABLE',
-          in_object_owner => l_object_metadata(i).object_owner,
-          in_object_name  => l_object_metadata(i).object_name,
+          in_object_owner => l_object_changes(i).object_owner,
+          in_object_name  => l_object_changes(i).object_name,
           in_sql          => 'begin cort_pkg.start_release(in_release => '''||in_release||'''); end;'
         );
       END LOOP;
 
       -- staring new release
       cort_aux_pkg.register_new_release(
-          in_application => l_application,
+        in_application => l_application,
         in_release     => in_release
       );
       END IF;
@@ -656,8 +551,8 @@ END;';
   AS
     l_rec             cort_builds%ROWTYPE;
     l_application     cort_applications.application%TYPE;
-    l_params          cort_params_pkg.gt_params_rec;
-    l_object_metadata cort_aux_pkg.gt_object_metadata;
+    l_params          cort_params_pkg.gt_run_params_rec;
+    l_object_changes  cort_aux_pkg.gt_object_changes;
   BEGIN
     l_params := cort_session_pkg.get_params;
     l_application := l_params.application.get_value;
@@ -671,7 +566,7 @@ END;';
       IF l_rec.build IS NOT NULL THEN
         -- revert schema changes first - apply in reverse order
         -- drop all revert tables and rename synonyms
-        l_object_metadata := cort_aux_pkg.get_object_metadata(
+        l_object_changes := cort_aux_pkg.get_object_changes(
                                in_object_type   => NULL, -- all objects
                                in_object_name   => NULL, -- all objects
                                in_object_owner  => NULL, -- all schemas
@@ -680,24 +575,24 @@ END;';
                                in_build         => l_rec.build
                              );
         -- revert non replacable objects in reverse order
-        FOR i IN REVERSE 1..l_object_metadata.COUNT LOOP
-          IF l_object_metadata(i).object_type IN ('TABLE','INDEX','INDEXES','SEQUENCE') THEN
+        FOR i IN REVERSE 1..l_object_changes.COUNT LOOP
+          IF l_object_changes(i).object_type IN ('TABLE','INDEX','INDEXES','SEQUENCE') THEN
             int_revert_object(
-              in_object_type  => l_object_metadata(i).object_type,
-              in_object_name  => l_object_metadata(i).object_name,
-              in_object_owner => l_object_metadata(i).object_owner,
+              in_object_type  => l_object_changes(i).object_type,
+              in_object_name  => l_object_changes(i).object_name,
+              in_object_owner => l_object_changes(i).object_owner,
               in_params_rec   => l_params
             );
           END IF;
         END LOOP;
 
         -- revert replacable object first
-        FOR i IN 1..l_object_metadata.COUNT LOOP
-          IF l_object_metadata(i).object_type NOT IN ('TABLE','INDEX','INDEXES','SEQUENCE') THEN
+        FOR i IN 1..l_object_changes.COUNT LOOP
+          IF l_object_changes(i).object_type NOT IN ('TABLE','INDEX','INDEXES','SEQUENCE') THEN
             int_revert_object(
-              in_object_type  => l_object_metadata(i).object_type,
-              in_object_name  => l_object_metadata(i).object_name,
-              in_object_owner => l_object_metadata(i).object_owner,
+              in_object_type  => l_object_changes(i).object_type,
+              in_object_name  => l_object_changes(i).object_name,
+              in_object_owner => l_object_changes(i).object_owner,
               in_params_rec   => l_params
             );
           END IF;
@@ -835,6 +730,7 @@ END;';
     FOR X IN (SELECT *
                 FROM user_triggers
                WHERE trigger_name like 'CORT%'
+              --   AND base_object_type = 'SCHEMA'
                ORDER BY trigger_name DESC) 
     LOOP
       l_sql := 'DROP TRIGGER '||x.trigger_name;
@@ -846,6 +742,7 @@ END;';
   PROCEDURE create_cort_triggers
   AS
     l_sql VARCHAR2(4000);
+    l_cnt NUMBER;
   BEGIN
     drop_cort_triggers;
 
@@ -858,9 +755,6 @@ WHEN (
       (cort_trg_pkg.get_execution_mode(ora_dict_obj_type) = 'REPLACE')
      )
 BEGIN
-  dbms_output.put_line('in trigger: session_user = '||sys_context('userenv','session_user'));
-  dbms_output.put_line('in trigger: current_user = '||sys_context('userenv','current_user'));
-  dbms_output.put_line('in trigger: current_schema = '||sys_context('userenv','current_schema'));
   cort_trg_pkg.instead_of_create;
 END;}';   
     dbms_output.put_line(l_sql);
@@ -893,30 +787,91 @@ END;}';
     dbms_output.put_line(l_sql);
     EXECUTE IMMEDIATE l_sql;
 
+
+    SELECT COUNT(*)
+      INTO l_cnt
+      FROM user_tables
+     WHERE table_name = 'PLAN_TABLE';
+   
+    IF l_cnt = 0 THEN
+      l_sql := q'{
+CREATE GLOBAL TEMPORARY TABLE PLAN_TABLE
+(
+  STATEMENT_ID       VARCHAR2(30 BYTE),
+  PLAN_ID            NUMBER,
+  TIMESTAMP          DATE,
+  REMARKS            VARCHAR2(4000 BYTE),
+  OPERATION          VARCHAR2(4000 BYTE),
+  OPTIONS            VARCHAR2(255 BYTE),
+  OBJECT_NODE        VARCHAR2(128 BYTE),
+  OBJECT_OWNER       VARCHAR2(30 BYTE),
+  OBJECT_NAME        VARCHAR2(30 BYTE),
+  OBJECT_ALIAS       VARCHAR2(65 BYTE),
+  OBJECT_INSTANCE    INTEGER,
+  OBJECT_TYPE        VARCHAR2(30 BYTE),
+  OPTIMIZER          VARCHAR2(255 BYTE),
+  SEARCH_COLUMNS     NUMBER,
+  ID                 INTEGER,
+  PARENT_ID          INTEGER,
+  DEPTH              INTEGER,
+  POSITION           INTEGER,
+  COST               INTEGER,
+  CARDINALITY        INTEGER,
+  BYTES              INTEGER,
+  OTHER_TAG          VARCHAR2(255 BYTE),
+  PARTITION_START    VARCHAR2(255 BYTE),
+  PARTITION_STOP     VARCHAR2(255 BYTE),
+  PARTITION_ID       INTEGER,
+  OTHER              LONG,
+  OTHER_XML          CLOB,
+  DISTRIBUTION       VARCHAR2(30 BYTE),
+  CPU_COST           INTEGER,
+  IO_COST            INTEGER,
+  TEMP_SPACE         INTEGER,
+  ACCESS_PREDICATES  VARCHAR2(4000 BYTE),
+  FILTER_PREDICATES  VARCHAR2(4000 BYTE),
+  PROJECTION         VARCHAR2(4000 BYTE),
+  TIME               INTEGER,
+  QBLOCK_NAME        VARCHAR2(30 BYTE)
+)
+ON COMMIT PRESERVE ROWS}';
+
+      dbms_output.put_line(l_sql);
+      EXECUTE IMMEDIATE l_sql;
+    END IF;    
+    
     l_sql := q'{
-CREATE OR REPLACE TRIGGER cort_lock_object_trg BEFORE DDL ON schema
-WHEN (
-      (cort_trg_pkg.get_status = 'ENABLED') AND 
-      (ora_dict_obj_type in ('TABLE','TYPE','SEQUENCE','INDEX')) AND
-      (ora_dict_obj_owner NOT IN ('SYS','SYSTEM')) 
-     )
+CREATE OR REPLACE TRIGGER cort_before_xplan_trg BEFORE INSERT ON PLAN_TABLE FOR EACH ROW
+DECLARE
+  PRAGMA AUTONOMOUS_TRANSACTION;
 BEGIN
-  cort_trg_pkg.lock_object;
-END;}';  
+  IF cort_trg_pkg.get_status = 'ENABLED' THEN
+    cort_trg_pkg.before_insert_xplan(
+      io_id           => :new.id,
+      io_parent_id    => :new.parent_id,
+      io_depth        => :new.depth,  
+      io_operation    => :new.operation,
+      in_statement_id => :new.statement_id,
+      in_plan_id      => :new.plan_id,
+      in_timestamp    => :new.timestamp, 
+      out_other_xml   => :new.other_xml,  
+      out_revert_ddl  => :new.access_predicates  
+    );
+  END IF;
+  COMMIT;
+END;}';
+
     dbms_output.put_line(l_sql);
     EXECUTE IMMEDIATE l_sql;
 
-  EXCEPTION
-    WHEN OTHERS THEN
-      RAISE_APPLICATION_ERROR(-20000, 'CREATE TRIGGER privilege is required. '||sqlerrm);
+
   END create_cort_triggers;
 
   -- install cort synonyms, triggers, grants into separate schema 
   PROCEDURE install
   AS
     l_sql               VARCHAR2(4000);
-    l_cort_objects_arr  arrays.gt_name_arr;
-    l_cort_schema       arrays.gt_name := cort_aux_pkg.get_cort_schema;
+    l_cort_schema       arrays.gt_name := $$PLSQL_UNIT_OWNER;
     l_cnt               NUMBER;
   BEGIN
     IF user <> l_cort_schema THEN  
@@ -947,36 +902,15 @@ END;}';
         RAISE_APPLICATION_ERROR(-20000,'CREATE SYNONYM privilege is require');
       END IF;
       
-      cort_aux_pkg.obtain_grants(sys_context('userenv','current_user'));
-      SELECT object_name
-        BULK COLLECT
-        INTO l_cort_objects_arr
-        FROM (SELECT DISTINCT object_name
-                FROM all_procedures
-               WHERE object_name like 'CORT%'
-                 AND owner = l_cort_schema
-                 AND object_type = 'PACKAGE'
-               UNION ALL
-              SELECT DISTINCT object_name
-                FROM all_objects
-               WHERE object_name like 'CORT%'
-                 AND owner = l_cort_schema
-                 AND object_type IN ('TABLE','VIEW')
-                 AND object_name IN (
-                    'CORT_OBJECTS',
-                    'CORT_JOBS',
-                    'CORT_JOB_LOG',
-                    'CORT_LOG',
-                    'CORT_RELEASES',
-                    'CORT_BUILDS',
-                    'CORT_RECENT_JOBS',
-                    'CORT_RECENT_OBJECTS',
-                    'CORT_USER_PARAMS'
-                  )
-                ); 
-
-      FOR i IN 1..l_cort_objects_arr.COUNT LOOP
-        l_sql := 'CREATE OR REPLACE SYNONYM '||l_cort_objects_arr(i)||' FOR "'||l_cort_schema||'".'||l_cort_objects_arr(i);
+      cort_aux_pkg.obtain_grants(user);
+      
+      FOR X IN (SELECT object_name, object_type
+                   FROM all_objects
+                  WHERE object_name like 'CORT%'
+                    AND owner = l_cort_schema
+               )
+      LOOP         
+        l_sql := 'CREATE OR REPLACE SYNONYM '||x.object_name||' FOR "'||l_cort_schema||'".'||x.object_name;
         dbms_output.put_line(l_sql);
         EXECUTE IMMEDIATE l_sql;
       END LOOP;
@@ -985,14 +919,15 @@ END;}';
     END IF;   
   END install;
   
-  -- deinstall cort synonyms, triggers, grants from separate schema 
-  PROCEDURE deinstall
+  -- uninstall cort synonyms, triggers, grants from separate schema 
+  PROCEDURE uninstall
   AS
-    l_cort_schema       arrays.gt_name := cort_aux_pkg.get_cort_schema;
+    l_cort_schema       arrays.gt_name := $$PLSQL_UNIT_OWNER;
     l_sql               VARCHAR2(1000);
   BEGIN
     IF user <> l_cort_schema THEN  
       drop_cort_triggers;
+      
       FOR x IN (SELECT * 
                   FROM user_synonyms 
                  WHERE synonym_name like 'CORT%'
@@ -1002,9 +937,47 @@ END;}';
         dbms_output.put_line(l_sql);
         EXECUTE IMMEDIATE l_sql;
       END LOOP;
-      cort_aux_pkg.revoke_grants(sys_context('userenv','current_user'));
+
+      cort_aux_pkg.revoke_grants(user);
     END IF;   
-  END deinstall;
+  END uninstall;
+
+  FUNCTION compare_release_numbers(in_release1 IN VARCHAR2, in_release2 in VARCHAR2) 
+  RETURN NUMBER
+  AS
+    l_r1_nums arrays.gt_num_arr;
+    l_r2_nums arrays.gt_num_arr;
+  BEGIN
+    SELECT REGEXP_SUBSTR (in_release1,'[0-9]+',1,level)
+      BULK COLLECT 
+      INTO l_r1_nums  
+      FROM dual
+    CONNECT BY REGEXP_SUBSTR (in_release1,'[0-9]+',1,level) IS NOT NULL;    
+
+    SELECT REGEXP_SUBSTR (in_release1,'[0-9]+',1,level)
+      BULK COLLECT 
+      INTO l_r2_nums  
+      FROM dual
+    CONNECT BY REGEXP_SUBSTR (in_release1,'[0-9]+',1,level) IS NOT NULL;
+
+    FOR i IN 1..LEAST(l_r1_nums.COUNT, l_r2_nums.COUNT) LOOP
+      IF l_r1_nums(i) < l_r2_nums(i) THEN
+        RETURN -1;
+      ELSIF l_r1_nums(i) > l_r2_nums(i) THEN
+        RETURN 1;
+      ELSE 
+        CONTINUE;
+      END  IF;
+    END LOOP;
+    IF l_r1_nums.COUNT < l_r2_nums.COUNT THEN
+      RETURN -1;
+    ELSIF l_r1_nums.COUNT > l_r2_nums.COUNT THEN
+      RETURN 1;
+    ELSE 
+      RETURN 0;
+    END  IF;
+  END compare_release_numbers;
+  
 
 END cort_pkg;
 /

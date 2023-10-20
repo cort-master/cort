@@ -1,7 +1,7 @@
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -27,6 +27,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   ----------------------------------------------------------------------------------------------------------------------  
   19.00   | Rustam Kafarov    | table for storing history of all changes made to database objects via cort 
   20.00   | Rustam Kafarov    | Added support of long names in Oracle 12.2 
+  21.00   | Rustam Kafarov    | Added job_id reference to cort_jobs. Moved forward/backward SQL into cort_sql table 
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
@@ -42,27 +43,25 @@ END;
 
 
 CREATE TABLE cort_objects(
+  job_id                         TIMESTAMP(6)  NOT NULL,
   object_owner                   VARCHAR2(128) NOT NULL,
   object_name                    VARCHAR2(128) NOT NULL,
   object_type                    VARCHAR2(30)  NOT NULL,
-  exec_time                      TIMESTAMP(9)  NOT NULL,
-  sid                            VARCHAR2(30)  NOT NULL,
-  sql_text                       CLOB,
-  last_ddl_time                  DATE,
+  change_type                    VARCHAR2(30)  NOT NULL,
+  last_ddl_text                  CLOB,
+  last_ddl_time                  TIMESTAMP,
+  change_params                  CLOB, --XMLTYPE,
   application                    VARCHAR2(20),
   release                        VARCHAR2(20),
   build                          VARCHAR2(20),
-  change_type                    VARCHAR2(30), 
-  metadata                       CLOB, --XMLTYPE
-  forward_ddl                    CLOB, --XMLTYPE,
-  revert_ddl                     CLOB, --XMLTYPE,
   revert_name                    VARCHAR2(128),
-  last_ddl_index                 NUMBER(9),
-  rename_name                    VARCHAR2(128),
-  CONSTRAINT cort_objects_pk PRIMARY KEY (object_owner, object_name, object_type, exec_time)
-    USING INDEX COMPRESS
+  prev_synonym                   VARCHAR2(128),
+  CONSTRAINT cort_objects_pk PRIMARY KEY (job_id)
 )
 ;
 
+CREATE INDEX cort_objects_objects_idx ON cort_objects(object_owner, object_name);
+
 CREATE INDEX cort_objects_release_idx ON cort_objects(application, release, object_name); 
+
 

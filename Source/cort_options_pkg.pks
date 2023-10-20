@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -32,12 +32,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   15.00   | Rustam Kafarov    | Added conditional context using
   16.00   | Rustam Kafarov    | Moved conditional context using to config_params_pkg
   17.00   | Rustam Kafarov    | Separated CC constants (options) from configurable params
+  22.00   | Rustam Kafarov    | Added param for auto-renaming type and creating synonyms with original name for them 
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
   gc_use_context             CONSTANT BOOLEAN := false;
   gc_explain_plan            CONSTANT BOOLEAN := true;
   gc_threading               CONSTANT BOOLEAN := true;
+  gc_rename_types            CONSTANT BOOLEAN := false;
   
 END cort_options_pkg;
 /

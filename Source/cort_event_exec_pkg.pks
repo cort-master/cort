@@ -5,7 +5,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -63,14 +63,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- process event action via job or directly
   PROCEDURE process_event(
-    in_async         IN BOOLEAN, 
+    in_async         IN BOOLEAN,
     in_action        IN VARCHAR2,
     in_object_type   IN VARCHAR2,
     in_object_name   IN VARCHAR2,
     in_object_owner  IN VARCHAR2,
     in_sql           IN CLOB,
     in_new_name      IN VARCHAR2 DEFAULT NULL,
-    in_params_rec    IN cort_params_pkg.gt_params_rec DEFAULT cort_session_pkg.get_params
+    in_params_rec    IN cort_params_pkg.gt_run_params_rec DEFAULT cort_session_pkg.get_params
   );
 
   -- resume pending process 

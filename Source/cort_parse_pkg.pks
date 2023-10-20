@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -34,6 +34,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   17.00   | Rustam Kafarov    | Added cleanup, get_cort_indexes, parse_cort_index
   18.00   | Rustam Kafarov    | Introduced complext type gt_sql_rec instead of individual global variables
   20.00   | Rustam Kafarov    | Added support of long names introduced in Oracle 12.2 
+  21.00   | Rustam Kafarov    | Split params into change and run params 
   ----------------------------------------------------------------------------------------------------------------------
 */
 
@@ -47,47 +48,59 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   TYPE gt_lexical_unit_arr IS TABLE OF gt_lexical_unit_rec INDEX BY PLS_INTEGER;
 
   TYPE gt_replace_rec IS RECORD(
-    object_type    arrays.gt_name,
-    object_name    arrays.gt_name,
+    object_type    VARCHAR2(50),
+    object_name    VARCHAR2(128),
     start_pos      PLS_INTEGER,
     end_pos        PLS_INTEGER,
-    new_name       arrays.gt_name
+    new_name       VARCHAR2(128)
   );
 
   TYPE gt_replace_arr IS TABLE OF gt_replace_rec INDEX BY PLS_INTEGER;
+  
+  TYPE gt_sql_column_rec IS RECORD(
+    column_name       arrays.gt_name,
+    start_position    PLS_INTEGER,     -- definition start position in SQL text (array index)
+    data_type         VARCHAR2(1024),
+    virtual_flag      BOOLEAN
+  );
+
+  TYPE gt_sql_column_arr IS TABLE OF gt_sql_column_rec INDEX BY PLS_INTEGER; 
 
   TYPE gt_sql_rec IS RECORD(
     original_sql                 CLOB, -- original SQL
-    normalized_sql               CLOB,  -- normalized sql excluding literals and comments
+    normalized_sql               CLOB, -- normalized sql excluding literals and comments
     lexical_units_arr            gt_lexical_unit_arr, -- Parsed SQL stored as array of lexical units(SQL/comments/quoted names/string literals)
     replaced_names_arr           gt_replace_arr,      -- list of replaced names indexes by replace position
     object_type                  arrays.gt_name,
     object_name                  arrays.gt_name,
     object_owner                 arrays.gt_name,
-    schema_name                  arrays.gt_name,
-    cort_param_start_pos         PLS_INTEGER,
-    cort_param_end_pos           PLS_INTEGER,
+    current_schema               arrays.gt_name,
+    run_param_start_pos          PLS_INTEGER,
+    run_param_end_pos            PLS_INTEGER,
     name_start_pos               PLS_INTEGER,
     definition_start_pos         PLS_INTEGER,
     columns_start_pos            PLS_INTEGER,
     columns_end_pos              PLS_INTEGER,
+    columns_arr                  gt_sql_column_arr,
     as_select_flag               BOOLEAN,
-    partition_type               VARCHAR2(20),
-    subpartition_type            VARCHAR2(20),
+    as_select_fromitself         BOOLEAN,
+    as_select_sql                CLOB,
+    subquery_start_pos           PLS_INTEGER,
+    subquery_end_pos             PLS_INTEGER,
+    partitioning_type            VARCHAR2(20),
+    subpartitioning_type         VARCHAR2(20),
+    part_key_column_arr          arrays.gt_name_arr,
+    subpart_key_column_arr       arrays.gt_name_arr,
     partitions_start_pos         PLS_INTEGER,
     partitions_end_pos           PLS_INTEGER,
---    partitions_count             PLS_INTEGER,
-    as_select_start_pos          PLS_INTEGER,
-    subquery_start_pos           PLS_INTEGER,
+    partitions_count             PLS_INTEGER,    
     table_definition_start_pos   PLS_INTEGER,   -- index's table start definition (after keyword ON {CLUSTER})
     is_cluster                   BOOLEAN,       -- is index created in cluster
     table_name                   arrays.gt_name,  -- index's table name
-    table_owner                  arrays.gt_name,  -- index's owner name
-    data_filter                  CLOB,          -- filtering part of sql added after FROM <table> a.
-    data_source                  CLOB           -- Custom SQL using to copy data when recreate. Can refer on changing table itself or prev$ synonym on it
+    table_owner                  arrays.gt_name   -- index's owner name
   );
 
-  TYPE gt_sql_arr IS TABLE OF gt_sql_rec;
+  TYPE gt_sql_arr IS TABLE OF gt_sql_rec INDEX BY PLS_INTEGER;
 
   FUNCTION get_regexp_const(
     in_value          IN VARCHAR2
@@ -98,10 +111,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   RETURN BOOLEAN;
 
 
-  FUNCTION parse_sql(
-    in_sql   IN   CLOB
-  )
-  RETURN gt_sql_rec;
+  PROCEDURE parse_sql(
+    in_sql      IN   CLOB,
+    out_sql_rec OUT NOCOPY gt_sql_rec
+  );
 
   FUNCTION get_normalized_sql(
     in_sql_rec      IN gt_sql_rec,
@@ -111,37 +124,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   RETURN CLOB;
 
-  -- parse cort params
-  PROCEDURE parse_params(
-    io_sql_rec      IN OUT NOCOPY gt_sql_rec,
-    io_params_rec   IN OUT NOCOPY cort_params_pkg.gt_params_rec
+  PROCEDURE parse_run_params(
+    in_sql          IN CLOB,
+    io_params_rec   IN OUT NOCOPY cort_params_pkg.gt_run_params_rec
   );
 
   -- Parse column definition start/end positions
   PROCEDURE parse_table_sql(
     io_sql_rec    IN OUT NOCOPY gt_sql_rec,
     in_table_name IN VARCHAR2,
-    in_owner_name IN VARCHAR2
-  );
-
-  -- Parse index definition to find table name
-  PROCEDURE parse_index_sql(
-    io_sql_rec    IN OUT NOCOPY gt_sql_rec,
-    in_index_name IN VARCHAR2,
-    in_owner_name IN VARCHAR2
-  );
-
-  -- Parse sequence definition to find table name
-  PROCEDURE parse_sequence_sql(
-    io_sql_rec       IN OUT NOCOPY gt_sql_rec,
-    in_sequence_name IN VARCHAR2,
-    in_owner_name    IN VARCHAR2
-  );
-
-  -- Parse type definition to find table name
-  PROCEDURE parse_type_sql(
-    io_sql_rec    IN OUT NOCOPY gt_sql_rec,
-    in_type_name  IN VARCHAR2,
     in_owner_name IN VARCHAR2
   );
 
@@ -153,70 +144,47 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_object_owner IN VARCHAR2
   );
 
-  -- Parse AS subquery definition
-  PROCEDURE parse_as_select(
-    io_sql_rec    IN OUT NOCOPY gt_sql_rec
-  );
-
-  -- set subquery return 0 rows
-  PROCEDURE modify_as_select(
-    io_sql_rec IN OUT NOCOPY gt_sql_rec
-  );
-
-  -- return TRUE if as_select subquery contains table name
-  FUNCTION as_select_from(
+  -- Finds index declarations in cort comments 
+  PROCEDURE parse_table_indexes(
     in_sql_rec    IN gt_sql_rec,
-    in_table_name IN VARCHAR
-  )
-  RETURN BOOLEAN;
-
-  -- determines partitions position
-  PROCEDURE parse_partitioning(
-    io_sql_rec    IN OUT NOCOPY gt_sql_rec
+    out_sql_arr   OUT NOCOPY gt_sql_arr 
   );
 
-  -- replaces partitions definition in original_sql
-  PROCEDURE replace_partitions_sql(
-    io_sql_rec       IN OUT NOCOPY gt_sql_rec,
-    in_partition_sql IN CLOB
+  -- modify partitions in original SQL
+  PROCEDURE modify_partition_sql(
+    in_source_table_rec    IN cort_exec_pkg.gt_table_rec,
+    io_sql_rec             IN OUT NOCOPY gt_sql_rec
   );
-
-  -- parses columns positions and cort-values
-  PROCEDURE parse_columns(
-    io_sql_rec    IN OUT NOCOPY gt_sql_rec,
-    io_table_rec  IN OUT NOCOPY cort_exec_pkg.gt_table_rec
-  );
-
+  
   -- replaces table name and all names of existing depending objects (constraints, log groups, indexes, lob segments)
-  PROCEDURE replace_names(
+  PROCEDURE replace_table_names(
     in_table_rec IN cort_exec_pkg.gt_table_rec,
-    io_sql_rec   IN OUT NOCOPY gt_sql_rec,
-    out_sql      OUT NOCOPY CLOB
+    io_sql_rec   IN OUT NOCOPY gt_sql_rec
+  );
+
+  -- replace all cort synonyms for types with real type names  
+  PROCEDURE replace_type_synonyms(
+    io_sql_rec   IN OUT NOCOPY gt_sql_rec
   );
 
   -- replaces index and table names for CREATE INDEX statement
-  PROCEDURE replace_names(
+  PROCEDURE replace_index_names(
     in_table_rec IN cort_exec_pkg.gt_table_rec,
     in_index_rec IN cort_exec_pkg.gt_index_rec,
-    io_sql_rec   IN OUT NOCOPY gt_sql_rec,
-    out_sql      OUT NOCOPY CLOB
+    io_sql_rec   IN OUT NOCOPY gt_sql_rec
   );
 
   -- replaces sequence name
-  PROCEDURE replace_names(
-    in_sequence_rec IN cort_exec_pkg.gt_sequence_rec,
-    io_sql_rec      IN OUT NOCOPY gt_sql_rec,
-    out_sql         OUT NOCOPY CLOB
+  PROCEDURE replace_seq_names(
+    in_rename_rec   IN cort_exec_pkg.gt_rename_rec,
+    io_sql_rec      IN OUT NOCOPY gt_sql_rec
   );
 
   -- replaces type name
-  PROCEDURE replace_names(
-    in_type_rec IN cort_exec_pkg.gt_type_rec,
-    io_sql_rec  IN OUT NOCOPY gt_sql_rec,
-    out_sql     OUT NOCOPY CLOB
+  PROCEDURE replace_type_names(
+    in_rename_rec   IN cort_exec_pkg.gt_rename_rec,
+    io_sql_rec      IN OUT NOCOPY gt_sql_rec
   );
-
-  PROCEDURE cleanup;
 
   -- replaces names in expression
   PROCEDURE update_expression(
@@ -226,14 +194,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- return original name for renamed object. If it wasn't rename return current name
   FUNCTION get_original_name(
-    in_object_type  IN VARCHAR2,
     in_object_name  IN VARCHAR2
   )
   RETURN VARCHAR2;
 
+  -- delete global array 
+  PROCEDURE cleanup;
+
 
   -- parses create statement and return object type, owner and name
-  PROCEDURE parse_create_statement(
+  PROCEDURE parse_explain_sql(
     in_sql           IN CLOB,
     out_object_type  OUT VARCHAR2,
     out_object_owner OUT VARCHAR2,
@@ -248,12 +218,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   FUNCTION get_alter_type_replace(in_sql IN CLOB)
   RETURN CLOB;
 */
-  -- Finds index declarations in cort comments
-  PROCEDURE get_cort_indexes(
-    in_sql_rec          IN gt_sql_rec,
-    in_job_rec          IN cort_jobs%ROWTYPE,
-    out_sql_arr         OUT NOCOPY gt_sql_arr
-  );
+
+
+  FUNCTION parse_qualified_col_expr(
+    in_qualified_col_name IN VARCHAR2
+ )
+  RETURN VARCHAR2;
+
 
 END cort_parse_pkg;
 /

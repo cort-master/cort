@@ -5,7 +5,7 @@ AS
 /*
 PL/SQL Utilities - Partition Utilities
 
-Copyright (C) 2013 Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -38,13 +38,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   typecode_maxvalue        CONSTANT PLS_INTEGER := -1;
   typecode_default         CONSTANT PLS_INTEGER := -2;
+  typecode_tuple           CONSTANT PLS_INTEGER := -3;
   typecode_number          CONSTANT PLS_INTEGER := dbms_types.typecode_number;
   typecode_varchar2        CONSTANT PLS_INTEGER := dbms_types.typecode_varchar2;
   typecode_date            CONSTANT PLS_INTEGER := dbms_types.typecode_date;
   typecode_timestamp       CONSTANT PLS_INTEGER := dbms_types.typecode_timestamp;
   typecode_interval_ym     CONSTANT PLS_INTEGER := dbms_types.typecode_interval_ym;
   typecode_interval_ds     CONSTANT PLS_INTEGER := dbms_types.typecode_interval_ds;
-  typecode_raw             CONSTANT PLS_INTEGER := dbms_types.typecode_raw;
 
 
   compare_greater          CONSTANT PLS_INTEGER := 1;
@@ -53,47 +53,30 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   TYPE gt_high_value_rec IS RECORD(
     typecode            PLS_INTEGER,
-    number_value        NUMBER,
-    varchar2_value      VARCHAR2(32767),
-    date_value          DATE,
-    timestamp_value     TIMESTAMP(9),
-    interval_ym_value   YMINTERVAL_UNCONSTRAINED,
-    interval_ds_value   DSINTERVAL_UNCONSTRAINED,
-    raw_value           RAW(32767)
+    value               AnyData
   );
 
   TYPE gt_high_values IS TABLE OF gt_high_value_rec;
+
+  TYPE gt_key_column_rec IS RECORD(
+    column_name             all_tab_columns.column_name%TYPE,
+    data_type               all_tab_columns.data_type%TYPE,
+    data_length             all_tab_columns.data_length%TYPE
+  );
+
+  TYPE gt_key_columns IS TABLE OF gt_key_column_rec;
+
 
   TYPE gt_partition_cur_rec IS RECORD(
     object_type             VARCHAR2(5),
     object_name             arrays.gt_name,
     object_owner            arrays.gt_name,
+    partitioning_type       VARCHAR2(15),
     partition_level         VARCHAR2(12),
     partition_name          all_tab_partitions.partition_name%TYPE,         
     parent_name             all_tab_partitions.partition_name%TYPE,
-    high_value              all_tab_partitions.high_value%TYPE,
     partition_position      all_tab_partitions.partition_position%TYPE,
-    tablespace_name         all_tab_partitions.tablespace_name%TYPE,
-    num_rows                all_tab_partitions.num_rows%TYPE,
-    blocks                  all_tab_partitions.blocks%TYPE,
-    sample_size             all_tab_partitions.sample_size%TYPE,
-    last_analyzed           all_tab_partitions.last_analyzed%TYPE,
-    buffer_pool             all_tab_partitions.buffer_pool%TYPE,
-    global_stats            all_tab_partitions.global_stats%TYPE,
-    user_stats              all_tab_partitions.user_stats%TYPE,
-    empty_blocks            all_tab_partitions.empty_blocks%TYPE,
-    avg_space               all_tab_partitions.avg_space%TYPE,
-    chain_cnt               all_tab_partitions.chain_cnt%TYPE,
-    avg_row_len             all_tab_partitions.avg_row_len%TYPE,
-    distinct_keys           all_ind_partitions.distinct_keys%TYPE,
-    blevel                  all_ind_partitions.blevel%TYPE,
-    avg_leaf_blocks_per_key all_ind_partitions.avg_leaf_blocks_per_key%TYPE,
-    avg_data_blocks_per_key all_ind_partitions.avg_data_blocks_per_key%TYPE,
-    clustering_factor       all_ind_partitions.clustering_factor%TYPE,
-    compression             all_tab_partitions.compression%TYPE,
-    compress_for            all_tab_partitions.compress_for%TYPE,           
-    interval                all_tab_partitions.interval%TYPE,               
-    segment_created         all_tab_partitions.segment_created%TYPE        
+    high_value              all_tab_partitions.high_value%TYPE
   );
   
   TYPE gt_partition_cur_arr IS TABLE OF gt_partition_cur_rec INDEX BY PLS_INTEGER;
@@ -105,34 +88,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     object_type             VARCHAR2(5),
     object_name             arrays.gt_name,
     object_owner            arrays.gt_name,
+    partitioning_type       VARCHAR2(15),
     partition_level         VARCHAR2(12),
     partition_name          arrays.gt_name,
-    parent_part_name        arrays.gt_name,
-    position                PLS_INTEGER,
-    high_values             gt_high_values,
-    tablespace              arrays.gt_name,
-    compression             VARCHAR2(10),
-    num_rows                NUMBER,
-    blocks                  NUMBER, -- LEAF_BLOCKS for index
-    sample_size             NUMBER,
-    last_analyzed           DATE,
-    buffer_pool             VARCHAR2(7),
-    global_stats            VARCHAR2(3),
-    user_stats              VARCHAR2(3),
-    interval                VARCHAR2(3),
-    segment_created         VARCHAR2(4),
-    -- table specific attributes
-    compress_for            VARCHAR2(30),
-    empty_blocks            NUMBER,
-    avg_space               NUMBER, 
-    chain_cnt               NUMBER, 
-    avg_row_len             NUMBER, 
-    -- index specific attributes
-    distinct_keys           NUMBER,
-    blevel                  NUMBER,
-    avg_leaf_blocks_per_key NUMBER,
-    avg_data_blocks_per_key NUMBER, 
-    clustering_factor       NUMBER 
+    parent_name             arrays.gt_name,
+    partition_position      NUMBER,
+    high_value              VARCHAR2(32767),
+    -- derived attributes
+    high_values             gt_high_values, 
+    key_columns             gt_key_columns,
+    filter_clause           CLOB           
   );
 
   TYPE gt_partition_arr IS TABLE OF gt_partition_rec INDEX BY PLS_INTEGER;
@@ -147,51 +112,51 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   
   g_use_cache BOOLEAN := TRUE;
 
-  FUNCTION get_maxvalue
+  FUNCTION maxvalue
   RETURN gt_high_value_rec;
 
-  FUNCTION get_default
+  FUNCTION default_value
   RETURN gt_high_value_rec;
 
-  FUNCTION get_number(in_number_value IN NUMBER)
+  FUNCTION number_value(in_number_value IN NUMBER)
   RETURN gt_high_value_rec;
 
-  FUNCTION get_varchar2(in_varchar2_value IN VARCHAR2)
+  FUNCTION varchar2_value(in_varchar2_value IN VARCHAR2)
   RETURN gt_high_value_rec;
 
-  FUNCTION get_date(in_date_value IN DATE)
+  FUNCTION date_value(in_date_value IN DATE)
   RETURN gt_high_value_rec;
 
-  FUNCTION get_timestamp(in_timestamp_value IN TIMESTAMP)
+  FUNCTION timestamp_value(in_timestamp_value IN TIMESTAMP)
   RETURN gt_high_value_rec;
 
-  FUNCTION get_interval_ym(in_interval_ym_value IN YMINTERVAL_UNCONSTRAINED)
+  FUNCTION interval_ym_value(in_interval_ym_value IN YMINTERVAL_UNCONSTRAINED)
   RETURN gt_high_value_rec;
 
-  FUNCTION get_interval_ds(in_interval_ds_value IN DSINTERVAL_UNCONSTRAINED)
+  FUNCTION interval_ds_value(in_interval_ds_value IN DSINTERVAL_UNCONSTRAINED)
   RETURN gt_high_value_rec;
 
-  FUNCTION get_raw(in_raw_value IN RAW)
+  FUNCTION tuple_value(in_tuple_value IN gt_high_values)
   RETURN gt_high_value_rec;
 
-  -- get_value overloaded wrappers
-  FUNCTION get_value(in_number_value IN NUMBER)
-  RETURN gt_high_value_rec;
 
-  FUNCTION get_value(in_varchar2_value IN VARCHAR2)
-  RETURN gt_high_value_rec;
+  FUNCTION get_number_value(in_value IN gt_high_value_rec) RETURN NUMBER;
 
-  FUNCTION get_value(in_date_value IN DATE)
-  RETURN gt_high_value_rec;
+  FUNCTION get_varchar2_value(in_value IN gt_high_value_rec) RETURN VARCHAR2;
 
-  FUNCTION get_value(in_timestamp_value IN TIMESTAMP)
-  RETURN gt_high_value_rec;
+  FUNCTION get_date_value(in_value IN gt_high_value_rec) RETURN DATE;
+  
+  FUNCTION get_timestamp_value(in_value IN gt_high_value_rec) RETURN TIMESTAMP;
 
-  FUNCTION get_value(in_interval_ym_value IN YMINTERVAL_UNCONSTRAINED)
-  RETURN gt_high_value_rec;
+  FUNCTION get_interval_ym_value(in_value IN gt_high_value_rec) RETURN YMINTERVAL_UNCONSTRAINED;
 
-  FUNCTION get_value(in_interval_ds_value IN DSINTERVAL_UNCONSTRAINED)
-  RETURN gt_high_value_rec;
+  FUNCTION get_interval_ds_value(in_value IN gt_high_value_rec) RETURN DSINTERVAL_UNCONSTRAINED;
+
+  FUNCTION get_tuple_value(in_value IN gt_high_value_rec) RETURN gt_high_values;
+
+  FUNCTION get_typecode(in_datatype IN VARCHAR2)
+  RETURN PLS_INTEGER;
+
 
   FUNCTION compare_high_value_rec(
     in_value1       IN gt_high_value_rec,
@@ -209,15 +174,19 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   RETURN PLS_INTEGER;
 
   PROCEDURE parse_high_value_str(
-    in_string  IN VARCHAR2,
-    out_values OUT NOCOPY gt_high_values
+    in_string      IN VARCHAR2,
+    out_values     OUT NOCOPY gt_high_values
   );
 
-  FUNCTION convert_to_string(in_high_value IN gt_high_value_rec)
+  FUNCTION as_literal(in_high_value IN gt_high_value_rec)
   RETURN VARCHAR2;
 
-  FUNCTION convert_to_string(in_high_values IN gt_high_values)
+  FUNCTION as_literal(in_high_values IN gt_high_values)
   RETURN VARCHAR2;
+
+  PROCEDURE parse_partition_arr(
+    io_partition_arr IN OUT NOCOPY gt_partition_arr
+  );
 
   FUNCTION get_partitions(
     io_cursor IN OUT gt_partition_ref_cur

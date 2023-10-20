@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -36,20 +36,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   18.00   | Rustam Kafarov    | Used new parsing API. Fixed create as select from itself.
   19.00   | Rustam Kafarov    | Revised parameters
   20.00   | Rustam Kafarov    | Added support of long names introduced in Oracle 12.2 
+  21.00   | Rustam Kafarov    | Split params into change and run params 
   ----------------------------------------------------------------------------------------------------------------------
 */
-
-  TYPE    gt_index_compare_rec        IS RECORD(
-    index_name       arrays.gt_name,
-    index_owner      arrays.gt_name,
-    temp_name        arrays.gt_name,
-    source_tab_indx  PLS_INTEGER,
-    target_tab_indx  PLS_INTEGER,
-    compare_result   PLS_INTEGER,
-    frwd_ddl_arr     arrays.gt_clob_arr,
-    rlbk_ddl_arr     arrays.gt_clob_arr
-  );
-  TYPE    gt_index_compare_arr        IS TABLE OF gt_index_compare_rec        INDEX BY PLS_INTEGER;
 
   SUBTYPE gt_all_indexes_rec          IS all_indexes%ROWTYPE;
   SUBTYPE gt_all_part_indexes_rec     IS all_part_indexes%ROWTYPE;
@@ -65,6 +54,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   ge_table_not_exist     EXCEPTION;
   PRAGMA                 EXCEPTION_INIT(ge_table_not_exist, -00942);
 
+  g_routine_indx         arrays.gt_name_arr;  
+  g_buffered_object      VARCHAR2(300);
+  -- int array indexed by object_type (3 CHAR)
+  g_temp_objects_arr     arrays.gt_int_indx;
+  -- array of abstract data types index by "owner"."name"
+  g_adt_arr              gt_adt_indx;
+
 
   -- output debug text
   PROCEDURE debug(
@@ -73,10 +69,45 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   AS
   BEGIN
-    IF g_params.debug.get_bool_value THEN
+    IF g_run_params.debug.get_bool_value THEN
       cort_log_pkg.debug(substr(in_text,1, 4000), in_details);
     END IF;
   END debug;
+
+  PROCEDURE init_routines_index(
+    in_owner IN VARCHAR2,
+    in_name  IN VARCHAR2,
+    in_type  IN VARCHAR2
+  )
+  AS
+    l_routine_arr  arrays.gt_name_arr;
+    l_line_num_arr arrays.gt_int_arr;
+  BEGIN
+    IF g_buffered_object = in_type||' '||in_owner||'.'||in_name THEN
+      -- already buffered
+      NULL;
+    ELSE
+      SELECT routine_name, MIN(line)
+        BULK COLLECT 
+        INTO l_routine_arr, l_line_num_arr                       
+        FROM (SELECT last_value(UPPER(REGEXP_SUBSTR(text, '(PROCEDURE|FUNCTION)\s+([A-Za-z][A-Za-z0-9_#$]{0,29})', 1, 1, 'i', 2)) ignore nulls) over(order by line) as routine_name, 
+                     line
+                FROM all_source a
+               WHERE owner = in_owner
+                 AND name = in_name
+                 AND type = in_type)
+       WHERE routine_name IS NOT NULL
+       GROUP BY routine_name
+       ;
+      
+      g_routine_indx.DELETE;
+      FOR i IN 1..l_line_num_arr.COUNT LOOP
+        g_routine_indx(l_line_num_arr(i)) := l_routine_arr(i);  
+      END LOOP;
+      
+      g_buffered_object := in_type||' '||in_owner||'.'||in_name;
+    END IF; 
+  END init_routines_index;
 
   FUNCTION get_routin_name(
     in_owner IN VARCHAR2,
@@ -87,23 +118,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   RETURN VARCHAR2
   AS
     l_result arrays.gt_name;
+    l_indx   PLS_INTEGER;
   BEGIN
-    BEGIN
-      SELECT routine_name
-        INTO l_result
-        FROM (SELECT a.* ,
-                     last_value(UPPER(REGEXP_SUBSTR(text, '(PROCEDURE|FUNCTION)\s+([A-Za-z][A-Za-z0-9_#$]{0,29})', 1, 1, 'i', 2)) ignore nulls) over(order by line) as routine_name
-                FROM all_source a
-               WHERE owner = in_owner
-                 AND name = in_name
-                 AND type = in_type
-             )
-       WHERE line = in_line;
-    EXCEPTION
-      WHEN no_data_found THEN
-        l_result := null;
-    END;
-    l_result := NVL(l_result,in_name);
+    init_routines_index(in_owner, in_name, in_type);    
+    l_indx := g_routine_indx.PRIOR(in_line); 
+    IF g_routine_indx.EXISTS(l_indx) THEN
+      l_result := g_routine_indx(l_indx);
+    ELSE  
+      l_result := in_name;
+    END IF;  
     RETURN l_result;
   END get_routin_name;
 
@@ -115,7 +138,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_type    VARCHAR2(100);
     l_routine VARCHAR2(100);
   BEGIN
-    IF g_params.debug.get_bool_value THEN
+    IF g_run_params.debug.get_bool_value THEN
       owa_util.who_called_me(
         owner          => l_owner,
         name           => l_name,
@@ -137,7 +160,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_type    VARCHAR2(100);
     l_routine VARCHAR2(100);
   BEGIN
-    IF g_params.debug.get_bool_value THEN
+    IF g_run_params.debug.get_bool_value THEN
       owa_util.who_called_me(
         owner          => l_owner,
         name           => l_name,
@@ -170,22 +193,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     RETURN l_result;
   END format_message;
 
-  -- output sql statement
-  PROCEDURE echo_sql(
-    in_sql IN CLOB
-  )
-  AS
-  BEGIN
-    IF SUBSTR(in_sql,-1) = ';' THEN
-      -- PL/SQL BLOCK
-      cort_log_pkg.echo(in_sql||CHR(10)||'/');
-    ELSE
-      -- DDL or SQL
-      cort_log_pkg.echo(in_sql||';');
-    END IF;
-  END echo_sql;
-
-
   PROCEDURE raise_error(
     in_msg  IN VARCHAR,
     in_code IN NUMBER DEFAULT -20000
@@ -202,14 +209,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     IF in_job_rec.sid IS NULL THEN
       RETURN;
     END IF;
-
-    IF NOT cort_job_pkg.is_job_alive(in_job_rec) THEN
-      raise_error('Operation cancelled for sid = '||in_job_rec.sid, -20900);
-    END IF;
-
-    IF in_job_rec.action = 'THREADING' THEN
-      cort_job_pkg.check_sibling_jobs_alive(in_job_rec);
-    END IF;
+/*
+    IF NOT cort_job_pkg.is_object_locked(in_job_rec.object_owner,in_job_rec.object_name,'CONTROL SESSION') THEN
+      raise_error('Operation cancelled for object "'||in_job_rec.object_owner||'"."'||in_job_rec.object_name||'"', -20900);
+    END IF;*/
   END check_if_process_active;
 
 
@@ -251,27 +254,26 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
   -- executes DDL command
   PROCEDURE execute_immediate(
-    in_sql   IN CLOB,
-    in_echo  IN BOOLEAN DEFAULT TRUE,
-    in_test  IN BOOLEAN DEFAULT FALSE
+    in_sql        IN CLOB,
+    in_echo       IN BOOLEAN DEFAULT TRUE,
+    in_test       IN BOOLEAN DEFAULT FALSE
   )
   AS
   PRAGMA autonomous_transaction;
+    l_log_attrs PLS_INTEGER := 0;
   BEGIN
-    cort_exec_pkg.check_if_process_active(in_job_rec => g_job_rec);
+    check_if_process_active(in_job_rec => g_job_rec);
 
     IF in_sql IS NOT NULL AND LENGTH(in_sql) > 0 THEN
-      IF in_echo THEN
-        echo_sql(in_sql);
-      END IF;
-
       IF in_test THEN
         cort_log_pkg.test(
-          in_text => in_sql
+          in_ddl        => in_sql--,
+--          in_revert_ddl => in_revert_ddl
         );
       ELSE
         cort_log_pkg.execute(
-          in_text      => in_sql
+          in_sql   => in_sql,
+          in_echo  => in_echo 
         );
         BEGIN
         $IF dbms_db_version.version >= 11 $THEN
@@ -282,7 +284,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         EXCEPTION
           WHEN OTHERS THEN
             cort_log_pkg.update_exec_time;
-            cort_log_pkg.error('Error in parsing/executing sql',in_sql);
+            cort_log_pkg.error('Error in parsing/executing sql',in_sql,in_echo);
             RAISE;
         END;
         cort_log_pkg.update_exec_time;
@@ -291,227 +293,286 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     COMMIT;
   END execute_immediate;
 
-  -- executes PL/SQL convertion from XML type
-  PROCEDURE execute_immediate_xml(
-    in_sql   IN CLOB,
-    in_xml   IN XMLTYPE
+  -- constructor for gt_change_rec
+  FUNCTION change_rec(
+    in_group_type  IN VARCHAR2,
+    in_change_sql  IN CLOB,
+    in_revert_sql  IN CLOB DEFAULT NULL,
+    in_display_sql IN VARCHAR2 DEFAULT NULL,
+    in_threadable  IN VARCHAR2 DEFAULT 'N'
+  )
+  RETURN gt_change_rec
+  AS
+    l_result   gt_change_rec;
+  BEGIN
+    l_result.group_type  := in_group_type;
+    l_result.change_sql  := in_change_sql;
+    l_result.revert_sql  := in_revert_sql;
+    l_result.display_sql := in_display_sql;
+    l_result.status      := 'REGISTERED';
+    l_result.threadable  := in_threadable;
+    l_result.row_id      := null;
+    RETURN l_result;
+  END change_rec;
+  
+  -- change status for the given change_rec
+  FUNCTION change_status(
+    in_rec    IN gt_change_rec, 
+    in_status IN VARCHAR2
+  )
+  RETURN gt_change_rec
+  AS
+    l_result   gt_change_rec;
+  BEGIN
+    l_result := in_rec;
+    l_result.status := in_status;
+    CASE in_status 
+    WHEN 'RUNNING' THEN
+      l_result.start_time := SYSTIMESTAMP;
+    WHEN 'COMPLETED' THEN
+      l_result.end_time := SYSTIMESTAMP;
+    WHEN 'TESTED' THEN
+      l_result.end_time := SYSTIMESTAMP;
+    WHEN 'FAILED' THEN
+      l_result.end_time := SYSTIMESTAMP;
+      l_result.error_msg := SQLERRM; 
+    WHEN 'REVERTING' THEN
+      l_result.revert_start_time := SYSTIMESTAMP;
+    WHEN 'REVERTED' THEN
+      l_result.revert_end_time := SYSTIMESTAMP;
+    WHEN 'FAILED ON REVERT' THEN
+      l_result.revert_end_time := SYSTIMESTAMP;
+      l_result.error_msg := SQLERRM; 
+    END CASE; 
+    IF l_result.row_id IS NOT NULL THEN
+      cort_aux_pkg.update_sql(
+        in_change_sql_rec => l_result
+      );
+    END IF;      
+    RETURN l_result;
+  END change_status;
+  
+
+  -- add new entry to array
+  PROCEDURE add_change(
+    io_change_arr IN OUT NOCOPY gt_change_arr,
+    in_change_rec IN gt_change_rec
   )
   AS
   BEGIN
-    cort_exec_pkg.check_if_process_active(in_job_rec => g_job_rec);
-    IF in_sql IS NOT NULL AND LENGTH(in_sql) > 0 THEN
-      cort_log_pkg.execute(
-        in_text => in_sql
-      );
-      BEGIN
-        EXECUTE IMMEDIATE in_sql USING IN in_xml;
-      EXCEPTION
-        WHEN OTHERS THEN
-          cort_log_pkg.update_exec_time;
-          cort_log_pkg.error('Error in parsing/executing XML sql ',in_sql);
-          RAISE;
-      END;
-      cort_log_pkg.update_exec_time;
-    END IF;
-  END execute_immediate_xml;
+    io_change_arr(io_change_arr.COUNT+1) := in_change_rec; 
+  END add_change;
 
-  -- executes PL/SQL convertion to XML type
-  PROCEDURE execute_immediate_xml(
-    in_sql   IN CLOB,
-    out_xml  OUT NOCOPY XMLTYPE
+  -- add new entry to array
+  PROCEDURE add_changes(
+    io_change_arr IN OUT NOCOPY gt_change_arr,
+    in_change_arr IN gt_change_arr
   )
   AS
   BEGIN
-    cort_exec_pkg.check_if_process_active(in_job_rec => g_job_rec);
-    IF in_sql IS NOT NULL AND LENGTH(in_sql) > 0 THEN
-      cort_log_pkg.execute(
-        in_text => in_sql
-      );
-      BEGIN
-        EXECUTE IMMEDIATE in_sql USING OUT out_xml;
-      EXCEPTION
-        WHEN OTHERS THEN
-          cort_log_pkg.update_exec_time;
-          cort_log_pkg.error('Error in parsing/executing XML sql', in_sql);
-          RAISE;
-      END;
-      cort_log_pkg.update_exec_time;
-    END IF;
-  END execute_immediate_xml;
+    FOR i IN 1..in_change_arr.COUNT LOOP
+      io_change_arr(io_change_arr.COUNT+1) := in_change_arr(i); 
+    END LOOP;
+  END add_changes;
 
-  -- executes PL/SQL block with single string param
-  PROCEDURE execute_immediate_param(
-    in_sql         IN VARCHAR2,
-    in_param_value IN VARCHAR2
+  -- execute revert DDL changes from cort_sql in reversed order
+  PROCEDURE revert_changes(
+    io_change_arr   IN OUT NOCOPY gt_change_arr,
+    in_test         IN BOOLEAN DEFAULT FALSE,
+    in_echo         IN BOOLEAN DEFAULT TRUE,
+    in_failure_indx IN PLS_INTEGER DEFAULT NULL
   )
   AS
+    e_compiled_with_errors EXCEPTION;
+    PRAGMA EXCEPTION_INIT(e_compiled_with_errors,-24344);
   BEGIN
-    cort_exec_pkg.check_if_process_active(in_job_rec => g_job_rec);
-    IF in_sql IS NOT NULL AND LENGTH(in_sql) > 0 THEN
-      cort_log_pkg.execute(
-        in_text => in_sql
-      );
-      BEGIN
-        EXECUTE IMMEDIATE in_sql USING IN in_param_value;
-      EXCEPTION
-        WHEN OTHERS THEN
-          cort_log_pkg.update_exec_time;
-          cort_log_pkg.error('Error in parsing/executing parameters sql', in_sql);
-          RAISE;
-      END;
-      cort_log_pkg.update_exec_time;
-    END IF;
-  END execute_immediate_param;
+    start_timer;
+    FOR i IN REVERSE 1..NVL(in_failure_indx, io_change_arr.COUNT) LOOP
+      IF io_change_arr(i).status = 'COMPLETED' THEN
+        io_change_arr(i) := change_status(io_change_arr(i), 'REVERTING');
+        BEGIN
+          execute_immediate(io_change_arr(i).revert_sql, in_echo, in_test);
+        EXCEPTION
+          -- if trigger created with errors then do not raise exception and carry on
+          WHEN e_compiled_with_errors THEN
+            NULL;
+          WHEN OTHERS THEN
+            io_change_arr(i) := change_status(io_change_arr(i), 'FAILED ON REVERT');
+            cort_log_pkg.error('Failed on reverting...');
+        END;
+        io_change_arr(i) := change_status(io_change_arr(i), 'REVERTED');
+      END IF;
+    END LOOP;
+    stop_timer;
+  END revert_changes;
 
-  PROCEDURE int_apply_changes(
-    in_frwd_alter_stmt_arr IN arrays.gt_clob_arr, -- forward alter statements
-    in_rlbk_alter_stmt_arr IN arrays.gt_clob_arr, -- rollback alter statements
-    io_last_ddl_index      IN OUT NOCOPY PLS_INTEGER,
-    in_revert              IN BOOLEAN DEFAULT TRUE,
-    in_test                IN BOOLEAN DEFAULT FALSE,
-    in_echo                IN BOOLEAN DEFAULT TRUE
+  -- execute DDL changes from cort_sql which are not applied yet
+  PROCEDURE apply_changes(
+    io_change_arr   IN OUT NOCOPY gt_change_arr,
+    in_test         IN BOOLEAN DEFAULT FALSE,
+    in_echo         IN BOOLEAN DEFAULT TRUE,
+    in_act_on_error IN VARCHAR2 DEFAULT 'REVERT' -- 'REVERT', 'RAISE', 'SKIP'
   )
   AS
-    l_indx                 PLS_INTEGER;
-    l_first_indx           PLS_INTEGER;
+    e_compiled_with_errors EXCEPTION;
+    PRAGMA EXCEPTION_INIT(e_compiled_with_errors,-24344);
+  BEGIN
+    IF in_echo THEN
+      cort_aux_pkg.save_sql(io_change_sql_arr => io_change_arr);
+    END IF; 
+ 
+    $IF cort_options_pkg.gc_threading $THEN
+    IF NOT in_test AND in_echo THEN
+      cort_thread_exec_pkg.apply_change(
+        io_change_arr => io_change_arr
+      );
+    END IF; 
+    $END
+
+    start_timer;
+    FOR i IN 1..io_change_arr.COUNT LOOP
+      IF io_change_arr(i).status = 'REGISTERED' THEN
+        io_change_arr(i) := change_status(io_change_arr(i), 'RUNNING');
+        BEGIN
+          execute_immediate(io_change_arr(i).change_sql, in_echo, in_test);
+        EXCEPTION
+          -- if trigger created with errors then do not raise exception and carry on
+          WHEN e_compiled_with_errors THEN
+            NULL;
+          WHEN OTHERS THEN
+            io_change_arr(i) := change_status(io_change_arr(i), 'FAILED');
+            CASE in_act_on_error 
+            WHEN 'REVERT' THEN
+              cort_log_pkg.error('Error. Changes revering...');
+              debug('Error. Reverting changes back...');
+              revert_changes(io_change_arr, in_echo, in_test, i);
+              debug('End of revert...');
+              RAISE;
+            WHEN 'RAISE' THEN
+              RAISE;  
+            WHEN 'SKIP' THEN
+              NULL;
+            END CASE;
+        END;
+        IF in_test THEN
+          io_change_arr(i) := change_status(io_change_arr(i), 'TESTED');
+        ELSE
+          io_change_arr(i) := change_status(io_change_arr(i), 'COMPLETED');
+        END IF;  
+      END IF;
+    END LOOP;
+
+    stop_timer;
+  END apply_changes;
+
+/*
+  -- execute revert DDL changes from cort_sql in reversed order
+  PROCEDURE revert_changes(
+    in_job_id   IN TIMESTAMP,
+    in_test     IN BOOLEAN DEFAULT FALSE,
+    in_echo     IN BOOLEAN DEFAULT TRUE
+  )
+  AS
+    e_compiled_with_errors EXCEPTION;
+    PRAGMA EXCEPTION_INIT(e_compiled_with_errors,-24344);
+  BEGIN
+    start_timer;
+    FOR x IN (SELECT a.rowid as row_id, a.revert_sql
+                FROM cort_sql a 
+               WHERE job_id = in_job_id
+                 AND status = 'COMPLETED'
+               ORDER BY seq_num DESC
+             ) 
+    LOOP
+      cort_aux_pkg.update_sql_status(x.row_id, 'REVERTING');
+      BEGIN
+        execute_immediate(x.revert_sql, in_echo, in_test);
+      EXCEPTION
+        -- if trigger created with errors then do not raise exception and carry on
+        WHEN e_compiled_with_errors THEN
+          NULL;
+        WHEN OTHERS THEN
+          cort_aux_pkg.update_sql_status(x.row_id, 'FAILED ON REVERT');
+          debug('Error on revert');
+      END;
+      cort_aux_pkg.update_sql_status(x.row_id, 'REVERTED');
+    END LOOP;
+    stop_timer;
+  END revert_changes;
+
+  -- execute DDL changes from cort_sql which are not applied yet
+  PROCEDURE apply_changes(
+    in_job_id        IN TIMESTAMP,
+    in_test          IN BOOLEAN DEFAULT FALSE,
+    in_echo          IN BOOLEAN DEFAULT TRUE,
+    in_act_on_error  IN VARCHAR2 DEFAULT 'REVERT'
+  )
+  AS
     e_compiled_with_errors EXCEPTION;
     PRAGMA EXCEPTION_INIT(e_compiled_with_errors,-24344);
   BEGIN
     start_timer;
 
-    IF io_last_ddl_index IS NULL THEN
-      l_indx := in_frwd_alter_stmt_arr.FIRST;
-    ELSE
-      l_indx := in_frwd_alter_stmt_arr.NEXT(io_last_ddl_index);
-    END IF;
-    l_first_indx := l_indx;
-    WHILE l_indx IS NOT NULL LOOP
-      IF LENGTH(in_frwd_alter_stmt_arr(l_indx)) > 0 THEN
-        BEGIN
-          execute_immediate(in_frwd_alter_stmt_arr(l_indx), in_echo, in_test);
-          io_last_ddl_index := l_indx;
-        EXCEPTION
-          -- if trigger created with errors then do not raise exception and carry on
-          WHEN e_compiled_with_errors THEN
-            NULL;
-          WHEN OTHERS THEN
-            IF in_revert THEN
-              debug('Error. Rolling back...');
-              l_indx := in_rlbk_alter_stmt_arr.PRIOR(l_indx);
-              WHILE l_indx IS NOT NULL AND l_indx >= l_first_indx LOOP
-                execute_immediate(in_rlbk_alter_stmt_arr(l_indx), in_echo, in_test);
-                l_indx := in_rlbk_alter_stmt_arr.PRIOR(l_indx);
-              END LOOP;
-              debug('End of rollback...');
-            END IF;
-            cort_log_pkg.echo('io_last_ddl_index = '||io_last_ddl_index);
-            cort_log_pkg.error('Error. Changes reverted...');
+    FOR x IN (SELECT a.rowid as row_id, a.change_sql
+                FROM cort_sql a 
+               WHERE job_id = in_job_id
+                 AND status = 'REGISTERED'
+               ORDER BY seq_num
+             ) 
+    LOOP
+      cort_aux_pkg.update_sql_status(x.row_id, 'RUNNING');
+      BEGIN
+        execute_immediate(x.change_sql, in_echo, in_test);
+      EXCEPTION
+        -- if trigger created with errors then do not raise exception and carry on
+        WHEN e_compiled_with_errors THEN
+          NULL;
+        WHEN OTHERS THEN
+          cort_aux_pkg.update_sql_status(x.row_id, 'FAILED');
+          CASE in_act_on_error 
+          WHEN 'REVERT' THEN
+            cort_log_pkg.error('Error. Changes revering...');
+            debug('Error. Reverting changes back...');
+            revert_changes(in_job_id, in_echo, in_test);
+            debug('End of revert...');
             RAISE;
-        END;
-      END IF;
-      -- go to next element
-      l_indx := in_frwd_alter_stmt_arr.NEXT(l_indx);
+          WHEN 'RAISE' THEN
+            RAISE;  
+          WHEN 'SKIP' THEN
+            NULL;
+          END CASE;
+      END;
+      cort_aux_pkg.update_sql_status(X.row_id, 'COMPLETED');
     END LOOP;
 
     stop_timer;
-  END int_apply_changes;
-
-  -- execute DDL changes
-  PROCEDURE apply_changes(
-    in_frwd_alter_stmt_arr IN arrays.gt_clob_arr, -- forward alter statements
-    in_rlbk_alter_stmt_arr IN arrays.gt_clob_arr, -- rollback alter statements
-    io_last_ddl_index      IN OUT NOCOPY PLS_INTEGER, -- index in array from which we want to start
-    in_revert              IN BOOLEAN DEFAULT TRUE,
-    in_test                IN BOOLEAN DEFAULT FALSE,
-    in_echo                IN BOOLEAN DEFAULT TRUE
-  )
-  AS
-    l_frwd_alter_stmt_arr  arrays.gt_clob_arr;
-    l_rlbk_alter_stmt_arr  arrays.gt_clob_arr;
-  BEGIN
-    $IF cort_options_pkg.gc_threading $THEN
-      cort_thread_exec_pkg.find_threading_statements(
-        in_frwd_alter_stmt_arr  => in_frwd_alter_stmt_arr,
-        in_rlbk_alter_stmt_arr  => in_rlbk_alter_stmt_arr,
-        out_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
-        out_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr
-      );
-      int_apply_changes(
-        in_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
-        in_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr,
-        io_last_ddl_index      => io_last_ddl_index,
-        in_revert              => in_revert,
-        in_test                => in_test,
-        in_echo                => in_echo
-      );
-    $ELSE
-      int_apply_changes(
-        in_frwd_alter_stmt_arr => in_frwd_alter_stmt_arr,
-        in_rlbk_alter_stmt_arr => in_rlbk_alter_stmt_arr,
-        io_last_ddl_index      => io_last_ddl_index,
-        in_revert              => in_revert,
-        in_test                => in_test,
-        in_echo                => in_echo
-      );
-    $END
   END apply_changes;
 
-  -- execute DDL changes
-  PROCEDURE apply_changes(
-    in_frwd_alter_stmt_arr IN arrays.gt_clob_arr, -- forward alter statements
-    in_rlbk_alter_stmt_arr IN arrays.gt_clob_arr, -- rollback alter statements
-    in_test                IN BOOLEAN DEFAULT FALSE,
-    in_echo                IN BOOLEAN DEFAULT TRUE
+*/
+  -- output already execute SQL.
+  PROCEDURE display_changes(
+    io_change_sql_arr IN OUT NOCOPY gt_change_arr,
+    in_test           IN BOOLEAN DEFAULT FALSE
   )
   AS
-    l_last_ddl_index      PLS_INTEGER;
   BEGIN
-    apply_changes(
-      in_frwd_alter_stmt_arr => in_frwd_alter_stmt_arr,
-      in_rlbk_alter_stmt_arr => in_rlbk_alter_stmt_arr,
-      io_last_ddl_index      => l_last_ddl_index,
-      in_revert              => TRUE,
-      in_test                => in_test,
-      in_echo                => in_echo
-    );
-  END apply_changes;
-
-  PROCEDURE apply_changes_ignore_errors(
-    io_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    in_test        IN BOOLEAN DEFAULT FALSE,
-    in_echo        IN BOOLEAN DEFAULT TRUE,
-    in_reverse     IN BOOLEAN DEFAULT FALSE
-  )
-  AS
-    l_indx                 PLS_INTEGER;
-    e_compiled_with_errors EXCEPTION;
-    PRAGMA EXCEPTION_INIT(e_compiled_with_errors,-24344);
-  BEGIN
-    IF in_reverse THEN
-      l_indx := io_stmt_arr.LAST;
-    ELSE
-      l_indx := io_stmt_arr.FIRST;
-    END IF;
-    WHILE l_indx IS NOT NULL LOOP
-      IF LENGTH(io_stmt_arr(l_indx)) > 0 THEN
-        BEGIN
-          execute_immediate(io_stmt_arr(l_indx), in_echo, in_test);
-        EXCEPTION
-          -- if trigger created with errors then do not raise exception and carry on
-          WHEN e_compiled_with_errors THEN
-            NULL;
-          WHEN OTHERS THEN
-            io_stmt_arr(l_indx) := NULL;
-        END;
-      END IF;
-      -- go to next element
-      IF in_reverse THEN
-        l_indx := io_stmt_arr.PRIOR(l_indx);
-      ELSE
-        l_indx := io_stmt_arr.NEXT(l_indx);
-      END IF;
+    cort_aux_pkg.save_sql(io_change_sql_arr => io_change_sql_arr);
+    FOR i IN 1..io_change_sql_arr.COUNT LOOP
+      IF io_change_sql_arr(i).status = 'COMPLETED' THEN
+        IF in_test THEN
+          cort_log_pkg.test(
+            in_ddl        => io_change_sql_arr(i).change_sql,
+            in_revert_ddl => io_change_sql_arr(i).revert_sql
+          );
+        ELSE
+          cort_log_pkg.echo_sql(
+            in_sql   => io_change_sql_arr(i).change_sql
+          );
+        END IF;  
+      END IF;  
     END LOOP;
-  END apply_changes_ignore_errors;
+
+  END display_changes;
 
   -- Returns TRUE if table exists otherwise returns FALSE
   FUNCTION object_exists(
@@ -529,23 +590,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
      WHERE owner = in_object_owner
        AND object_name = in_object_name
        AND object_type = in_object_type;
-    RETURN l_cnt > 0;
-  END object_exists;
-
-  -- Returns TRUE if table exists otherwise returns FALSE
-  FUNCTION object_exists(
-    in_rename_rec  IN gt_rename_rec
-  )
-  RETURN BOOLEAN
-  AS
-    l_cnt PLS_INTEGER;
-  BEGIN
-    SELECT COUNT(*)
-      INTO l_cnt
-      FROM all_objects
-     WHERE owner = in_rename_rec.object_owner
-       AND object_name = in_rename_rec.current_name
-       AND object_type = in_rename_rec.object_type;
     RETURN l_cnt > 0;
   END object_exists;
 
@@ -583,110 +627,24 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     RETURN l_cnt > 0;
   END log_group_exists;
 
-  -- return DROP object DDL
-  FUNCTION get_drop_object_ddl(
-    in_object_type  IN VARCHAR2,
-    in_object_name  IN VARCHAR2,
-    in_object_owner IN VARCHAR2,
-    in_purge        IN BOOLEAN DEFAULT FALSE
+
+  -- Returns TRUE if table exists otherwise returns FALSE
+  FUNCTION object_exists(
+    in_rename_rec  IN gt_rename_rec
   )
-  RETURN VARCHAR2
+  RETURN BOOLEAN
   AS
-    l_sql VARCHAR2(32767);
+    l_cnt PLS_INTEGER;
   BEGIN
-    l_sql :=  'DROP '||in_object_type||' "'||in_object_owner||'"."'||in_object_name||'"';
-    IF in_object_type = 'TABLE' THEN
-      l_sql := l_sql||' CASCADE CONSTRAINTS';
-      IF in_purge THEN
-        l_sql := l_sql||' PURGE';
-      END IF;
-    END IF;
-
-    IF in_object_type = 'INDEX' THEN
-      l_sql := l_sql||' ONLINE';
-    END IF;
-
-    IF in_object_type = 'TYPE' THEN
-      l_sql := l_sql||' FORCE';
-    END IF;
-    RETURN l_sql;
-  END get_drop_object_ddl;
-
-  -- warpper for TABLE
-  FUNCTION get_drop_table_ddl(
-    in_table_name  IN VARCHAR2,
-    in_owner       IN VARCHAR2
-  )
-  RETURN VARCHAR2
-  AS
-  BEGIN
-    RETURN get_drop_object_ddl(
-             in_object_type  => 'TABLE',
-             in_object_name  => in_table_name,
-             in_object_owner => in_owner
-           );
-  END get_drop_table_ddl;
-
-  -- warpper for INDEX
-  FUNCTION get_drop_index_ddl(
-    in_index_name  IN VARCHAR2,
-    in_owner       IN VARCHAR2
-  )
-  RETURN VARCHAR2
-  AS
-  BEGIN
-    RETURN get_drop_object_ddl(
-             in_object_type  => 'INDEX',
-             in_object_name  => in_index_name,
-             in_object_owner => in_owner
-           );
-  END get_drop_index_ddl;
-
-  -- warpper for SEQUENCE
-  FUNCTION get_drop_sequence_ddl(
-    in_sequence_name  IN VARCHAR2,
-    in_owner          IN VARCHAR2
-  )
-  RETURN VARCHAR2
-  AS
-  BEGIN
-    RETURN get_drop_object_ddl(
-             in_object_type  => 'SEQUENCE',
-             in_object_name  => in_sequence_name,
-             in_object_owner => in_owner
-           );
-  END get_drop_sequence_ddl;
-
-
-  -- warpper for TYPE
-  FUNCTION get_drop_type_ddl(
-    in_type_name  IN VARCHAR2,
-    in_owner      IN VARCHAR2
-  )
-  RETURN VARCHAR2
-  AS
-  BEGIN
-    RETURN get_drop_object_ddl(
-             in_object_type  => 'TYPE',
-             in_object_name  => in_type_name,
-             in_object_owner => in_owner
-           );
-  END get_drop_type_ddl;
-
-  -- warpper for VIEW
-  FUNCTION get_drop_view_ddl(
-    in_view_name  IN VARCHAR2,
-    in_owner      IN VARCHAR2
-  )
-  RETURN VARCHAR2
-  AS
-  BEGIN
-    RETURN get_drop_object_ddl(
-             in_object_type  => 'VIEW',
-             in_object_name  => in_view_name,
-             in_object_owner => in_owner
-           );
-  END get_drop_view_ddl;
+    CASE 
+      WHEN in_rename_rec.object_type in ('CONSTRAINT', 'REFERENCE') THEN
+        RETURN constraint_exists(in_rename_rec.current_name, in_rename_rec.object_owner);
+      WHEN in_rename_rec.object_type = 'LOG GROUP' THEN
+        RETURN log_group_exists(in_rename_rec.current_name, in_rename_rec.object_owner);
+     ELSE
+       RETURN object_exists(in_rename_rec.object_type, in_rename_rec.current_name, in_rename_rec.object_owner);
+    END CASE;   
+  END object_exists;
 
   -- Drops object if it exists
   PROCEDURE exec_drop_object(
@@ -706,7 +664,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
          in_object_owner => in_object_owner
        )
     THEN
-      l_sql := get_drop_object_ddl(
+      l_sql := cort_comp_pkg.get_drop_object_ddl(
                  in_object_type  => in_object_type,
                  in_object_name  => in_object_name,
                  in_object_owner => in_object_owner,
@@ -743,37 +701,49 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   END exec_drop_table;
 
 
+  FUNCTION get_prev_synonym_name(in_table_name IN VARCHAR2)
+  RETURN VARCHAR2
+  AS
+  BEGIN
+    IF g_params.short_name.get_value IS NOT NULL THEN
+      RETURN SUBSTR(cort_params_pkg.gc_prev_prefix||g_params.short_name.get_value, 1, arrays.gc_name_max_length);
+    ELSE
+      RETURN SUBSTR(cort_params_pkg.gc_prev_prefix||in_table_name, 1, arrays.gc_name_max_length);
+    END IF;
+  END get_prev_synonym_name;
+
   PROCEDURE create_prev_synonym(
-    in_synonym_name  IN VARCHAR2,
-    in_table_name    IN VARCHAR2,
-    in_table_owner   IN VARCHAR2
+    in_owner        IN VARCHAR2,
+    in_table_name   IN VARCHAR2,
+    in_revert_name  IN VARCHAR2,
+    io_change_arr   IN OUT NOCOPY gt_change_arr
   )
   AS
-    l_sql         CLOB;
-    l_prev_schema arrays.gt_name;
+    l_prev_synonym    arrays.gt_name;
+    l_curr_table_name arrays.gt_name;
+    l_revert_sql      VARCHAR2(1200);
   BEGIN
-    debug('Create synonym "'||in_synonym_name||'" for "'||in_table_owner||'"."'||in_table_name||'"');
-    l_prev_schema := g_params.prev_schema.get_value;
-    IF l_prev_schema IS NOT NULL THEN
-       -- prev schema synonym
-       l_sql := 'begin
-         "'||l_prev_schema||'".cort_prev_exec_pkg.create_prev_synonym(
-           in_synonym_name => '''||in_synonym_name||''',
-           in_table_name   => '''||in_table_name||''',
-           in_table_owner  => '''||in_table_owner||'''
-         );
-       end;';
-    ELSIF cort_params_pkg.gc_prev_prefix IS NOT NULL THEN
-      -- same schema synonym
-      l_sql := 'CREATE OR REPLACE SYNONYM "'||in_table_owner||'"."'||substr(cort_params_pkg.gc_prev_prefix||in_synonym_name, 1, 30)||'" FOR "'||in_table_owner||'"."'||in_table_name||'"';
-    ELSE
-      raise_error('Not set CORT prev schema/prefix');
-    END IF;
-    debug('Prev synonym SQL: '||l_sql);
-    execute_immediate(
-      in_sql  => l_sql,
-      in_echo => FALSE,
-      in_test => FALSE
+    l_prev_synonym := get_prev_synonym_name(in_table_name);
+    BEGIN
+      SELECT table_name
+        INTO l_curr_table_name
+        FROM all_synonyms
+       WHERE owner = in_owner
+         AND synonym_name = l_prev_synonym;
+         
+      l_revert_sql := 'CREATE OR REPLACE SYNONYM "'||in_owner||'"."'||l_prev_synonym||'" FOR "'||in_owner||'"."'||l_curr_table_name||'"';
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        l_revert_sql := NULL;
+    END;
+
+    add_change(
+      io_change_arr, 
+      change_rec(
+        in_group_type => 'CREATE PREV SYNONYM',  
+        in_change_sql => 'CREATE OR REPLACE SYNONYM "'||in_owner||'"."'||l_prev_synonym||'" FOR "'||in_owner||'"."'||in_revert_name||'"',
+        in_revert_sql => l_revert_sql
+      )
     );
   END create_prev_synonym;
 
@@ -798,7 +768,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       exec_drop_object(
         in_object_type  => in_object_type,
         in_object_name  => l_revert_object_arr(i),
-        in_object_owner => in_object_owner
+        in_object_owner => in_object_owner,
+        in_purge        => g_run_params.purge.get_bool_value
       );
     END LOOP;
     -- delete any previous records for given object
@@ -808,91 +779,83 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       in_object_owner  => in_object_owner
     );
   END cleanup_history;
-
-  -- return string higher than given but not longer than 30 chars
-  FUNCTION get_next_name(in_name IN VARCHAR2)
-  RETURN VARCHAR2
-  AS
-    l_next_name VARCHAR2(24);
-    l_substr    VARCHAR2(24);
-    l_number    BINARY_INTEGER;
+  
+  FUNCTION translate64(in_number in number) RETURN char
+  as
   BEGIN
-    l_substr := SUBSTR(in_name, 1, 24);
-    l_substr := SUBSTR(in_name, -4, 4);
-    l_number := utl_raw.cast_to_binary_integer(utl_raw.cast_to_raw(l_substr));
-    l_number := l_number + 1;
-    l_substr := utl_raw.cast_to_varchar2(utl_raw.cast_from_binary_integer(l_number));
-    l_substr := REPLACE(l_substr, '"', '#');
-    l_next_name := SUBSTR(in_name, 1, LENGTH(in_name)-4)||l_substr;
-    RETURN l_next_name;
-  END get_next_name;
-
-  FUNCTION check_object_exist(
-    in_owner IN VARCHAR2,
-    in_name  IN VARCHAR2
-  )
-  RETURN BOOLEAN
+    RETURN 
+      CASE 
+        WHEN in_number BETWEEN 0 AND 9 THEN CHR(48+in_number)
+        WHEN in_number BETWEEN 10 AND 35 THEN CHR(55+in_number)
+        WHEN in_number BETWEEN 36 AND 37 THEN CHR(58+in_number)
+        WHEN in_number BETWEEN 38 AND 64 THEN CHR(59+in_number)
+      END;
+  END translate64;  
+  
+  FUNCTION get_64base_number(in_value in number) RETURN VARCHAR2
   AS
-    l_cnt PLS_INTEGER;
+    l_value     NUMBER;
+    l_remainder PLS_INTEGER;
+    l_result    VARCHAR2(30);
   BEGIN
-    BEGIN
-      SELECT 1
-        INTO l_cnt
-        FROM all_objects
-       WHERE owner = in_owner
-         AND object_name = in_name
-         AND ROWNUM <= 1;
-    EXCEPTION
-      WHEN NO_DATA_FOUND THEN
-        l_cnt := 0;
-    END;
-    RETURN l_cnt = 1;
-  END check_object_exist;
-
-  -- Returns temp name for given object (table|index|trigger|lob)
-  FUNCTION get_object_temp_name(
-    in_object_id   IN VARCHAR2,
-    in_owner       IN VARCHAR2,
-    in_prefix      IN VARCHAR2 DEFAULT cort_params_pkg.gc_temp_prefix
-  )
-  RETURN VARCHAR2
-  AS
-    l_temp_name VARCHAR2(24);
-  BEGIN
-    l_temp_name := in_prefix||TO_CHAR(in_object_id, 'fm0XXXXXXXXXXX');
-    WHILE check_object_exist(in_owner, l_temp_name) LOOP
-      l_temp_name := get_next_name(l_temp_name);
+    l_value := in_value;
+    WHILE l_value >= 64 LOOP
+      l_remainder := MOD(l_value, 64);
+      l_result := translate64(l_remainder)||l_result;
+      l_value := TRUNC(l_value / 64);
     END LOOP;
-    RETURN l_temp_name;
-  END get_object_temp_name;
-
+    l_remainder := MOD(l_value, 64);
+    l_result := LPAD(translate64(l_remainder)||l_result, 6, CHR(48));
+    RETURN l_result;
+  END get_64base_number;
+  
   -- Returns temp name for current session (tab|ind|trg|lob)
   FUNCTION get_object_temp_name(
-    in_object_type IN VARCHAR2,
-    in_owner       IN VARCHAR2,
-    in_prefix      IN VARCHAR2 DEFAULT cort_params_pkg.gc_temp_prefix
+    in_object_type  IN VARCHAR2,
+    in_object_name  IN VARCHAR2,
+    in_object_owner IN VARCHAR2,
+    in_prefix       IN VARCHAR2 DEFAULT cort_params_pkg.gc_temp_prefix
   )
   RETURN VARCHAR2
   AS
     l_object_type VARCHAR2(3);
-    l_temp_name   VARCHAR2(24);
+    l_temp_name   arrays.gt_name;
+    l_suffix      arrays.gt_name;
+    l_indx        PLS_INTEGER;
   BEGIN
     l_object_type := CASE in_object_type
-                       WHEN 'TABLE'    THEN 'TAB'
-                       WHEN 'INDEX'    THEN 'IND'
-                       WHEN 'TRIGGER'  THEN 'TRG'
-                       WHEN 'LOB'      THEN 'LOB'
-                       WHEN 'SEQUENCE' THEN 'SEQ'
-                       WHEN 'TYPE'     THEN 'TYP'
-                       WHEN 'SYNONYM'  THEN 'SYN'
+                       WHEN 'TABLE'      THEN 'TAB'
+                       WHEN 'INDEX'      THEN 'IND'
+                       WHEN 'TRIGGER'    THEN 'TRG'
+                       WHEN 'LOB'        THEN 'LOB'
+                       WHEN 'SEQUENCE'   THEN 'SEQ'
+                       WHEN 'TYPE'       THEN 'TYP'
+                       WHEN 'TYPE BODY'  THEN 'TPB'
+                       WHEN 'SYNONYM'    THEN 'SYN'
+                       WHEN 'CONSTRAINT' THEN 'CON'
+                       WHEN 'REFERENCE'  THEN 'REF'
+                       WHEN 'LOG GROUP'  THEN 'LOG'
                        ELSE 'OBJ'
                      END;
 
-                    --    AAAAA(5)   TTT(3)          XXXXXXXXXX(10)                    FFFFFF(6)
-    l_temp_name := SUBSTR(in_prefix||l_object_type||cort_aux_pkg.get_time_str||TO_CHAR(SYS_CONTEXT('USERENV','SID'),'fm0XXXXX'),1, 24);
-    WHILE check_object_exist(in_owner, l_temp_name) LOOP
-      l_temp_name := get_next_name(l_temp_name);
-    END LOOP;
+    IF in_object_type = 'TYPE' THEN
+      l_suffix := cort_params_pkg.gc_prefix||get_64base_number((sysdate-date'2023-01-01')*24*60*60);
+      l_temp_name := SUBSTR(in_object_name, 1, arrays.gc_name_max_length-length(l_suffix))||l_suffix;
+    ELSE    
+      IF g_temp_objects_arr.EXISTS(l_object_type) THEN
+        l_indx := g_temp_objects_arr(l_object_type) + 1;
+      ELSE
+        l_indx := 0;   
+      END IF;
+      g_temp_objects_arr(l_object_type) := l_indx;
+      
+      --             AAAAA(5)   TTT(3)         XXXXXXXXXXXXXXXXXX(18)                           #(1)     
+      l_temp_name := in_prefix||l_object_type||TO_CHAR(g_job_rec.job_id, 'yymmddhh24missff6')||'#'||TO_CHAR(l_indx, 'fm009');
+      $IF arrays.gc_long_name_supported $THEN
+        l_temp_name := SUBSTR(l_temp_name||'_'||in_object_name, 1, 128);
+      $END
+    END IF;
+
     RETURN l_temp_name;
   END get_object_temp_name;
 
@@ -900,7 +863,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   FUNCTION get_rename_rec(
     in_object_name  IN VARCHAR2,
     in_object_owner IN VARCHAR2,
-    in_object_type  IN VARCHAR2
+    in_object_type  IN VARCHAR2,
+    in_generated    IN VARCHAR2 DEFAULT 'N',
+    in_parent_name  IN VARCHAR2 DEFAULT NULL
   )
   RETURN gt_rename_rec
   AS
@@ -908,73 +873,39 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   BEGIN
     l_rec.object_type  := in_object_type;
     l_rec.object_name  := cort_parse_pkg.get_original_name(
-                            in_object_type => in_object_type,
                             in_object_name => in_object_name
                           );
     l_rec.object_owner := in_object_owner;
     l_rec.current_name := in_object_name;
-
-    SELECT object_id, generated
-      INTO l_rec.object_id, l_rec.generated
-      FROM all_objects
-     WHERE owner = in_object_owner
-       AND object_type = in_object_type
-       AND object_name = in_object_name
-       AND subobject_name IS NULL;
+    l_rec.generated := in_generated;
 
     l_rec.temp_name := get_object_temp_name(
-                         in_object_type => in_object_type,
-                         in_owner       => l_rec.object_owner,
-                         in_prefix      => cort_params_pkg.gc_temp_prefix
+                         in_object_type  => in_object_type,
+                         in_object_name  => l_rec.object_name,
+                         in_object_owner => l_rec.object_owner,
+                         in_prefix       => cort_params_pkg.gc_temp_prefix
                        );
     l_rec.cort_name := get_object_temp_name(
-                         in_object_id   => l_rec.object_id,
-                         in_owner       => l_rec.object_owner,
-                         in_prefix      => cort_params_pkg.gc_rlbk_prefix
+                         in_object_type  => in_object_type,
+                         in_object_name  => l_rec.object_name,
+                         in_object_owner => l_rec.object_owner,
+                         in_prefix       => cort_params_pkg.gc_rlbk_prefix
                        );
     l_rec.rename_name := get_object_temp_name(
-                           in_object_id   => l_rec.object_id,
-                           in_owner       => l_rec.object_owner,
-                           in_prefix      => cort_params_pkg.gc_rename_prefix
+                           in_object_type  => in_object_type,
+                           in_object_name  => l_rec.object_name,
+                           in_object_owner => l_rec.object_owner,
+                           in_prefix       => cort_params_pkg.gc_rename_prefix
                          );
 
-    RETURN l_rec;
-  END get_rename_rec;
+    l_rec.parent_object_name := in_parent_name;
 
-  -- Initializes and return gt_rename_rec record for constraints and log groups
-  FUNCTION get_rename_rec(
-    in_table_name_rec IN gt_rename_rec,
-    in_object_name    IN VARCHAR2,
-    in_object_owner   IN VARCHAR2,
-    in_object_type    IN VARCHAR2,
-    in_index          IN PLS_INTEGER,
-    in_generated      IN VARCHAR2
-  )
-  RETURN gt_rename_rec
-  AS
-    l_rec     gt_rename_rec;
-    l_prefix  VARCHAR2(10);
-  BEGIN
-    l_rec.object_type  := in_object_type;
-    l_rec.object_name  := cort_parse_pkg.get_original_name(
-                            in_object_type => in_object_type,
-                            in_object_name => in_object_name
-                          );
-    l_rec.object_owner := in_object_owner;
-    l_rec.object_id := NULL;
-    l_rec.generated := in_generated;
-    l_rec.current_name := in_object_name;
-    l_prefix := '$'||SUBSTR(in_object_type,1,1);
-    l_rec.temp_name := in_table_name_rec.temp_name||l_prefix||TO_CHAR(in_index,'fm0XXX');
-    l_rec.cort_name := in_table_name_rec.cort_name||l_prefix||TO_CHAR(in_index,'fm0XXX');
-    l_rec.rename_name := in_table_name_rec.rename_name||l_prefix||TO_CHAR(in_index,'fm0XXX');
-    l_rec.parent_object_name := in_table_name_rec.current_name;
     RETURN l_rec;
   END get_rename_rec;
 
   -- return column indx in table column_arr by name
   FUNCTION get_column_indx(
-    in_table_rec   IN cort_exec_pkg.gt_table_rec,
+    in_table_rec   IN gt_table_rec,
     in_column_name IN VARCHAR2
   )
   RETURN PLS_INTEGER
@@ -997,10 +928,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   AS
     TYPE t_subpartition_templates_arr IS TABLE OF all_subpartition_templates%ROWTYPE INDEX BY PLS_INTEGER;
-    TYPE t_lob_templates_arr          IS TABLE OF all_lob_templates%ROWTYPE INDEX BY PLS_INTEGER;
     l_subpartition_templates_arr  t_subpartition_templates_arr;
     l_subpart_template_indx       arrays.gt_name_indx;
-    l_lob_templates_arr           t_lob_templates_arr;
     l_lob_template_rec            gt_lob_template_rec;
     l_indx                        PLS_INTEGER;
     l_cnt                         PLS_INTEGER;
@@ -1022,18 +951,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       l_subpart_template_indx(l_subpartition_templates_arr(i).subpartition_name) := i;
     END LOOP;
 
-    SELECT DISTINCT *   -- use distinct as a workaround for Oracle bug - missing join condition which lead to rows duplication
-      BULK COLLECT
-      INTO l_lob_templates_arr
-      FROM all_lob_templates
-     WHERE user_name = io_table_rec.owner
-       AND table_name = io_table_rec.table_name;
-
-    FOR i IN 1..l_lob_templates_arr.COUNT LOOP
-      l_lob_template_rec.subpartition_name := l_lob_templates_arr(i).subpartition_name;
-      l_lob_template_rec.lob_column_name := l_lob_templates_arr(i).lob_col_name;
-      l_lob_template_rec.lob_segment_name := l_lob_templates_arr(i).lob_segment_name;
-      l_lob_template_rec.tablespace_name := l_lob_templates_arr(i).tablespace_name;
+    FOR x IN (SELECT DISTINCT ts.subpartition_position, t.*   -- use distinct as a workaround for Oracle bug - missing join condition which lead to rows duplication
+                FROM all_lob_templates t
+                JOIN all_subpartition_templates ts
+                  ON ts.user_name = t.user_name 
+                 AND ts.table_name = t.table_name
+                 AND ts.subpartition_name = t.subpartition_name 
+               WHERE t.user_name = io_table_rec.owner
+                 AND t.table_name = io_table_rec.table_name
+               ORDER by ts.subpartition_position, t.lob_col_name) 
+    LOOP
+      l_lob_template_rec.subpartition_name := x.subpartition_name;
+      l_lob_template_rec.lob_column_name := x.lob_col_name;
+      l_lob_template_rec.lob_segment_name := x.lob_segment_name;
+      l_lob_template_rec.tablespace_name := x.tablespace_name;
       IF l_subpart_template_indx.EXISTS(l_lob_template_rec.subpartition_name) THEN
         l_indx := l_subpart_template_indx(l_lob_template_rec.subpartition_name);
         l_cnt := io_table_rec.subpartition_template_arr(l_indx).lob_template_arr.COUNT;
@@ -1042,6 +973,409 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END LOOP;
 
   END read_subpartition_template;
+
+
+  PROCEDURE read_table_policies(
+    io_table_rec IN OUT NOCOPY gt_table_rec
+  )
+  AS
+    TYPE t_all_policies_arr         IS TABLE OF all_policies%ROWTYPE INDEX BY PLS_INTEGER;
+    l_all_policies_arr              t_all_policies_arr;
+    l_column_option_arr             arrays.gt_str_arr;
+  BEGIN
+    start_timer;
+    SELECT *
+      BULK COLLECT
+      INTO l_all_policies_arr
+      FROM all_policies
+     WHERE object_name = io_table_rec.table_name
+       AND object_owner = io_table_rec.owner;
+    
+    io_table_rec.policy_arr.DELETE;
+    FOR i IN 1..l_all_policies_arr.COUNT LOOP
+      io_table_rec.policy_arr(i).object_owner   := l_all_policies_arr(i).object_owner;
+      io_table_rec.policy_arr(i).object_name    := l_all_policies_arr(i).object_name;
+      io_table_rec.policy_arr(i).policy_group   := l_all_policies_arr(i).policy_group;
+      io_table_rec.policy_arr(i).policy_name    := l_all_policies_arr(i).policy_name;
+      io_table_rec.policy_arr(i).pf_owner       := l_all_policies_arr(i).pf_owner;
+      io_table_rec.policy_arr(i).package        := l_all_policies_arr(i).package;
+      io_table_rec.policy_arr(i).function       := l_all_policies_arr(i).function;
+      io_table_rec.policy_arr(i).sel            := l_all_policies_arr(i).sel;
+      io_table_rec.policy_arr(i).ins            := l_all_policies_arr(i).ins;
+      io_table_rec.policy_arr(i).upd            := l_all_policies_arr(i).upd;
+      io_table_rec.policy_arr(i).del            := l_all_policies_arr(i).del;
+      io_table_rec.policy_arr(i).idx            := l_all_policies_arr(i).idx;
+      io_table_rec.policy_arr(i).chk_option     := l_all_policies_arr(i).chk_option;
+      io_table_rec.policy_arr(i).enable         := l_all_policies_arr(i).enable;
+      io_table_rec.policy_arr(i).static_policy  := l_all_policies_arr(i).static_policy;
+      io_table_rec.policy_arr(i).policy_type    := l_all_policies_arr(i).policy_type;
+      io_table_rec.policy_arr(i).long_predicate := l_all_policies_arr(i).long_predicate;
+
+      SELECT sec_rel_column, column_option
+        BULK COLLECT
+        INTO io_table_rec.policy_arr(i).sec_rel_col_arr, l_column_option_arr
+        FROM all_sec_relevant_cols
+       WHERE object_owner = io_table_rec.policy_arr(i).object_owner
+         AND object_name = io_table_rec.policy_arr(i).object_name
+         AND policy_group = io_table_rec.policy_arr(i).policy_group
+         AND policy_name = io_table_rec.policy_arr(i).policy_name;
+
+      IF l_column_option_arr.COUNT > 0 THEN
+        io_table_rec.policy_arr(i).column_option := l_column_option_arr(1);
+      END IF;
+    END LOOP;
+
+    stop_timer;
+  END read_table_policies;
+
+
+  PROCEDURE enable_policies(
+    in_policy_arr     IN gt_policy_arr
+  )
+  AS
+    l_sql VARCHAR2(1000); 
+  BEGIN
+    FOR i IN 1..in_policy_arr.COUNT LOOP
+      l_sql := '
+begin
+  dbms_rls.enable_policy(
+    object_schema => :in_object_owner,
+    object_name   => :in_object_name,
+    policy_name   => :in_policy_name,
+    enable        => TRUE
+  );
+end;';     
+      EXECUTE IMMEDIATE l_sql USING in_policy_arr(i).object_owner, in_policy_arr(i).object_name,in_policy_arr(i).policy_name;    
+    END LOOP;
+  END enable_policies;
+
+  PROCEDURE disable_policies(
+    in_policy_arr     IN gt_policy_arr
+  )
+  AS
+    l_sql VARCHAR2(1000); 
+  BEGIN
+    FOR i IN 1..in_policy_arr.COUNT LOOP
+      l_sql := '
+begin
+  dbms_rls.enable_policy(
+    object_schema => :in_object_owner,
+    object_name   => :in_object_name,
+    policy_name   => :in_policy_name,
+    enable        => FALSE
+  );
+end;';
+      EXECUTE IMMEDIATE l_sql USING in_policy_arr(i).object_owner, in_policy_arr(i).object_name,in_policy_arr(i).policy_name;    
+    END LOOP;
+  END disable_policies;
+/*
+  PROCEDURE read_adt_synonyms
+  AS
+  BEGIN
+    IF g_type_synonym_arr.COUNT = 0 THEN
+      SELECT t.owner, t.type_name, s.synonym_name
+        BULK COLLECT
+        INTO g_type_owner_arr, g_type_name_arr, g_type_synonym_arr  
+        FROM all_types t          
+       INNER JOIN all_synonyms s
+          ON s.table_owner = t.owner
+         AND s.table_name = t.type_name
+         AND s.owner = s.table_owner
+         AND REGEXP_LIKE(table_name, '^'||cort_parse_pkg.get_regexp_const(SUBSTR(synonym_name, 1, arrays.gc_name_max_length - 6))||'#[\$-z]+$');
+    END IF;
+  END read_adt_synonyms;
+*/
+  PROCEDURE read_adt(
+    in_type_owner IN VARCHAR2,
+    in_type_name  IN VARCHAR2
+  )
+  AS
+    CURSOR all_super_types_cur(in_root_owner IN VARCHAR2, in_root_name IN VARCHAR2) IS
+    SELECT owner,
+           type_name,
+           typeid,
+           typeid_name,
+           supertype_owner,
+           supertype_name,
+           type_path,
+           attributes,
+           local_attributes,
+           local_attr_start_pos
+      FROM (SELECT owner,
+                   type_name,
+                   typeid,
+                   ''''||RAWTOHEX(typeid)||''',''"'||owner||'"."'||type_name||'"''' as typeid_name,
+                   supertype_owner,
+                   supertype_name,
+                   -(LEVEL-1) as type_depth,
+                   null as type_path,
+                   attributes,
+                   local_attributes,
+                   nvl(attributes - local_attributes,0) + 1 as local_attr_start_pos
+              FROM all_types
+             WHERE typecode = 'OBJECT'
+               AND owner = in_root_owner 
+           CONNECT BY PRIOR supertype_name = type_name
+             START WITH type_name = in_root_name
+           )
+     WHERE (type_name <> in_root_name)
+     ORDER BY type_depth
+   ;
+
+    CURSOR all_types_cur(in_root_owner IN VARCHAR2, in_root_name IN VARCHAR2, in_root_type_depth IN VARCHAR2) IS
+    SELECT owner,
+           type_name,
+           typeid,
+           typeid_name,
+           supertype_owner,
+           supertype_name,
+           in_root_type_depth || type_path as type_path,
+           attributes,
+           local_attributes,
+           local_attr_start_pos
+      FROM (SELECT owner,
+                   type_name,
+                   typeid,
+                   ''''||RAWTOHEX(typeid)||''',''"'||owner||'"."'||type_name||'"''' as typeid_name,
+                   supertype_owner,
+                   supertype_name,
+                   LEVEL type_depth,
+                   REPLACE(SYS_CONNECT_BY_PATH(REPLACE('"'||type_name||'"','\',chr(0)),'\'),chr(0),'\') type_path,
+                   attributes,
+                   local_attributes,
+                   nvl(attributes - local_attributes,0) + 1 as local_attr_start_pos
+              FROM all_types
+             WHERE typecode = 'OBJECT'
+               AND owner = in_root_owner 
+           CONNECT BY supertype_name = PRIOR type_name
+             START WITH type_name = in_root_name
+           );
+
+
+    TYPE t_all_type_arr         IS TABLE OF all_types_cur%ROWTYPE INDEX BY PLS_INTEGER;
+    TYPE t_all_type_attr_arr    IS TABLE OF all_type_attrs%ROWTYPE INDEX BY PLS_INTEGER;
+    l_all_type_arr          t_all_type_arr;
+    l_all_type_attrs_arr    t_all_type_attr_arr;
+    l_adt_rec               gt_adt_rec;
+    l_type_path             VARCHAR2(32767);
+    l_attr_define_type_arr  arrays.gt_name_arr;
+  BEGIN
+    IF g_adt_arr.EXISTS('"'||in_type_owner||'"."'||in_type_name||'"') THEN
+      RETURN; 
+    END IF;
+    IF in_type_owner IS NULL OR 
+       (in_type_owner  = 'SYS' AND in_type_name IN ('XMLTYPE', 'ANYDATA', 'ANYDATATYPE', 'ANYDATASET')) THEN
+      RETURN;
+    END IF; 
+
+    start_timer;
+    debug('reading ADT "'||in_type_owner||'"."'||in_type_name||'"');
+    
+/*    
+    BEGIN
+      SELECT owner, type_name
+        INTO l_root_owner, l_root_name 
+        FROM all_types
+       WHERE supertype_name is null  
+     CONNECT BY owner = PRIOR supertype_owner
+         AND type_name = PRIOR supertype_name 
+       START WITH owner = in_type_owner
+         AND type_name = in_type_name;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        raise_error('Invalid ADT type name: "'||in_type_owner||'"."'||in_type_name||'"');
+    END;     
+*/
+
+
+    -- read first all super types (excluding current type itself)
+    OPEN all_super_types_cur(in_type_owner, in_type_name);
+    FETCH all_super_types_cur 
+     BULK COLLECT 
+     INTO l_all_type_arr;
+    CLOSE all_super_types_cur;
+    
+
+    l_type_path := null;
+    l_attr_define_type_arr.DELETE;
+    
+    FOR i IN 1..l_all_type_arr.COUNT LOOP
+      l_type_path := l_type_path||'\"'||l_all_type_arr(i).type_name||'"';
+      FOR j IN l_all_type_arr(i).local_attr_start_pos..l_all_type_arr(i).attributes LOOP
+        l_attr_define_type_arr(j) := l_all_type_arr(i).type_name;
+      END LOOP; 
+    END LOOP;
+    
+    l_all_type_arr.DELETE;
+    
+    -- read current type and all inhereted subtypes
+    OPEN all_types_cur(in_type_owner, in_type_name, l_type_path);
+    FETCH all_types_cur 
+     BULK COLLECT 
+     INTO l_all_type_arr;
+    CLOSE all_types_cur;
+    
+    IF l_all_type_arr.COUNT = 0 THEN
+      debug('ADT type "'||in_type_owner||'"."'||in_type_name||'" not found');
+      RETURN; 
+    END IF;
+
+    FOR i IN 1..l_all_type_arr.COUNT LOOP
+      IF NOT g_adt_arr.EXISTS('"'||l_all_type_arr(i).owner||'"."'||l_all_type_arr(i).type_name||'"') THEN
+        debug('read ADT: '||l_all_type_arr(i).type_name);
+
+        l_adt_rec.attribute_arr.DELETE;
+        l_adt_rec.attribute_ind_arr.DELETE;
+        l_adt_rec.subtype_adt_arr.DELETE;
+
+        l_adt_rec.owner                := l_all_type_arr(i).owner;
+        l_adt_rec.type_name            := l_all_type_arr(i).type_name;
+        l_adt_rec.typeid               := l_all_type_arr(i).typeid;
+        l_adt_rec.supertype_owner      := l_all_type_arr(i).supertype_owner;
+        l_adt_rec.supertype_name       := l_all_type_arr(i).supertype_name;
+        l_adt_rec.type_path            := l_all_type_arr(i).type_path;
+        l_adt_rec.typeid_name          := l_all_type_arr(i).typeid_name;
+        l_adt_rec.attributes           := l_all_type_arr(i).attributes;
+        l_adt_rec.local_attributes     := l_all_type_arr(i).local_attributes;
+        l_adt_rec.local_attr_start_pos := l_all_type_arr(i).local_attr_start_pos;
+
+
+        -- find all children subtypes      
+        FOR k IN i+1..l_all_type_arr.COUNT LOOP
+          IF SUBSTR(l_all_type_arr(k).type_path, 1, LENGTH(l_adt_rec.type_path)+1) = l_adt_rec.type_path||'\' THEN
+            l_adt_rec.subtype_adt_arr(l_adt_rec.subtype_adt_arr.COUNT+1) := l_all_type_arr(k).type_name;
+            l_adt_rec.typeid_name   := l_adt_rec.typeid_name||','||l_all_type_arr(k).typeid_name;  
+          ELSE
+            EXIT;
+          END IF; 
+        END LOOP;
+
+        -- read attributes
+        SELECT *
+          BULK COLLECT
+          INTO l_all_type_attrs_arr
+          FROM all_type_attrs
+         WHERE owner = l_adt_rec.owner
+           AND type_name = l_adt_rec.type_name
+         ORDER BY attr_no;
+
+        debug('read ADT: '||l_adt_rec.type_name||' number of attributes '||l_all_type_attrs_arr.count);
+        
+
+        FOR j IN 1..l_all_type_attrs_arr.COUNT LOOP
+          l_adt_rec.attribute_ind_arr(l_all_type_attrs_arr(j).attr_name) := j;
+          debug('read ADT: '||l_adt_rec.type_name||' attr #'||j||' = '||l_all_type_attrs_arr(j).attr_name);
+          
+          l_adt_rec.attribute_arr(j).owner              := l_all_type_attrs_arr(j).owner;
+          l_adt_rec.attribute_arr(j).type_name          := l_all_type_attrs_arr(j).type_name;
+          l_adt_rec.attribute_arr(j).attr_name          := l_all_type_attrs_arr(j).attr_name;
+          l_adt_rec.attribute_arr(j).attr_type_mod      := l_all_type_attrs_arr(j).attr_type_mod;
+          l_adt_rec.attribute_arr(j).attr_type_owner    := l_all_type_attrs_arr(j).attr_type_owner;
+          l_adt_rec.attribute_arr(j).attr_type_name     := l_all_type_attrs_arr(j).attr_type_name;
+          l_adt_rec.attribute_arr(j).length             := l_all_type_attrs_arr(j).length;
+          l_adt_rec.attribute_arr(j).precision          := l_all_type_attrs_arr(j).precision;
+          l_adt_rec.attribute_arr(j).scale              := l_all_type_attrs_arr(j).scale;
+          l_adt_rec.attribute_arr(j).character_set_name := l_all_type_attrs_arr(j).character_set_name;
+          l_adt_rec.attribute_arr(j).attr_no            := l_all_type_attrs_arr(j).attr_no;
+          l_adt_rec.attribute_arr(j).inherited          := l_all_type_attrs_arr(j).inherited;
+          $IF dbms_db_version.version >= 11 $THEN
+          l_adt_rec.attribute_arr(j).char_used          := CASE l_all_type_attrs_arr(j).char_used WHEN 'B' THEN 'BYTE' WHEN 'C' THEN 'CHAR' END;
+          $END
+
+          IF l_adt_rec.attribute_arr(j).inherited = 'YES' THEN
+            l_adt_rec.attribute_arr(j).defined_type_name       := l_attr_define_type_arr(j);
+          ELSE
+            l_adt_rec.attribute_arr(j).defined_type_name       := l_adt_rec.type_name;
+            l_attr_define_type_arr(j)                          := l_adt_rec.type_name;
+          END IF;
+        END LOOP;
+
+        g_adt_arr('"'||l_adt_rec.owner||'"."'||l_adt_rec.type_name||'"') := l_adt_rec; 
+      
+        FOR j IN 1..l_all_type_attrs_arr.COUNT LOOP
+          IF l_all_type_attrs_arr(j).attr_type_owner IS NOT NULL AND 
+             NOT (l_all_type_attrs_arr(j).attr_type_owner = 'SYS' AND l_all_type_attrs_arr(j).attr_type_name IN ('XMLTYPE', 'ANYDATA', 'ANYDATATYPE', 'ANYDATASET')) 
+          THEN
+            -- read ADT attribute types
+            read_adt(l_all_type_attrs_arr(j).attr_type_owner, l_all_type_attrs_arr(j).attr_type_name);
+          END IF;
+        END LOOP;
+      ELSE
+        debug('ADT type "'||in_type_owner||'"."'||in_type_name||'" has been read already');
+      END IF;
+      
+    END LOOP;                                     
+
+/*
+        BEGIN
+          SELECT object_type
+            INTO l_object_type 
+            FROM all_objects
+           WHERE owner = in_type_owner
+             AND object_name = in_type_name
+             AND object_type in ('TYPE','SYNONYM');
+        EXCEPTION
+          WHEN NO_DATA_FOUND THEN
+            RETURN;
+        END;  
+      
+        IF l_object_type = 'SYNONYM' THEN 
+          BEGIN
+            SELECT owner, table_name, synonym_name
+              INTO out_adt_rec.type_owner, out_adt_rec.type_name, out_adt_rec.synonym_name 
+              FROM all_synonyms
+             WHERE owner = in_type_owner
+               AND synonym_name = in_type_name
+               AND table_owner = owner;
+          EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+              raise_error('Type assosiated with synonym "'||in_type_name||'" not found');
+          END;
+        ELSE
+          out_adt_rec.type_owner := in_type_owner; 
+          out_adt_rec.type_name := in_type_name; 
+          BEGIN
+            SELECT synonym_name
+              INTO out_adt_rec.synonym_name 
+              FROM all_synonyms
+             WHERE owner = in_type_owner
+               AND table_name = in_type_name
+               AND REGEXP_LIKE(table_name, '^'||cort_parse_pkg.get_regexp_const(SUBSTR(synonym_name, 1, arrays.gc_name_max_length-6))||'#[\$-z]+$')
+               AND table_owner = owner;
+          EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+              out_adt_rec.synonym_name := null;
+          END;
+        END IF;
+        
+        debug('object name is '||out_adt_rec.type_name);
+        debug('synonym name is '||out_adt_rec.synonym_name);
+                              
+*/
+            
+    stop_timer;
+  END read_adt;
+  
+  
+  -- returns adt_rec by type_owner and type_name
+  FUNCTION get_adt_rec(    
+    in_owner      IN VARCHAR2,
+    in_type_name  IN VARCHAR2
+  ) 
+  RETURN gt_adt_rec
+  AS
+  BEGIN
+    IF NOT g_adt_arr.EXISTS('"'||in_owner||'"."'||in_type_name||'"') THEN
+      read_adt(in_owner, in_type_name);
+    END IF;
+      
+    IF g_adt_arr.EXISTS('"'||in_owner||'"."'||in_type_name||'"') THEN
+      RETURN g_adt_arr('"'||in_owner||'"."'||in_type_name||'"');
+    ELSE
+     RETURN NULL;  
+    END IF;
+  END get_adt_rec;
+  
 
   -- read table attributes from all_tables/all_part_tables
   PROCEDURE read_table(
@@ -1089,6 +1423,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     out_table_rec.object_id_type := l_all_tables_rec.object_id_type;
     out_table_rec.table_type_owner := l_all_tables_rec.table_type_owner;
     out_table_rec.table_type := l_all_tables_rec.table_type;
+
     out_table_rec.row_movement := l_all_tables_rec.row_movement;
     out_table_rec.dependencies := l_all_tables_rec.dependencies;
     out_table_rec.physical_attr_rec.pct_free := NVL(l_all_tables_rec.pct_free,10);
@@ -1195,8 +1530,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         out_table_rec.overflow_physical_attr_rec.storage.freelists := l_all_tables_rec.freelists;
         out_table_rec.overflow_physical_attr_rec.storage.freelist_groups := l_all_tables_rec.freelist_groups;
         out_table_rec.overflow_physical_attr_rec.storage.buffer_pool := NULLIF(l_all_tables_rec.buffer_pool,'DEFAULT');
-        out_table_rec.overflow_tablespace := l_indexes_rec.tablespace_name;
-        out_table_rec.overflow_logging := l_indexes_rec.logging;
+        out_table_rec.overflow_tablespace := l_all_tables_rec.tablespace_name;
+        out_table_rec.overflow_logging := l_all_tables_rec.logging;
       EXCEPTION
         WHEN NO_DATA_FOUND THEN
           NULL;
@@ -1374,11 +1709,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       WHEN NO_DATA_FOUND THEN
         NULL;
     END;
+    
+    -- read exsting policies
+    read_table_policies(
+      io_table_rec   => out_table_rec
+    );
+    
 
     IF in_read_data THEN
+      -- disable existing policies before read source table
+      disable_policies(
+        in_policy_arr => out_table_rec.policy_arr
+      );
       l_sql := 'SELECT COUNT(*) FROM "'||in_owner||'"."'||in_table_name||'" WHERE ROWNUM = 1';
       cort_log_pkg.execute(
-        in_text      => l_sql
+        in_sql  => l_sql,
+        in_echo => FALSE        
       );
       BEGIN
         EXECUTE IMMEDIATE l_sql INTO l_cnt;
@@ -1386,8 +1732,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         WHEN OTHERS THEN
           cort_log_pkg.update_exec_time;
           cort_log_pkg.error('Error in parsing/executing sql (select count)',l_sql);
+          enable_policies(
+            in_policy_arr => out_table_rec.policy_arr
+          );
       END;
       cort_log_pkg.update_exec_time;
+      enable_policies(
+        in_policy_arr => out_table_rec.policy_arr
+      );
     END IF;
     out_table_rec.is_table_empty := l_cnt = 0;
     stop_timer;
@@ -1398,7 +1750,26 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     io_table_rec IN OUT NOCOPY gt_table_rec
   )
   AS
-    TYPE t_all_tab_cols_arr IS TABLE OF all_tab_cols%ROWTYPE INDEX BY PLS_INTEGER;
+    CURSOR c_all_tab_cols IS
+    SELECT tc.*, s.table_name as original_data_type, TRIM(oc.substitutable) AS substitutable, cc.comments
+      FROM all_tab_cols tc
+      LEFT JOIN all_synonyms s
+        ON s.owner = tc.owner
+       AND s.synonym_name = tc.data_type
+       AND s.table_owner = tc.data_type_owner
+      LEFT JOIN all_obj_colattrs oc
+        ON oc.owner = tc.owner
+       AND oc.table_name = tc.table_name
+       AND oc.column_name = tc.qualified_col_name
+      LEFT JOIN all_col_comments cc
+        ON cc.owner = tc.owner
+       AND cc.table_name = tc.table_name
+       AND cc.column_name = tc.column_name
+     WHERE tc.owner = io_table_rec.owner
+       AND tc.table_name = io_table_rec.table_name
+     ORDER BY tc.internal_column_id;
+
+    TYPE t_all_tab_cols_arr IS TABLE OF c_all_tab_cols%ROWTYPE INDEX BY PLS_INTEGER;
     TYPE t_all_enc_cols_arr IS TABLE OF all_encrypted_columns%ROWTYPE INDEX BY PLS_INTEGER;
     l_tab_cols_arr             t_all_tab_cols_arr;
     l_enc_cols_arr             t_all_enc_cols_arr;
@@ -1411,13 +1782,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_invisible_col_cnt        PLS_INTEGER;
   BEGIN
     start_timer;
-    SELECT *
+    OPEN c_all_tab_cols;
+    FETCH c_all_tab_cols
       BULK COLLECT
-      INTO l_tab_cols_arr
-      FROM all_tab_cols
-     WHERE owner = io_table_rec.owner
-       AND table_name = io_table_rec.table_name
-     ORDER BY internal_column_id;
+      INTO l_tab_cols_arr;
+    CLOSE c_all_tab_cols;  
 
     FOR i IN 1..io_table_rec.part_key_column_arr.COUNT LOOP
       l_part_key_col_indx_arr(io_table_rec.part_key_column_arr(i)) := i;
@@ -1435,12 +1804,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       l_cluster_column_indx_arr(io_table_rec.cluster_column_arr(i)) := i;
     END LOOP;
 
-
     l_unused_col_cnt := 0;
     l_invisible_col_cnt := 0;
     FOR i IN 1..l_tab_cols_arr.COUNT LOOP
       io_table_rec.column_indx_arr(l_tab_cols_arr(i).column_name) := i;
-      io_table_rec.column_qualified_indx_arr(l_tab_cols_arr(i).qualified_col_name) := i;
       io_table_rec.column_arr(i).column_name := l_tab_cols_arr(i).column_name;
       io_table_rec.column_arr(i).column_indx := i;
       io_table_rec.column_arr(i).data_type := l_tab_cols_arr(i).data_type;
@@ -1459,6 +1826,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       io_table_rec.column_arr(i).internal_column_id := l_tab_cols_arr(i).internal_column_id;
       io_table_rec.column_arr(i).hidden_column := l_tab_cols_arr(i).hidden_column;
       io_table_rec.column_arr(i).qualified_col_name := l_tab_cols_arr(i).qualified_col_name;
+      io_table_rec.column_arr(i).original_data_type := l_tab_cols_arr(i).original_data_type;
+      io_table_rec.column_arr(i).substitutable := l_tab_cols_arr(i).substitutable;
+      io_table_rec.column_arr(i).col_comment := l_tab_cols_arr(i).comments;
+
       $IF dbms_db_version.version >= 11 $THEN
       io_table_rec.column_arr(i).virtual_column := l_tab_cols_arr(i).virtual_column;
       $END
@@ -1469,14 +1840,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       io_table_rec.column_arr(i).evaluation_edition := l_tab_cols_arr(i).evaluation_edition;
       io_table_rec.column_arr(i).unusable_before := l_tab_cols_arr(i).unusable_before;
       io_table_rec.column_arr(i).unusable_beginning := l_tab_cols_arr(i).unusable_beginning;
+      $ELSE
+      io_table_rec.column_arr(i).user_generated := CASE WHEN io_table_rec.column_arr(i).hidden_column = 'NO' AND io_table_rec.column_arr(i).column_name = io_table_rec.column_arr(i).qualified_col_name THEN 'YES' ELSE 'NO' END; 
       $END
       $IF dbms_db_version.version >= 18 $THEN
       io_table_rec.column_arr(i).collation := l_tab_cols_arr(i).collation;
       io_table_rec.column_arr(i).collated_column_id := l_tab_cols_arr(i).collated_column_id;
       $END
       io_table_rec.column_arr(i).segment_column_id := l_tab_cols_arr(i).segment_column_id -
-                                                      CASE WHEN g_params.compare.value_exists('IGNORE_UNUSED') THEN l_unused_col_cnt ELSE 0 END -
-                                                      CASE WHEN g_params.compare.value_exists('IGNORE_INVISIBLE') THEN l_invisible_col_cnt ELSE 0 END;
+                                                      CASE WHEN g_params.compare.exist('IGNORE_UNUSED') THEN l_unused_col_cnt ELSE 0 END -
+                                                      CASE WHEN g_params.compare.exist('IGNORE_INVISIBLE') THEN l_invisible_col_cnt ELSE 0 END;
       io_table_rec.column_arr(i).unused_segment_shift := l_unused_col_cnt;
       io_table_rec.column_arr(i).invisible_segment_shift := l_invisible_col_cnt;
       -- Special case for unused columns: increase counter and deduct from segment_id for next columns
@@ -1511,8 +1884,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       THEN
         io_table_rec.column_arr(i).virtual_column := 'NO';
         io_table_rec.column_arr(i).segment_column_id := l_tab_cols_arr(i+1).segment_column_id -
-                                                        CASE WHEN g_params.compare.value_exists('IGNORE_UNUSED') THEN l_unused_col_cnt ELSE 0 END -
-                                                        CASE WHEN g_params.compare.value_exists('IGNORE_INVISIBLE') THEN l_invisible_col_cnt ELSE 0 END;
+                                                        CASE WHEN g_params.compare.exist('IGNORE_UNUSED') THEN l_unused_col_cnt ELSE 0 END -
+                                                        CASE WHEN g_params.compare.exist('IGNORE_INVISIBLE') THEN l_invisible_col_cnt ELSE 0 END;
+      END IF;
+
+      IF io_table_rec.column_arr(i).data_type_owner IS NOT NULL AND 
+         NOT (io_table_rec.column_arr(i).data_type_owner in ('SYS','PUBLIC') AND io_table_rec.column_arr(i).data_type IN ('XMLTYPE', 'ANYDATA', 'ANYDATATYPE', 'ANYDATASET')) 
+      THEN
+        io_table_rec.column_arr(i).adt_flag := TRUE;
+        read_adt(io_table_rec.column_arr(i).data_type_owner,io_table_rec.column_arr(i).data_type);
+      ELSE
+        io_table_rec.column_arr(i).adt_flag := FALSE;
       END IF;
 
       io_table_rec.column_arr(i).partition_key := l_part_key_col_indx_arr.EXISTS(io_table_rec.column_arr(i).column_name) OR
@@ -1537,6 +1919,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         END CASE;
       END IF;
       io_table_rec.column_arr(i).temp_column_name := cort_params_pkg.gc_temp_prefix||'COLUMN_'||TO_CHAR(i,'fm0XXX');
+
+      IF io_table_rec.column_arr(i).col_comment LIKE cort_params_pkg.gc_prefix||cort_params_pkg.gc_force_value_prefix||'%' AND io_table_rec.column_arr(i).qualified_col_name = io_table_rec.column_arr(i).column_name THEN
+        io_table_rec.column_arr(i).qualified_col_name := SUBSTR(io_table_rec.column_arr(i).col_comment, LENGTH(cort_params_pkg.gc_prefix||cort_params_pkg.gc_force_value_prefix)+1, 32767);
+
+      END IF; 
+
+      IF io_table_rec.column_arr(i).column_name = 'SYS_NC_TYPEID$' AND io_table_rec.column_arr(i).data_type = 'RAW' AND 
+         io_table_rec.column_arr(i).user_generated = 'NO' AND io_table_rec.column_arr(i).hidden_column = 'YES' 
+      THEN
+        io_table_rec.column_arr(i).qualified_col_name := 'SYS_TYPEID("SYS_NC_ROWINFO$")';
+      END IF;  
+
+
+      debug('Qualified name for '||io_table_rec.column_arr(i).column_name||' is '||io_table_rec.column_arr(i).qualified_col_name);
+
+      io_table_rec.column_qualified_indx_arr(io_table_rec.column_arr(i).qualified_col_name) := i;
     END LOOP;
 
     $IF dbms_db_version.ver_le_10_2 OR dbms_db_version.version >= 11 $THEN
@@ -1706,6 +2104,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     out_index_rec.compression       := in_all_indexes_rec.compression;
     out_index_rec.prefix_length     := case when out_index_rec.compression in ('PREFIX', 'ENABLED') and in_all_indexes_rec.prefix_length > 0 then in_all_indexes_rec.prefix_length end;
     out_index_rec.tablespace_name   := in_all_indexes_rec.tablespace_name;
+    out_index_rec.status            := in_all_indexes_rec.status;
     out_index_rec.physical_attr_rec.pct_free  := in_all_indexes_rec.pct_free;
     out_index_rec.physical_attr_rec.ini_trans := in_all_indexes_rec.ini_trans;
     out_index_rec.physical_attr_rec.max_trans := in_all_indexes_rec.max_trans;
@@ -1748,7 +2147,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     out_index_rec.rename_rec := get_rename_rec(
                                   in_object_name  => out_index_rec.index_name,
                                   in_object_owner => out_index_rec.owner,
-                                  in_object_type  => 'INDEX'
+                                  in_object_type  => 'INDEX',
+                                  in_generated    => out_index_rec.generated
                                 );
 
     read_index_cols(io_index_rec => out_index_rec);
@@ -1756,6 +2156,120 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     read_part_index(io_index_rec => out_index_rec);
 
   END assign_index_rec;
+
+  -- reads table partitions
+  PROCEDURE read_index_partitions(
+    io_index_rec IN OUT NOCOPY gt_index_rec
+  )
+  AS
+    TYPE gt_ind_partitions_arr IS TABLE OF all_ind_partitions%ROWTYPE INDEX BY PLS_INTEGER;
+    l_ind_partitions_arr       gt_ind_partitions_arr;
+  BEGIN
+    start_timer;
+    IF io_index_rec.partitioned = 'YES' THEN
+      SELECT *
+        BULK COLLECT
+        INTO l_ind_partitions_arr
+        FROM all_ind_partitions
+       WHERE index_owner = io_index_rec.owner
+         AND index_name = io_index_rec.index_name
+       ORDER BY partition_position;
+    END IF;
+
+    FOR i IN 1..l_ind_partitions_arr.COUNT LOOP
+      io_index_rec.partition_indx_arr(l_ind_partitions_arr(i).partition_name) := i;
+      io_index_rec.partition_arr(i).indx               := i;
+      io_index_rec.partition_arr(i).object_type        := 'INDEX';
+      io_index_rec.partition_arr(i).object_owner       := l_ind_partitions_arr(i).index_owner;
+      io_index_rec.partition_arr(i).object_name        := l_ind_partitions_arr(i).index_name;
+      io_index_rec.partition_arr(i).partition_level    := 'PARTITION';
+      io_index_rec.partition_arr(i).partition_type     := io_index_rec.partitioning_type;
+      io_index_rec.partition_arr(i).partition_name     := l_ind_partitions_arr(i).partition_name;
+      io_index_rec.partition_arr(i).composite          := l_ind_partitions_arr(i).composite;
+      io_index_rec.partition_arr(i).high_value         := l_ind_partitions_arr(i).high_value;
+      io_index_rec.partition_arr(i).position           := l_ind_partitions_arr(i).partition_position;
+      io_index_rec.partition_arr(i).physical_attr_rec.pct_free := l_ind_partitions_arr(i).pct_free;
+      io_index_rec.partition_arr(i).physical_attr_rec.ini_trans := l_ind_partitions_arr(i).ini_trans;
+      io_index_rec.partition_arr(i).physical_attr_rec.max_trans := l_ind_partitions_arr(i).max_trans;
+      io_index_rec.partition_arr(i).physical_attr_rec.storage.initial_extent := l_ind_partitions_arr(i).initial_extent;
+--      io_index_rec.partition_arr(i).physical_attr_rec.storage.next_extent := l_ind_partitions_arr(i).next_extent;
+      io_index_rec.partition_arr(i).physical_attr_rec.storage.min_extents := l_ind_partitions_arr(i).min_extent;
+--      io_index_rec.partition_arr(i).physical_attr_rec.storage.max_extents := l_ind_partitions_arr(i).max_extent;
+      io_index_rec.partition_arr(i).physical_attr_rec.storage.pct_increase := l_ind_partitions_arr(i).pct_increase;
+      io_index_rec.partition_arr(i).physical_attr_rec.storage.freelists := l_ind_partitions_arr(i).freelists;
+      io_index_rec.partition_arr(i).physical_attr_rec.storage.freelist_groups := l_ind_partitions_arr(i).freelist_groups;
+      io_index_rec.partition_arr(i).physical_attr_rec.storage.buffer_pool := NULLIF(l_ind_partitions_arr(i).buffer_pool,'DEFAULT');
+      io_index_rec.partition_arr(i).compression_rec.compression := l_ind_partitions_arr(i).compression;
+      io_index_rec.partition_arr(i).logging := l_ind_partitions_arr(i).logging;
+      io_index_rec.partition_arr(i).tablespace_name := l_ind_partitions_arr(i).tablespace_name;
+    END LOOP;
+    stop_timer;
+  END read_index_partitions;
+
+  -- reads table subpartitions
+  PROCEDURE read_index_subpartitions(
+    io_index_rec IN OUT NOCOPY gt_index_rec
+  )
+  AS
+    TYPE gt_ind_subpartitions_arr IS TABLE OF all_ind_subpartitions%ROWTYPE INDEX BY PLS_INTEGER;
+    l_ind_subpartitions_arr       gt_ind_subpartitions_arr;
+    l_last_partition_name         arrays.gt_name;
+    l_partition_name              arrays.gt_name;
+    l_partition_indx              PLS_INTEGER;
+  BEGIN
+    start_timer;
+    IF io_index_rec.subpartitioning_type IS NOT NULL THEN
+      SELECT *
+        BULK COLLECT
+        INTO l_ind_subpartitions_arr
+        FROM all_ind_subpartitions
+       WHERE index_owner = io_index_rec.owner
+         AND index_name = io_index_rec.table_name
+       ORDER BY partition_name, subpartition_position;
+    END IF;
+
+    l_last_partition_name := NULL;
+    FOR i IN 1..l_ind_subpartitions_arr.COUNT LOOP
+      io_index_rec.subpartition_indx_arr(l_ind_subpartitions_arr(i).subpartition_name) := i;
+      l_partition_name := l_ind_subpartitions_arr(i).partition_name;
+      IF io_index_rec.partition_indx_arr.EXISTS(l_partition_name) THEN
+        l_partition_indx := io_index_rec.partition_indx_arr(l_partition_name);
+        IF l_last_partition_name = l_partition_name THEN
+          io_index_rec.partition_arr(l_partition_indx).subpartition_to_indx := i;
+        ELSE
+          l_last_partition_name := l_partition_name;
+          io_index_rec.partition_arr(l_partition_indx).subpartition_from_indx := i;
+          io_index_rec.partition_arr(l_partition_indx).subpartition_to_indx := i;
+        END IF;
+      END IF;
+      io_index_rec.subpartition_arr(i).indx               := i;
+      io_index_rec.subpartition_arr(i).object_type        := 'INDEX';
+      io_index_rec.subpartition_arr(i).object_owner       := l_ind_subpartitions_arr(i).index_owner;
+      io_index_rec.subpartition_arr(i).object_name        := l_ind_subpartitions_arr(i).index_name;
+      io_index_rec.subpartition_arr(i).partition_level    := 'SUBPARTITION';
+      io_index_rec.subpartition_arr(i).partition_type     := io_index_rec.subpartitioning_type;
+      io_index_rec.subpartition_arr(i).partition_name     := l_ind_subpartitions_arr(i).subpartition_name;
+      io_index_rec.subpartition_arr(i).parent_partition_name := l_ind_subpartitions_arr(i).partition_name;
+      io_index_rec.subpartition_arr(i).high_value         := l_ind_subpartitions_arr(i).high_value;
+      io_index_rec.subpartition_arr(i).position           := l_ind_subpartitions_arr(i).subpartition_position;
+      io_index_rec.subpartition_arr(i).physical_attr_rec.pct_free := l_ind_subpartitions_arr(i).pct_free;
+      io_index_rec.subpartition_arr(i).physical_attr_rec.ini_trans := l_ind_subpartitions_arr(i).ini_trans;
+      io_index_rec.subpartition_arr(i).physical_attr_rec.max_trans := l_ind_subpartitions_arr(i).max_trans;
+      io_index_rec.subpartition_arr(i).physical_attr_rec.storage.initial_extent := l_ind_subpartitions_arr(i).initial_extent;
+      --io_index_rec.subpartition_arr(i).physical_attr_rec.storage.next_extent := l_ind_subpartitions_arr(i).next_extent;
+      io_index_rec.subpartition_arr(i).physical_attr_rec.storage.min_extents := l_ind_subpartitions_arr(i).min_extent;
+      --io_index_rec.subpartition_arr(i).physical_attr_rec.storage.max_extents := l_ind_subpartitions_arr(i).max_extent;
+      io_index_rec.subpartition_arr(i).physical_attr_rec.storage.pct_increase := l_ind_subpartitions_arr(i).pct_increase;
+      io_index_rec.subpartition_arr(i).physical_attr_rec.storage.freelists := l_ind_subpartitions_arr(i).freelists;
+      io_index_rec.subpartition_arr(i).physical_attr_rec.storage.freelist_groups := l_ind_subpartitions_arr(i).freelist_groups;
+      io_index_rec.subpartition_arr(i).physical_attr_rec.storage.buffer_pool := NULLIF(l_ind_subpartitions_arr(i).buffer_pool,'DEFAULT');
+      io_index_rec.subpartition_arr(i).compression_rec.compression := l_ind_subpartitions_arr(i).compression;
+      io_index_rec.subpartition_arr(i).logging := l_ind_subpartitions_arr(i).logging;
+      io_index_rec.subpartition_arr(i).tablespace_name := l_ind_subpartitions_arr(i).tablespace_name;
+    END LOOP;
+
+    stop_timer;
+  END read_index_subpartitions;
 
   --  read individual index metadata
   PROCEDURE read_index(
@@ -1781,7 +2295,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       in_all_indexes_rec => l_all_indexes_rec,
       out_index_rec      => out_index_rec
     );
-
+    
+    read_index_partitions(io_index_rec => out_index_rec);
+    
+    read_index_subpartitions(io_index_rec => out_index_rec);
+    
     SELECT table_type_owner, table_type
       INTO out_index_rec.table_object_owner, out_index_rec.table_object_type
       FROM all_all_tables
@@ -1797,7 +2315,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   AS
     l_index_rec                gt_index_rec;
     l_all_indexes_arr          gt_all_indexes_arr;
-    l_index_full_name          VARCHAR2(65);
+    l_index_full_name          arrays.gt_full_name;
   BEGIN
     start_timer;
     SELECT *
@@ -1819,6 +2337,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
       l_index_rec.table_object_owner := io_table_rec.table_type_owner;
       l_index_rec.table_object_type := io_table_rec.table_type;
+      l_index_rec.indx := i;
 
       io_table_rec.index_arr(i) := l_index_rec;
     END LOOP;
@@ -1830,7 +2349,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   AS
     l_index_rec                gt_index_rec;
-    l_index_full_name          VARCHAR2(65);
+    l_index_full_name          arrays.gt_full_name;
     l_indx                     pls_integer;
   BEGIN
     start_timer;
@@ -1856,6 +2375,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
       l_index_rec.table_object_owner := io_table_rec.table_type_owner;
       l_index_rec.table_object_type := io_table_rec.table_type;
+      l_index_rec.indx := l_indx;
 
       io_table_rec.join_index_arr(l_indx) := l_index_rec;
       l_indx := l_indx + 1;
@@ -1905,6 +2425,58 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     END LOOP;
   END update_constraint_index_owner;
 
+  -- finds all check constraint that was implicitly created by NOT NULL column constraint and mark their type as 'N'
+  PROCEDURE mark_notnull_constraints(
+    io_constraint_arr IN OUT NOCOPY gt_constraint_arr,
+    io_column_arr     IN OUT NOCOPY gt_column_arr
+  )
+  AS
+    l_column_indx   arrays.gt_int_indx;
+    l_indx          PLS_INTEGER;
+  BEGIN
+    -- bild index
+    FOR i IN 1..io_column_arr.COUNT LOOP
+      l_column_indx(io_column_arr(i).column_name) := i;
+    END LOOP;
+
+    -- find all check constraints
+    FOR i IN 1..io_constraint_arr.COUNT LOOP
+      IF io_constraint_arr(i).constraint_type = 'C' AND
+         io_constraint_arr(i).column_arr.COUNT = 1 AND
+         io_constraint_arr(i).search_condition = '"'||io_constraint_arr(i).column_arr(1)||'" IS NOT NULL' AND
+         l_column_indx.EXISTS(io_constraint_arr(i).column_arr(1))
+      THEN
+        l_indx := l_column_indx(io_constraint_arr(i).column_arr(1));
+        IF io_column_arr(l_indx).nullable = 'N' THEN
+          io_constraint_arr(i).constraint_type := 'N';
+          debug(io_constraint_arr(i).constraint_name||' ('||io_constraint_arr(i).column_arr(1)||') is NOT NULL constraint');
+          IF io_constraint_arr(i).generated = 'USER NAME' THEN
+            io_column_arr(l_indx).notnull_constraint_name := io_constraint_arr(i).constraint_name;
+          END IF;
+        END IF;
+      END IF;
+
+      IF io_constraint_arr(i).constraint_type = 'F' AND
+         io_constraint_arr(i).column_arr.COUNT > 1
+      THEN
+        FOR j IN 1..io_constraint_arr(i).column_arr.COUNT LOOP
+          IF io_constraint_arr(i).search_condition = '"'||io_constraint_arr(i).column_arr(j)||'" IS NOT NULL' AND
+             l_column_indx.EXISTS(io_constraint_arr(i).column_arr(j))
+          THEN
+            l_indx := l_column_indx(io_constraint_arr(i).column_arr(j));
+            IF io_column_arr(l_indx).nullable = 'N' THEN
+              io_constraint_arr(i).constraint_type := 'N';
+              debug(io_constraint_arr(i).constraint_name||' is NOT NULL constraint');
+              IF io_constraint_arr(i).generated = 'USER NAME' THEN
+                io_column_arr(l_indx).notnull_constraint_name := io_constraint_arr(i).constraint_name;
+              END IF;
+            END IF;
+          END IF;
+        END LOOP;
+      END IF;
+    END LOOP;
+  END mark_notnull_constraints;
+
   -- read constraint details from cort_all_constraints
   PROCEDURE read_table_constraints(
     io_table_rec IN OUT NOCOPY gt_table_rec
@@ -1916,7 +2488,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_col_name_arr             arrays.gt_name_arr;
     l_col_position_arr         arrays.gt_num_arr;
     l_indx                     PLS_INTEGER;
-    l_index_full_name          VARCHAR2(65);
+    l_index_full_name          arrays.gt_full_name;
   BEGIN
     start_timer;
     SELECT c.*
@@ -1940,12 +2512,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       io_table_rec.constraint_arr(i) := l_constraint_rec;
 
       io_table_rec.constraint_arr(i).rename_rec := get_rename_rec(
-                                                     in_table_name_rec => io_table_rec.rename_rec,
                                                      in_object_name    => l_constraint_rec.constraint_name,
                                                      in_object_owner   => l_constraint_rec.owner,
-                                                     in_object_type    => 'CONSTRAINT',
-                                                     in_index          => i,
-                                                     in_generated      => CASE l_constraint_rec.generated WHEN 'USER NAME' THEN 'N' ELSE 'Y' END
+                                                     in_object_type    => 'CONSTRAINT', 
+                                                     in_generated      => CASE l_constraint_rec.generated WHEN 'USER NAME' THEN 'N' ELSE 'Y' END,
+                                                     in_parent_name    => io_table_rec.rename_rec.current_name
                                                    );
 /*
       IF io_table_rec.constraint_arr(i).constraint_type = 'C' THEN
@@ -2002,27 +2573,36 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     FOR i IN 1..io_table_rec.constraint_arr.COUNT LOOP
       IF io_table_rec.constraint_arr(i).constraint_type IN ('P', 'U') THEN
 
-        -- find index owner. A workaround for oracle ALL_CONSTRAINS bug (index owner is NULL)
-        update_constraint_index_owner(
-          in_table_rec      => io_table_rec,
-          io_constraint_rec => io_table_rec.constraint_arr(i)
-        );
+        IF io_table_rec.constraint_arr(i).index_owner IS NULL THEN
+          -- find index owner. A workaround for oracle ALL_CONSTRAINS bug (index owner is NULL)
+          update_constraint_index_owner(
+            in_table_rec      => io_table_rec,
+            io_constraint_rec => io_table_rec.constraint_arr(i)
+          );
+        END IF;
 
         l_index_full_name := '"'||io_table_rec.constraint_arr(i).index_owner||'"."'||io_table_rec.constraint_arr(i).index_name||'"';
         IF io_table_rec.index_indx_arr.EXISTS(l_index_full_name) THEN
           l_indx := io_table_rec.index_indx_arr(l_index_full_name);
           io_table_rec.index_arr(l_indx).constraint_name := io_table_rec.constraint_arr(i).constraint_name;
-          IF io_table_rec.index_arr(l_indx).rename_rec.object_name = io_table_rec.constraint_arr(i).constraint_name AND
+/*          IF io_table_rec.index_arr(l_indx).index_name = io_table_rec.constraint_arr(i).constraint_name AND
              io_table_rec.constraint_arr(i).constraint_name <> io_table_rec.constraint_arr(i).rename_rec.object_name
           THEN
             io_table_rec.index_arr(l_indx).rename_rec.object_name := io_table_rec.constraint_arr(i).rename_rec.object_name;
+            io_table_rec.index_arr(l_indx).rename_rec.temp_name := io_table_rec.constraint_arr(i).rename_rec.temp_name;
+            io_table_rec.index_arr(l_indx).rename_rec.cort_name := io_table_rec.constraint_arr(i).rename_rec.cort_name;
           END IF;
-
+*/
         END IF;
       END IF;
 
     END LOOP;
 
+    -- mark all check constraints implicitly created from NOT NULL column constraint
+    mark_notnull_constraints(
+      io_constraint_arr => io_table_rec.constraint_arr,
+      io_column_arr     => io_table_rec.column_arr
+    );
     stop_timer;
   END read_table_constraints;
 
@@ -2076,12 +2656,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
            ORDER BY position;
 
           io_table_rec.ref_constraint_arr(i).rename_rec := get_rename_rec(
-                                                             in_table_name_rec => l_ref_table_rename_rec,
                                                              in_object_name    => l_all_constraints_arr(i).constraint_name,
                                                              in_object_owner   => l_all_constraints_arr(i).owner,
                                                              in_object_type    => 'REFERENCE',
-                                                             in_index          => i,
-                                                             in_generated      => CASE l_all_constraints_arr(i).generated WHEN 'USER NAME' THEN 'N' ELSE 'Y' END
+                                                             in_generated      => CASE l_all_constraints_arr(i).generated WHEN 'USER NAME' THEN 'N' ELSE 'Y' END,
+                                                             in_parent_name    => l_ref_table_rename_rec.current_name
                                                            );
         END LOOP;
       END IF;
@@ -2122,12 +2701,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       io_table_rec.log_group_arr(i).drop_flag         := FALSE;
 
       io_table_rec.log_group_arr(i).rename_rec := get_rename_rec(
-                                                    in_table_name_rec => io_table_rec.rename_rec,
                                                     in_object_name    => l_all_log_groups_arr(i).log_group_name,
                                                     in_object_owner   => l_all_log_groups_arr(i).owner,
                                                     in_object_type    => 'LOG GROUP',
-                                                    in_index          => i,
-                                                    in_generated      => CASE l_all_log_groups_arr(i).generated WHEN 'USER NAME' THEN 'N' ELSE 'Y' END
+                                                    in_generated      => CASE l_all_log_groups_arr(i).generated WHEN 'USER NAME' THEN 'N' ELSE 'Y' END,
+                                                    in_parent_name    => io_table_rec.rename_rec.current_name
                                                   );
     END LOOP;
 
@@ -2173,7 +2751,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
       FOR i IN 1..l_part_lob_arr.COUNT LOOP
         l_column_indx := get_column_indx(io_table_rec, l_part_lob_arr(i).column_name);
-        io_table_rec.lob_indx_arr(l_part_lob_arr(i).column_name) := l_column_indx;
+--        io_table_rec.lob_indx_arr(l_part_lob_arr(i).column_name) := l_column_indx;
         io_table_rec.lob_arr(l_column_indx).column_indx     := l_column_indx;
         io_table_rec.lob_arr(l_column_indx).owner           := l_part_lob_arr(i).table_owner;
         io_table_rec.lob_arr(l_column_indx).table_name      := l_part_lob_arr(i).table_name;
@@ -2223,8 +2801,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         io_table_rec.lob_arr(l_column_indx).rename_rec := get_rename_rec(
                                                             in_object_name  => io_table_rec.lob_arr(l_column_indx).lob_name,
                                                             in_object_owner => io_table_rec.lob_arr(l_column_indx).owner,
-                                                            in_object_type  => 'LOB'
+                                                            in_object_type  => 'LOB',
+                                                            in_generated    => CASE WHEN io_table_rec.lob_arr(l_column_indx).lob_name LIKE 'SYS_LOB%' THEN 'Y' ELSE 'N' END
                                                           );
+        io_table_rec.lob_arr(l_column_indx).rename_rec.parent_object_name := l_part_lob_arr(i).table_name;
+        io_table_rec.lob_arr(l_column_indx).rename_rec.lob_column_name := l_part_lob_arr(i).column_name;
       END LOOP;
 
     ELSE
@@ -2239,7 +2820,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       FOR i IN 1..l_lob_arr.COUNT LOOP
         l_column_indx := get_column_indx(io_table_rec, l_lob_arr(i).column_name);
         io_table_rec.lob_arr(l_column_indx).column_indx     := l_column_indx;
-        io_table_rec.lob_indx_arr(l_lob_arr(i).column_name) := l_column_indx;
+--        io_table_rec.lob_indx_arr(l_lob_arr(i).column_name) := l_column_indx;
         io_table_rec.lob_arr(l_column_indx).owner           := l_lob_arr(i).owner;
         io_table_rec.lob_arr(l_column_indx).table_name      := l_lob_arr(i).table_name;
         io_table_rec.lob_arr(l_column_indx).column_name     := l_lob_arr(i).column_name;
@@ -2303,7 +2884,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         io_table_rec.lob_arr(l_column_indx).rename_rec := get_rename_rec(
                                                             in_object_name  => io_table_rec.lob_arr(l_column_indx).lob_name,
                                                             in_object_owner => io_table_rec.lob_arr(l_column_indx).owner,
-                                                            in_object_type  => 'LOB'
+                                                            in_object_type  => 'LOB',
+                                                            in_generated    => CASE WHEN io_table_rec.lob_arr(l_column_indx).lob_name LIKE 'SYS_LOB%' THEN 'Y' ELSE 'N' END
                                                           );
         io_table_rec.lob_arr(l_column_indx).rename_rec.parent_object_name := l_lob_arr(i).table_name;
         io_table_rec.lob_arr(l_column_indx).rename_rec.lob_column_name := l_lob_arr(i).column_name;
@@ -2425,7 +3007,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_cnt_arr                  arrays.gt_num_arr;
   BEGIN
     cort_log_pkg.execute(
-      in_text      => in_sql
+      in_sql  => in_sql,
+      in_echo => FALSE        
     );
     BEGIN
       EXECUTE IMMEDIATE in_sql
@@ -2456,12 +3039,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_ind_partitions_arr       gt_ind_partitions_arr;
     l_lob_partitions_arr       gt_lob_partitions_arr;
     l_indx                     PLS_INTEGER;
-    l_lob_indx                 PLS_INTEGER;
     l_lob_rec                  gt_lob_rec;
     l_block_size               NUMBER;
     l_part_sql                 CLOB;
     l_sql                      CLOB;
     l_segment_created          BOOLEAN;
+    l_partition_arr            partition_utils.gt_partition_arr;
   BEGIN
     start_timer;
     IF io_table_rec.partitioned = 'YES' THEN
@@ -2481,17 +3064,39 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
          AND table_name = io_table_rec.table_name
        ORDER BY partition_position, column_name;
     END IF;
+    
+    IF in_read_data THEN
+      disable_policies(
+        in_policy_arr => io_table_rec.policy_arr
+      );
+    END IF;  
+
+    FOR i IN 1..l_tab_partitions_arr.COUNT LOOP
+      l_partition_arr(i).object_type        := 'TABLE';
+      l_partition_arr(i).object_owner       := l_tab_partitions_arr(i).table_owner;
+      l_partition_arr(i).object_name        := l_tab_partitions_arr(i).table_name;
+      l_partition_arr(i).partition_level    := 'PARTITION';
+      l_partition_arr(i).partitioning_type  := io_table_rec.partitioning_type;
+      l_partition_arr(i).partition_name     := l_tab_partitions_arr(i).partition_name;
+      l_partition_arr(i).parent_name        := NULL;
+      l_partition_arr(i).high_value         := l_tab_partitions_arr(i).high_value;
+      l_partition_arr(i).partition_position := l_tab_partitions_arr(i).partition_position;
+    END LOOP;  
+
+    partition_utils.parse_partition_arr(l_partition_arr);
 
     FOR i IN 1..l_tab_partitions_arr.COUNT LOOP
       io_table_rec.partition_indx_arr(l_tab_partitions_arr(i).partition_name) := i;
       io_table_rec.partition_arr(i).indx               := i;
-      io_table_rec.partition_arr(i).table_owner        := l_tab_partitions_arr(i).table_owner;
-      io_table_rec.partition_arr(i).table_name         := l_tab_partitions_arr(i).table_name;
+      io_table_rec.partition_arr(i).object_type        := 'TABLE';
+      io_table_rec.partition_arr(i).object_owner       := l_tab_partitions_arr(i).table_owner;
+      io_table_rec.partition_arr(i).object_name        := l_tab_partitions_arr(i).table_name;
       io_table_rec.partition_arr(i).partition_level    := 'PARTITION';
       io_table_rec.partition_arr(i).partition_type     := io_table_rec.partitioning_type;
       io_table_rec.partition_arr(i).partition_name     := l_tab_partitions_arr(i).partition_name;
       io_table_rec.partition_arr(i).composite          := l_tab_partitions_arr(i).composite;
       io_table_rec.partition_arr(i).high_value         := l_tab_partitions_arr(i).high_value;
+      io_table_rec.partition_arr(i).partition_rec      := l_partition_arr(i);
       io_table_rec.partition_arr(i).position           := l_tab_partitions_arr(i).partition_position;
       io_table_rec.partition_arr(i).physical_attr_rec.pct_free := l_tab_partitions_arr(i).pct_free;
       io_table_rec.partition_arr(i).physical_attr_rec.pct_used := l_tab_partitions_arr(i).pct_used;
@@ -2545,6 +3150,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       );
     END IF;
 
+    IF in_read_data THEN
+      enable_policies(
+        in_policy_arr => io_table_rec.policy_arr
+      );
+    END IF;  
 
     FOR i IN 1..l_lob_partitions_arr.COUNT LOOP
       l_lob_rec.owner              := l_lob_partitions_arr(i).table_owner;
@@ -2595,9 +3205,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       $END
       l_lob_rec.column_indx := get_column_indx(io_table_rec, l_lob_rec.column_name);
       l_indx := io_table_rec.partition_indx_arr(l_lob_partitions_arr(i).partition_name);
-      l_lob_indx := io_table_rec.partition_arr(l_indx).lob_arr.COUNT+1;
-      io_table_rec.partition_arr(l_indx).lob_arr(l_lob_indx) := l_lob_rec;
-      io_table_rec.partition_arr(l_indx).lob_indx_arr(l_lob_rec.column_indx) := l_lob_indx;
+      io_table_rec.partition_arr(l_indx).lob_arr(l_lob_rec.column_indx) := l_lob_rec;
     END LOOP;
 
     IF io_table_rec.iot_type IS NOT NULL AND
@@ -2673,12 +3281,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     l_partition_name              arrays.gt_name;
     l_partition_indx              PLS_INTEGER;
     l_indx                        PLS_INTEGER;
-    l_lob_indx                    PLS_INTEGER;
     l_lob_rec                     gt_lob_rec;
     l_part_sql                    CLOB;
     l_sql                         CLOB;
     l_segment_created             BOOLEAN;
     l_parent_name                 arrays.gt_name;
+    l_partition_arr            partition_utils.gt_partition_arr;
   BEGIN
     start_timer;
     IF io_table_rec.subpartitioning_type IS NOT NULL THEN
@@ -2700,6 +3308,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
     END IF;
 
+    FOR i IN 1..l_tab_subpartitions_arr.COUNT LOOP
+      l_partition_arr(i).object_type        := 'TABLE';
+      l_partition_arr(i).object_owner       := l_tab_subpartitions_arr(i).table_owner;
+      l_partition_arr(i).object_name        := l_tab_subpartitions_arr(i).table_name;
+      l_partition_arr(i).partition_level    := 'SUBPARTITION';
+      l_partition_arr(i).partitioning_type  := io_table_rec.subpartitioning_type;
+      l_partition_arr(i).partition_name     := l_tab_subpartitions_arr(i).subpartition_name;
+      l_partition_arr(i).parent_name        := l_tab_subpartitions_arr(i).partition_name;
+      l_partition_arr(i).high_value         := l_tab_subpartitions_arr(i).high_value;
+      l_partition_arr(i).partition_position := l_tab_subpartitions_arr(i).subpartition_position;
+    END LOOP;  
+
+    partition_utils.parse_partition_arr(l_partition_arr);
+
+
+
     l_last_partition_name := NULL;
     FOR i IN 1..l_tab_subpartitions_arr.COUNT LOOP
       io_table_rec.subpartition_indx_arr(l_tab_subpartitions_arr(i).subpartition_name) := i;
@@ -2715,14 +3339,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         END IF;
       END IF;
       io_table_rec.subpartition_arr(i).indx               := i;
-      io_table_rec.subpartition_arr(i).table_owner        := l_tab_subpartitions_arr(i).table_owner;
-      io_table_rec.subpartition_arr(i).table_name         := l_tab_subpartitions_arr(i).table_name;
+      io_table_rec.subpartition_arr(i).object_type        := 'TABLE';
+      io_table_rec.subpartition_arr(i).object_owner       := l_tab_subpartitions_arr(i).table_owner;
+      io_table_rec.subpartition_arr(i).object_name        := l_tab_subpartitions_arr(i).table_name;
       io_table_rec.subpartition_arr(i).partition_level    := 'SUBPARTITION';
       io_table_rec.subpartition_arr(i).partition_type     := io_table_rec.subpartitioning_type;
       io_table_rec.subpartition_arr(i).partition_name     := l_tab_subpartitions_arr(i).subpartition_name;
       io_table_rec.subpartition_arr(i).parent_partition_name := l_tab_subpartitions_arr(i).partition_name;
       io_table_rec.subpartition_arr(i).high_value         := l_tab_subpartitions_arr(i).high_value;
       io_table_rec.subpartition_arr(i).position           := l_tab_subpartitions_arr(i).subpartition_position;
+      io_table_rec.subpartition_arr(i).partition_rec      := l_partition_arr(i);
       io_table_rec.subpartition_arr(i).physical_attr_rec.pct_free := l_tab_subpartitions_arr(i).pct_free;
       io_table_rec.subpartition_arr(i).physical_attr_rec.pct_used := l_tab_subpartitions_arr(i).pct_used;
       io_table_rec.subpartition_arr(i).physical_attr_rec.ini_trans := l_tab_subpartitions_arr(i).ini_trans;
@@ -2826,66 +3452,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       $END
       l_lob_rec.column_indx := get_column_indx(io_table_rec, l_lob_rec.column_name);
       l_indx := io_table_rec.subpartition_indx_arr(l_lob_subpartitions_arr(i).subpartition_name);
-      l_lob_indx := io_table_rec.subpartition_arr(l_indx).lob_arr.COUNT+1;
-      io_table_rec.subpartition_arr(l_indx).lob_arr(l_lob_indx) := l_lob_rec;
-      io_table_rec.subpartition_arr(l_indx).lob_indx_arr(l_lob_rec.column_indx) := l_lob_indx;
+      io_table_rec.subpartition_arr(l_indx).lob_arr(l_lob_rec.column_indx) := l_lob_rec;
     END LOOP;
 
     stop_timer;
   END read_subpartitions;
-
-  -- read table privileges
-  PROCEDURE read_privileges(
-    in_owner         IN VARCHAR2,
-    in_table_name    IN VARCHAR2,
-    io_privilege_arr IN OUT NOCOPY gt_privilege_arr
-  )
-  AS
-    TYPE t_all_tab_privs_arr IS TABLE OF all_tab_privs%ROWTYPE INDEX BY PLS_INTEGER;
-    TYPE t_all_col_privs_arr IS TABLE OF all_col_privs%ROWTYPE INDEX BY PLS_INTEGER;
-    l_all_tab_privs_arr      t_all_tab_privs_arr;
-    l_all_col_privs_arr      t_all_col_privs_arr;
-    l_indx                   PLS_INTEGER;
-  BEGIN
-    start_timer;
-    io_privilege_arr.DELETE;
-    SELECT *
-      BULK COLLECT
-      INTO l_all_tab_privs_arr
-      FROM all_tab_privs
-     WHERE table_name = in_table_name
-       AND table_schema = in_owner
-       AND grantor = user;
-
-    FOR i IN 1..l_all_tab_privs_arr.COUNT LOOP
-      io_privilege_arr(i).grantor      := l_all_tab_privs_arr(i).grantor;
-      io_privilege_arr(i).grantee      := l_all_tab_privs_arr(i).grantee;
-      io_privilege_arr(i).table_schema := l_all_tab_privs_arr(i).table_schema;
-      io_privilege_arr(i).table_name   := l_all_tab_privs_arr(i).table_name;
-      io_privilege_arr(i).privilege    := l_all_tab_privs_arr(i).privilege;
-      io_privilege_arr(i).grantable    := l_all_tab_privs_arr(i).grantable;
-      io_privilege_arr(i).hierarchy    := l_all_tab_privs_arr(i).hierarchy;
-    END LOOP;
-
-    SELECT *
-      BULK COLLECT
-      INTO l_all_col_privs_arr
-      FROM all_col_privs
-     WHERE table_name = in_table_name
-       AND table_schema = in_owner;
-
-    FOR i IN 1..l_all_col_privs_arr.COUNT LOOP
-      l_indx := io_privilege_arr.COUNT + i;
-      io_privilege_arr(l_indx).grantor      := l_all_col_privs_arr(i).grantor;
-      io_privilege_arr(l_indx).grantee      := l_all_col_privs_arr(i).grantee;
-      io_privilege_arr(l_indx).table_schema := l_all_col_privs_arr(i).table_schema;
-      io_privilege_arr(l_indx).table_name   := l_all_col_privs_arr(i).table_name;
-      io_privilege_arr(l_indx).column_name  := l_all_col_privs_arr(i).column_name;
-      io_privilege_arr(l_indx).privilege    := l_all_col_privs_arr(i).privilege;
-      io_privilege_arr(l_indx).grantable    := l_all_col_privs_arr(i).grantable;
-    END LOOP;
-    stop_timer;
-  END read_privileges;
 
   PROCEDURE read_table_triggers(
     io_table_rec IN OUT NOCOPY gt_table_rec
@@ -2893,7 +3464,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   AS
     TYPE t_all_triggers_arr         IS TABLE OF all_triggers%ROWTYPE INDEX BY PLS_INTEGER;
     l_all_triggers_arr              t_all_triggers_arr;
-    l_full_name                     VARCHAR2(65);
+    l_full_name                     arrays.gt_full_name;
     l_indx                          PLS_INTEGER;
     l_owner_arr                     arrays.gt_name_arr;
     l_trigger_name_arr              arrays.gt_name_arr;
@@ -2971,101 +3542,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     stop_timer;
   END read_table_triggers;
 
-  PROCEDURE read_table_policies(
-    in_table_name      IN VARCHAR2,
-    in_owner           IN VARCHAR2,
-    out_policy_arr     OUT NOCOPY gt_policy_arr
-  )
-  AS
-    TYPE t_all_policies_arr         IS TABLE OF all_policies%ROWTYPE INDEX BY PLS_INTEGER;
-    l_all_policies_arr              t_all_policies_arr;
-    l_column_option_arr             arrays.gt_str_arr;
-  BEGIN
-    start_timer;
-    SELECT *
-      BULK COLLECT
-      INTO l_all_policies_arr
-      FROM all_policies
-     WHERE object_name = in_table_name
-       AND object_owner = in_owner;
-
-    FOR i IN 1..l_all_policies_arr.COUNT LOOP
-      out_policy_arr(i).object_owner   := l_all_policies_arr(i).object_owner;
-      out_policy_arr(i).object_name    := l_all_policies_arr(i).object_name;
-      out_policy_arr(i).policy_group   := l_all_policies_arr(i).policy_group;
-      out_policy_arr(i).policy_name    := l_all_policies_arr(i).policy_name;
-      out_policy_arr(i).pf_owner       := l_all_policies_arr(i).pf_owner;
-      out_policy_arr(i).package        := l_all_policies_arr(i).package;
-      out_policy_arr(i).function       := l_all_policies_arr(i).function;
-      out_policy_arr(i).sel            := l_all_policies_arr(i).sel;
-      out_policy_arr(i).ins            := l_all_policies_arr(i).ins;
-      out_policy_arr(i).upd            := l_all_policies_arr(i).upd;
-      out_policy_arr(i).del            := l_all_policies_arr(i).del;
-      out_policy_arr(i).idx            := l_all_policies_arr(i).idx;
-      out_policy_arr(i).chk_option     := l_all_policies_arr(i).chk_option;
-      out_policy_arr(i).enable         := l_all_policies_arr(i).enable;
-      out_policy_arr(i).static_policy  := l_all_policies_arr(i).static_policy;
-      out_policy_arr(i).policy_type    := l_all_policies_arr(i).policy_type;
-      out_policy_arr(i).long_predicate := l_all_policies_arr(i).long_predicate;
-
-      SELECT sec_rel_column, column_option
-        BULK COLLECT
-        INTO out_policy_arr(i).sec_rel_col_arr, l_column_option_arr
-        FROM all_sec_relevant_cols
-       WHERE object_owner = out_policy_arr(i).object_owner
-         AND object_name = out_policy_arr(i).object_name
-         AND policy_group = out_policy_arr(i).policy_group
-         AND policy_name = out_policy_arr(i).policy_name;
-
-      IF l_column_option_arr.COUNT > 0 THEN
-        out_policy_arr(i).column_option := l_column_option_arr(1);
-      END IF;
-    END LOOP;
-
-    stop_timer;
-  END read_table_policies;
-
-
-  PROCEDURE enable_policies(
-    in_policy_arr     IN gt_policy_arr,
-    in_enable         IN BOOLEAN DEFAULT TRUE
-  )
-  AS
-    l_sql VARCHAR2(1000); 
-  BEGIN
-    FOR i IN 1..in_policy_arr.COUNT LOOP
-      IF in_enable THEN 
-        l_sql := '
-begin
-  dbms_rls.enable_policy(
-    object_schema => :in_object_owner,
-    object_name   => :in_object_name,
-    policy_name   => :in_policy_name,
-    enable        => TRUE
-  );
-end;';     
-      ELSE
-        l_sql := '
-begin
-  dbms_rls.enable_policy(
-    object_schema => :in_object_owner,
-    object_name   => :in_object_name,
-    policy_name   => :in_policy_name,
-    enable        => FALSE
-  );
-end;';
-     END IF;
-     EXECUTE IMMEDIATE l_sql USING in_policy_arr(i).object_owner, in_policy_arr(i).object_name,in_policy_arr(i).policy_name;    
-    END LOOP;
-  END enable_policies;
-
-
   PROCEDURE read_nested_tables(
     io_table_rec IN OUT NOCOPY gt_table_rec
   )
   AS
     TYPE t_all_nested_tables_arr   IS TABLE OF all_nested_tables%ROWTYPE INDEX BY PLS_INTEGER;
     l_all_nested_tables_arr        t_all_nested_tables_arr;
+    l_column_indx                  PLS_INTEGER;
   BEGIN
     start_timer;
     SELECT *
@@ -3077,31 +3560,90 @@ end;';
 
     io_table_rec.nested_tables_arr.DELETE;
     FOR i IN 1..l_all_nested_tables_arr.COUNT LOOP
-      io_table_rec.nested_tables_arr(i).owner                 := l_all_nested_tables_arr(i).owner;
-      io_table_rec.nested_tables_arr(i).table_name            := l_all_nested_tables_arr(i).table_name;
-      io_table_rec.nested_tables_arr(i).table_type_owner      := l_all_nested_tables_arr(i).table_type_owner;
-      io_table_rec.nested_tables_arr(i).table_type_name       := l_all_nested_tables_arr(i).table_type_name;
-      io_table_rec.nested_tables_arr(i).parent_table_name     := l_all_nested_tables_arr(i).parent_table_name;
-      io_table_rec.nested_tables_arr(i).parent_table_column   := l_all_nested_tables_arr(i).parent_table_column;
-      io_table_rec.nested_tables_arr(i).storage_spec          := l_all_nested_tables_arr(i).storage_spec;
-      io_table_rec.nested_tables_arr(i).return_type           := l_all_nested_tables_arr(i).return_type;
-      io_table_rec.nested_tables_arr(i).element_substitutable := trim(l_all_nested_tables_arr(i).element_substitutable);
+      l_column_indx := get_column_indx(io_table_rec, l_all_nested_tables_arr(i).parent_table_column);
+      io_table_rec.nested_tables_arr(l_column_indx).owner                 := l_all_nested_tables_arr(i).owner;
+      io_table_rec.nested_tables_arr(l_column_indx).table_name            := l_all_nested_tables_arr(i).table_name;
+      io_table_rec.nested_tables_arr(l_column_indx).table_type_owner      := l_all_nested_tables_arr(i).table_type_owner;
+      io_table_rec.nested_tables_arr(l_column_indx).table_type_name       := l_all_nested_tables_arr(i).table_type_name;
+      io_table_rec.nested_tables_arr(l_column_indx).column_indx           := l_column_indx;
+      io_table_rec.nested_tables_arr(l_column_indx).parent_table_name     := l_all_nested_tables_arr(i).parent_table_name;
+      io_table_rec.nested_tables_arr(l_column_indx).parent_table_column   := l_all_nested_tables_arr(i).parent_table_column;
+      io_table_rec.nested_tables_arr(l_column_indx).storage_spec          := l_all_nested_tables_arr(i).storage_spec;
+      io_table_rec.nested_tables_arr(l_column_indx).return_type           := l_all_nested_tables_arr(i).return_type;
+      io_table_rec.nested_tables_arr(l_column_indx).element_substitutable := trim(l_all_nested_tables_arr(i).element_substitutable);
 
-      io_table_rec.nested_tables_arr(i).rename_rec := get_rename_rec(
-                                                        in_object_name  => io_table_rec.nested_tables_arr(i).table_name,
-                                                        in_object_owner => io_table_rec.nested_tables_arr(i).owner,
-                                                        in_object_type  => 'TABLE'
-                                                      );
+      io_table_rec.nested_tables_arr(l_column_indx).rename_rec := get_rename_rec(
+                                                                    in_object_name  => io_table_rec.nested_tables_arr(l_column_indx).table_name,
+                                                                    in_object_owner => io_table_rec.nested_tables_arr(l_column_indx).owner,
+                                                                    in_object_type  => 'TABLE'
+                                                                  );
+
     END LOOP;
 
     stop_timer;
   END read_nested_tables;
+
+
+  -- read table privileges
+  PROCEDURE read_privileges(
+    in_owner         IN VARCHAR2,
+    in_object_name   IN VARCHAR2,
+    io_privilege_arr IN OUT NOCOPY gt_privilege_arr
+  )
+  AS
+    TYPE t_all_tab_privs_arr IS TABLE OF all_tab_privs%ROWTYPE INDEX BY PLS_INTEGER;
+    TYPE t_all_col_privs_arr IS TABLE OF all_col_privs%ROWTYPE INDEX BY PLS_INTEGER;
+    l_all_tab_privs_arr      t_all_tab_privs_arr;
+    l_all_col_privs_arr      t_all_col_privs_arr;
+    l_indx                   PLS_INTEGER;
+  BEGIN
+    start_timer;
+    io_privilege_arr.DELETE;
+    SELECT *
+      BULK COLLECT
+      INTO l_all_tab_privs_arr
+      FROM all_tab_privs
+     WHERE table_name = in_object_name
+       AND table_schema = in_owner
+       AND grantor = user;
+
+    FOR i IN 1..l_all_tab_privs_arr.COUNT LOOP
+      io_privilege_arr(i).grantor      := l_all_tab_privs_arr(i).grantor;
+      io_privilege_arr(i).grantee      := l_all_tab_privs_arr(i).grantee;
+      io_privilege_arr(i).table_schema := l_all_tab_privs_arr(i).table_schema;
+      io_privilege_arr(i).table_name   := l_all_tab_privs_arr(i).table_name;
+      io_privilege_arr(i).privilege    := l_all_tab_privs_arr(i).privilege;
+      io_privilege_arr(i).grantable    := l_all_tab_privs_arr(i).grantable;
+      io_privilege_arr(i).hierarchy    := l_all_tab_privs_arr(i).hierarchy;
+    END LOOP;
+
+    SELECT *
+      BULK COLLECT
+      INTO l_all_col_privs_arr
+      FROM all_col_privs
+     WHERE table_name = in_object_name
+       AND table_schema = in_owner;
+
+    FOR i IN 1..l_all_col_privs_arr.COUNT LOOP
+      l_indx := io_privilege_arr.COUNT + i;
+      io_privilege_arr(l_indx).grantor      := l_all_col_privs_arr(i).grantor;
+      io_privilege_arr(l_indx).grantee      := l_all_col_privs_arr(i).grantee;
+      io_privilege_arr(l_indx).table_schema := l_all_col_privs_arr(i).table_schema;
+      io_privilege_arr(l_indx).table_name   := l_all_col_privs_arr(i).table_name;
+      io_privilege_arr(l_indx).column_name  := l_all_col_privs_arr(i).column_name;
+      io_privilege_arr(l_indx).privilege    := l_all_col_privs_arr(i).privilege;
+      io_privilege_arr(l_indx).grantable    := l_all_col_privs_arr(i).grantable;
+    END LOOP;
+    stop_timer;
+  END read_privileges;
+
 
   -- read table properties and all attributes/dependant objects
   PROCEDURE read_table_cascade(
     in_table_name      IN VARCHAR2,
     in_owner           IN VARCHAR2,
     in_read_data       IN BOOLEAN,
+    in_debug_text      IN VARCHAR2,
     out_table_rec      OUT NOCOPY gt_table_rec
   )
   AS
@@ -3141,7 +3683,22 @@ end;';
     read_subpartitions(l_table_rec, in_read_data);
     -- read nested tables
     read_nested_tables(l_table_rec);
-
+    -- read privileges
+    read_privileges(
+      in_owner         => l_table_rec.owner,
+      in_object_name   => l_table_rec.table_name,
+      io_privilege_arr => l_table_rec.privilege_arr
+    );
+        
+/*
+    IF g_run_params.debug.get_bool_value AND in_debug_text IS NOT NULL THEN
+      -- log source table rec
+      cort_log_pkg.debug(
+        in_text     => in_debug_text,
+        in_details  => cort_xml_pkg.get_table_xml(l_table_rec).getClobVal()
+      );
+    END IF;
+*/
     out_table_rec := l_table_rec;
     stop_timer;
   END read_table_cascade;
@@ -3183,100 +3740,117 @@ end;';
                                      in_object_type  => 'SEQUENCE'
                                    );
 
+    read_privileges(
+      in_owner         => out_sequence_rec.owner,
+      in_object_name   => out_sequence_rec.sequence_name,
+      io_privilege_arr => out_sequence_rec.privilege_arr
+    );
   END read_sequence;
 
   -- read object type metadata
   PROCEDURE read_type(
-    in_type_name IN VARCHAR2,
-    in_owner     IN VARCHAR2,
-    out_type_rec IN OUT NOCOPY gt_type_rec
+    in_type_name         IN VARCHAR2,
+    in_owner             IN VARCHAR2,
+--    in_read_dependencies IN BOOLEAN DEFAULT TRUE,
+    out_type_rec         IN OUT NOCOPY gt_type_rec
   )
   AS
-    TYPE t_all_type_attr_arr    IS TABLE OF all_type_attrs%ROWTYPE INDEX BY PLS_INTEGER;
     TYPE t_all_type_method_arr  IS TABLE OF all_type_methods%ROWTYPE INDEX BY PLS_INTEGER;
     TYPE t_all_method_param_arr IS TABLE OF all_method_params%ROWTYPE INDEX BY PLS_INTEGER;
-    TYPE t_all_dependencies_arr IS TABLE OF all_dependencies%ROWTYPE INDEX BY PLS_INTEGER;
 
     l_all_type_rec          all_types%ROWTYPE;
-    l_all_type_attrs_arr    t_all_type_attr_arr;
     l_all_type_method_arr   t_all_type_method_arr;
     l_all_method_param_arr  t_all_method_param_arr;
     l_indx_arr              arrays.gt_int_arr;
     l_last_indx             PLS_INTEGER;
-    l_cnt                   PLS_INTEGER;
     l_indx                  PLS_INTEGER;
     l_table_rec             gt_table_rec;
+    l_adt_rec               gt_adt_rec;
+    l_type_name             arrays.gt_name;
+    l_object_type           all_objects.object_type%TYPE; 
+    l_synonym_rec           all_synonyms%ROWTYPE;
   BEGIN
     start_timer;
+/*    
+    IF cort_options_pkg.gc_rename_types THEN
+    
+      -- check if we are changing synonym or type itslef
+      BEGIN
+        SELECT object_type
+          INTO l_object_type 
+          FROM all_objects
+         WHERE owner = in_owner
+           AND object_name = in_type_name
+           AND object_type in ('TYPE','SYNONYM');
+      EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+          RETURN;
+      END;      
+      
+      debug('Changing object name is "'||in_type_name||'" and object type is '||l_object_type);
+
+      BEGIN
+        SELECT *
+          INTO l_synonym_rec 
+          FROM all_synonyms
+         WHERE owner = in_owner
+           AND DECODE(l_object_type, 'SYNONYM', synonym_name, table_name) = in_type_name
+           AND REGEXP_LIKE(table_name, '^'||cort_parse_pkg.get_regexp_const(SUBSTR(synonym_name, 1, arrays.gc_name_max_length-6))||'#[\$-z]+$')
+           AND table_owner = in_owner;
+
+        debug('object name is '||l_synonym_rec.table_name);
+        debug('synonym name is '||l_synonym_rec.synonym_name);
+        l_type_name       := l_synonym_rec.table_name;
+        out_type_rec.synonym_name    := l_synonym_rec.synonym_name;
+      EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+          IF l_object_type = 'TYPE' THEN
+            l_type_name         := in_type_name;
+          ELSE
+            raise_error('Type assosiated with synonym "'||in_type_name||'" not found or has invalid naming');
+          END IF;
+      END;      
+          
+    ELSE
+      l_type_name         := in_type_name;
+    END IF;
+*/    
+    l_type_name         := in_type_name;
     BEGIN
       SELECT *
         INTO l_all_type_rec
         FROM all_types
        WHERE owner = in_owner
-         AND type_name = in_type_name;
+         AND type_name = l_type_name;
     EXCEPTION
       WHEN NO_DATA_FOUND THEN
         RETURN;
     END;
-
+    
     out_type_rec.owner             := l_all_type_rec.owner;
     out_type_rec.type_name         := l_all_type_rec.type_name;
-    out_type_rec.type_oid          := l_all_type_rec.type_oid;
     out_type_rec.typecode          := l_all_type_rec.typecode;
     out_type_rec.predefined        := l_all_type_rec.predefined;
     out_type_rec.incomplete        := l_all_type_rec.incomplete;
     out_type_rec.final             := l_all_type_rec.final;
     out_type_rec.instantiable      := l_all_type_rec.instantiable;
-    out_type_rec.supertype_owner   := l_all_type_rec.supertype_owner;
-    out_type_rec.supertype_name    := l_all_type_rec.supertype_name;
     out_type_rec.local_attributes  := l_all_type_rec.local_attributes;
     out_type_rec.local_methods     := l_all_type_rec.local_methods;
-    out_type_rec.typeid            := l_all_type_rec.typeid;
-/*
-    SELECT text
-      BULK COLLECT
-      INTO l_text_arr
-      FROM all_source
-     WHERE type = 'TYPE'
-       AND owner = in_owner
-       AND name = in_type_name
-     ORDER BY line;
+    $IF dbms_db_version.version >= 18 $THEN
+    out_type_rec.persistable       := l_all_type_rec.persistable;
+    $ELSE
+    out_type_rec.persistable       := 'YES';
+    $END
+    out_type_rec.supertype_owner   := l_all_type_rec.supertype_owner;
+    out_type_rec.supertype_name    := l_all_type_rec.supertype_name;
+    out_type_rec.rename_rec        := get_rename_rec(
+                                        in_object_name  => in_type_name,
+                                        in_object_owner => out_type_rec.owner,
+                                        in_object_type  => 'TYPE',
+                                        in_parent_name  => out_type_rec.supertype_name
+                                      );
 
-    out_type_rec.sql_text := null;
-    FOR i in 1..l_text_arr.COUNT LOOP
-      out_type_rec.sql_text := out_type_rec.sql_text || l_text_arr(i) || chr(10);
-    END LOOP;
-    out_type_rec.sql_text := TRIM(chr(10) FROM out_type_rec.sql_text);
-*/
-
-    -- read attributes
-    SELECT *
-      BULK COLLECT
-      INTO l_all_type_attrs_arr
-      FROM all_type_attrs
-     WHERE owner = in_owner
-       AND type_name = in_type_name
-       AND inherited = 'NO'
-     ORDER BY attr_no;
-
-    FOR i IN 1..l_all_type_attrs_arr.COUNT LOOP
-      out_type_rec.attribute_ind_arr(l_all_type_attrs_arr(i).attr_name) := i;
-      out_type_rec.attribute_arr(i).owner              := l_all_type_attrs_arr(i).owner;
-      out_type_rec.attribute_arr(i).type_name          := l_all_type_attrs_arr(i).type_name;
-      out_type_rec.attribute_arr(i).attr_name          := l_all_type_attrs_arr(i).attr_name;
-      out_type_rec.attribute_arr(i).attr_type_mod      := l_all_type_attrs_arr(i).attr_type_mod;
-      out_type_rec.attribute_arr(i).attr_type_owner    := l_all_type_attrs_arr(i).attr_type_owner;
-      out_type_rec.attribute_arr(i).attr_type_name     := l_all_type_attrs_arr(i).attr_type_name;
-      out_type_rec.attribute_arr(i).length             := l_all_type_attrs_arr(i).length;
-      out_type_rec.attribute_arr(i).precision          := l_all_type_attrs_arr(i).precision;
-      out_type_rec.attribute_arr(i).scale              := l_all_type_attrs_arr(i).scale;
-      out_type_rec.attribute_arr(i).character_set_name := l_all_type_attrs_arr(i).character_set_name;
-      out_type_rec.attribute_arr(i).attr_no            := l_all_type_attrs_arr(i).attr_no;
-      out_type_rec.attribute_arr(i).inherited          := l_all_type_attrs_arr(i).inherited;
-      $IF dbms_db_version.version >= 11 $THEN
-      out_type_rec.attribute_arr(i).char_used          := CASE l_all_type_attrs_arr(i).char_used WHEN 'B' THEN 'BYTE' WHEN 'C' THEN 'CHAR' END;
-      $END
-    END LOOP;
+    l_adt_rec                      := get_adt_rec(in_owner,l_all_type_rec.type_name);      
 
     -- read methods
     SELECT *
@@ -3284,7 +3858,7 @@ end;';
       INTO l_all_type_method_arr
       FROM all_type_methods
      WHERE owner = in_owner
-       AND type_name = in_type_name
+       AND type_name = out_type_rec.type_name
        AND inherited = 'NO'
      ORDER BY method_no;
 
@@ -3294,7 +3868,7 @@ end;';
       INTO l_all_method_param_arr
       FROM all_method_params
      WHERE owner = in_owner
-       AND type_name = in_type_name
+       AND type_name = out_type_rec.type_name
      ORDER BY method_no, param_no;
 
     l_last_indx := 0;
@@ -3303,14 +3877,10 @@ end;';
       out_type_rec.method_arr(i).owner         := l_all_type_method_arr(i).owner;
       out_type_rec.method_arr(i).type_name     := l_all_type_method_arr(i).type_name;
       out_type_rec.method_arr(i).method_name   := cort_parse_pkg.get_original_name(
-                                                    in_object_type => 'METHOD',
                                                     in_object_name => l_all_type_method_arr(i).method_name
                                                   );
       out_type_rec.method_arr(i).method_no    := l_all_type_method_arr(i).method_no;
-      out_type_rec.method_arr(i).method_type  := cort_parse_pkg.get_original_name(
-                                                    in_object_type => 'TYPE',
-                                                    in_object_name => l_all_type_method_arr(i).method_type
-                                                  );
+      out_type_rec.method_arr(i).method_type  := l_all_type_method_arr(i).method_type;
       out_type_rec.method_arr(i).final        := l_all_type_method_arr(i).final;
       out_type_rec.method_arr(i).instantiable := l_all_type_method_arr(i).instantiable;
       out_type_rec.method_arr(i).overriding   := l_all_type_method_arr(i).overriding;
@@ -3326,11 +3896,9 @@ end;';
             l_indx := l_all_method_param_arr(j).param_no;
             out_type_rec.method_arr(i).parameter_arr(l_indx).owner              := l_all_method_param_arr(j).owner;
             out_type_rec.method_arr(i).parameter_arr(l_indx).type_name          := cort_parse_pkg.get_original_name(
-                                                                                     in_object_type => 'TYPE',
                                                                                      in_object_name => l_all_method_param_arr(j).type_name
                                                                                    );
             out_type_rec.method_arr(i).parameter_arr(l_indx).method_name        := cort_parse_pkg.get_original_name(
-                                                                                     in_object_type => 'METHOD',
                                                                                      in_object_name => l_all_method_param_arr(j).method_name
                                                                                    );
             out_type_rec.method_arr(i).parameter_arr(l_indx).method_no          := l_all_method_param_arr(j).method_no;
@@ -3343,16 +3911,17 @@ end;';
             out_type_rec.method_arr(i).parameter_arr(l_indx).character_set_name := l_all_method_param_arr(j).character_set_name;
 
             out_type_rec.method_arr(i).parameter_arr(l_indx).param_type_name :=
-              CASE out_type_rec.method_arr(i).parameter_arr(l_indx).param_type_name
-                WHEN 'PL/SQL PLS INTEGER'    THEN 'PLS_INTEGER'
-                WHEN 'PL/SQL BINARY INTEGER' THEN 'BINARY_INTEGER'
-                WHEN 'PL/SQL BOOLEAN'        THEN 'BOOLEAN'
-                WHEN 'PL/SQL REF CURSOR'     THEN 'SYS_REFCURSOR'
-                WHEN 'PL/SQL LONG RAW'       THEN 'LONG RAW'
-                ELSE cort_parse_pkg.get_original_name(
-                       in_object_type => 'TYPE',
+              CASE 
+                WHEN out_type_rec.method_arr(i).parameter_arr(l_indx).param_type_name = 'PL/SQL PLS INTEGER'    THEN 'PLS_INTEGER'
+                WHEN out_type_rec.method_arr(i).parameter_arr(l_indx).param_type_name = 'PL/SQL BINARY INTEGER' THEN 'BINARY_INTEGER'
+                WHEN out_type_rec.method_arr(i).parameter_arr(l_indx).param_type_name = 'PL/SQL BOOLEAN'        THEN 'BOOLEAN'
+                WHEN out_type_rec.method_arr(i).parameter_arr(l_indx).param_type_name = 'PL/SQL REF CURSOR'     THEN 'SYS_REFCURSOR'
+                WHEN out_type_rec.method_arr(i).parameter_arr(l_indx).param_type_name = 'PL/SQL LONG RAW'       THEN 'LONG RAW'
+                WHEN l_all_method_param_arr(j).param_type_owner IS NOT NULL THEN
+                     cort_parse_pkg.get_original_name(
                        in_object_name => out_type_rec.method_arr(i).parameter_arr(l_indx).param_type_name
                      )
+                ELSE out_type_rec.method_arr(i).parameter_arr(l_indx).param_type_name
               END;
 
             IF l_all_method_param_arr(j).param_no = 1 THEN
@@ -3382,28 +3951,29 @@ end;';
           INTO out_type_rec.method_arr(i).result_rec
           FROM all_method_results
          WHERE owner = in_owner
-           AND type_name = in_type_name
+           AND type_name = out_type_rec.type_name
            AND method_name = l_all_type_method_arr(i).method_name
            AND method_no = l_all_type_method_arr(i).method_no;
         out_type_rec.method_arr(i).result_rec.method_name := cort_parse_pkg.get_original_name(
-                                                               in_object_type => 'TYPE',
+                                                             --  in_object_type => 'TYPE',
                                                                in_object_name => out_type_rec.method_arr(i).result_rec.type_name
                                                              );
         out_type_rec.method_arr(i).result_rec.method_name := cort_parse_pkg.get_original_name(
-                                                               in_object_type => 'METHOD',
+                                                               --in_object_type => 'METHOD',
                                                                in_object_name => out_type_rec.method_arr(i).result_rec.method_name
                                                              );
         out_type_rec.method_arr(i).result_rec.param_type_name :=
-          CASE out_type_rec.method_arr(i).result_rec.param_type_name
-            WHEN 'PL/SQL PLS INTEGER'    THEN 'PLS_INTEGER'
-            WHEN 'PL/SQL BINARY INTEGER' THEN 'BINARY_INTEGER'
-            WHEN 'PL/SQL BOOLEAN'        THEN 'BOOLEAN'
-            WHEN 'PL/SQL REF CURSOR'     THEN 'SYS_REFCURSOR'
-            WHEN 'PL/SQL LONG RAW'       THEN 'LONG RAW'
-            ELSE cort_parse_pkg.get_original_name(
-                   in_object_type => 'TYPE',
+          CASE 
+            WHEN out_type_rec.method_arr(i).result_rec.param_type_name = 'PL/SQL PLS INTEGER'    THEN 'PLS_INTEGER'
+            WHEN out_type_rec.method_arr(i).result_rec.param_type_name = 'PL/SQL BINARY INTEGER' THEN 'BINARY_INTEGER'
+            WHEN out_type_rec.method_arr(i).result_rec.param_type_name = 'PL/SQL BOOLEAN'        THEN 'BOOLEAN'
+            WHEN out_type_rec.method_arr(i).result_rec.param_type_name = 'PL/SQL REF CURSOR'     THEN 'SYS_REFCURSOR'
+            WHEN out_type_rec.method_arr(i).result_rec.param_type_name = 'PL/SQL LONG RAW'       THEN 'LONG RAW'
+            WHEN out_type_rec.method_arr(i).result_rec.param_type_owner IS NOT NULL THEN
+                 cort_parse_pkg.get_original_name(
                    in_object_name => out_type_rec.method_arr(i).result_rec.param_type_name
                  )
+            ELSE out_type_rec.method_arr(i).result_rec.param_type_name
           END;
       END IF;
 
@@ -3416,112 +3986,101 @@ end;';
       out_type_rec.method_ind_arr(out_type_rec.method_arr(i).method_name) := l_indx_arr;
     END LOOP;
 
-    -- read dependencies
 
-    SELECT *
-      BULK COLLECT
-      INTO out_type_rec.dependency_arr
-      FROM (SELECT DISTINCT d.owner, d.name, d.type,
-                   (SELECT max(object_id) FROM all_objects a
-                     WHERE a.object_type = d.type
-                       AND a.owner = d.owner
-                       AND a.object_name = d.name
-                       AND status = 'VALID') as object_id
-              FROM all_dependencies d
-             WHERE type = 'TABLE'
-             CONNECT BY referenced_owner = PRIOR d.owner
-                    AND referenced_name = PRIOR d.name
-                    AND referenced_type = PRIOR d.type
-             START WITH referenced_owner = in_owner
-                    AND referenced_name =  in_type_name
-                    AND referenced_type = 'TYPE'
-            )
-      WHERE OBJECT_ID IS NOT NULL;
+    FOR x IN (SELECT *
+                FROM (SELECT DISTINCT d.owner, d.name, d.type
+                        FROM all_dependencies d
+                       WHERE type = 'TABLE'
+                       CONNECT BY referenced_owner = PRIOR d.owner
+                              AND referenced_name = PRIOR d.name
+                              AND referenced_type = PRIOR d.type
+                       START WITH referenced_owner = in_owner
+                              AND referenced_name = NVL(l_adt_rec.synonym_name, l_adt_rec.type_name)
+                              AND referenced_type = NVL2(l_adt_rec.synonym_name, 'SYNONYM', 'TYPE')
+                      ) d
+                WHERE EXISTS (SELECT 1 
+                                FROM all_objects a
+                               WHERE a.object_type = d.type
+                                 AND a.owner = d.owner
+                                 AND a.object_name = d.name
+                                 AND status = 'VALID')
+              ) 
+    LOOP
+      l_table_rec := NULL;
 
-    out_type_rec.table_dependency := FALSE;
-    FOR i IN 1..out_type_rec.dependency_arr.COUNT LOOP
-      IF out_type_rec.dependency_arr(i).type = 'TABLE' THEN
-        out_type_rec.table_dependency := TRUE;
+      debug('Read type dependant table "'||x.owner||'"."'||x.name||'"');
+      
+      read_table_cascade(
+        in_table_name => x.name,
+        in_owner      => x.owner,
+        in_read_data  => g_params.data.get_value <> 'NONE',
+        in_debug_text => 'BACKUP_TABLE_REC',
+        out_table_rec => l_table_rec
+      );
+      out_type_rec.table_dependency_arr(out_type_rec.table_dependency_arr.COUNT + 1) := l_table_rec;
+      
+      -- find part key columns
+      FOR j IN 1..l_table_rec.part_key_column_arr.COUNT LOOP
+        IF l_adt_rec.attribute_ind_arr.EXISTS(l_table_rec.part_key_column_arr(j)) THEN
+          l_indx := l_adt_rec.attribute_ind_arr(l_table_rec.part_key_column_arr(j));
+          l_adt_rec.attribute_arr(l_indx).partition_key := TRUE;
+        END IF;
+      END LOOP;
 
-        read_table(
-          in_table_name      => out_type_rec.dependency_arr(i).name,
-          in_owner           => out_type_rec.dependency_arr(i).owner,
-          in_read_data       => FALSE,
-          out_table_rec      => l_table_rec
-        );
+      -- find part key columns
+      FOR j IN 1..l_table_rec.subpart_key_column_arr.COUNT LOOP
+        IF l_adt_rec.attribute_ind_arr.EXISTS(l_table_rec.subpart_key_column_arr(j)) THEN
+          l_indx := l_adt_rec.attribute_ind_arr(l_table_rec.subpart_key_column_arr(j));
+          l_adt_rec.attribute_arr(l_indx).partition_key := TRUE;
+        END IF;
+      END LOOP;
 
-        -- find part key columns
-        FOR j IN 1..l_table_rec.part_key_column_arr.COUNT LOOP
-          IF out_type_rec.attribute_ind_arr.EXISTS(l_table_rec.part_key_column_arr(j)) THEN
-            l_indx := out_type_rec.attribute_ind_arr(l_table_rec.part_key_column_arr(j));
-            out_type_rec.attribute_arr(l_indx).partition_key := TRUE;
-          END IF;
-        END LOOP;
+      -- find IOT key columns
+      FOR j IN 1..l_table_rec.iot_pk_column_arr.COUNT LOOP
+        IF l_adt_rec.attribute_ind_arr.EXISTS(l_table_rec.iot_pk_column_arr(j)) THEN
+          l_indx := l_adt_rec.attribute_ind_arr(l_table_rec.iot_pk_column_arr(j));
+          l_adt_rec.attribute_arr(l_indx).iot_primary_key := TRUE;
+        END IF;
+      END LOOP;
 
-        -- find part key columns
-        FOR j IN 1..l_table_rec.subpart_key_column_arr.COUNT LOOP
-          IF out_type_rec.attribute_ind_arr.EXISTS(l_table_rec.subpart_key_column_arr(j)) THEN
-            l_indx := out_type_rec.attribute_ind_arr(l_table_rec.subpart_key_column_arr(j));
-            out_type_rec.attribute_arr(l_indx).partition_key := TRUE;
-          END IF;
-        END LOOP;
-
-        -- find IOT key columns
-        FOR j IN 1..l_table_rec.iot_pk_column_arr.COUNT LOOP
-          IF out_type_rec.attribute_ind_arr.EXISTS(l_table_rec.iot_pk_column_arr(j)) THEN
-            l_indx := out_type_rec.attribute_ind_arr(l_table_rec.iot_pk_column_arr(j));
-            out_type_rec.attribute_arr(l_indx).iot_primary_key := TRUE;
-          END IF;
-        END LOOP;
-
-        -- find cluster key columns
-        FOR j IN 1..l_table_rec.cluster_column_arr.COUNT LOOP
-          IF out_type_rec.attribute_ind_arr.EXISTS(l_table_rec.cluster_column_arr(j)) THEN
-            l_indx := out_type_rec.attribute_ind_arr(l_table_rec.cluster_column_arr(j));
-            out_type_rec.attribute_arr(l_indx).cluster_key := TRUE;
-          END IF;
-        END LOOP;
-
-      END IF;
+      -- find cluster key columns
+      FOR j IN 1..l_table_rec.cluster_column_arr.COUNT LOOP
+        IF l_adt_rec.attribute_ind_arr.EXISTS(l_table_rec.cluster_column_arr(j)) THEN
+          l_indx := l_adt_rec.attribute_ind_arr(l_table_rec.cluster_column_arr(j));
+          l_adt_rec.attribute_arr(l_indx).cluster_key := TRUE;
+        END IF;
+      END LOOP;      
     END LOOP;
-
-
-/*
-    SELECT COUNT(*)
-      INTO l_cnt
-      FROM all_dependencies d
-     INNER JOIN all_objects a
-        ON a.object_type = d.type
-       AND a.owner = d.owner
-       AND a.object_name = d.name
-     WHERE referenced_owner = in_owner
-       AND referenced_name = in_type_name
-       AND referenced_type = 'TYPE'
-       AND TYPE = 'TABLE';
-    out_type_rec.table_dependency := l_cnt > 0;
-*/
-
-    BEGIN
-      SELECT 1
-        INTO l_cnt
-        FROM all_types
-       WHERE supertype_owner = in_owner
-         AND supertype_name = in_type_name
-         AND ROWNUM = 1;
-    EXCEPTION
-      WHEN NO_DATA_FOUND THEN
-        l_cnt := 0;
-    END;
-    out_type_rec.subtype_dependency := l_cnt = 1;
-
-    out_type_rec.rename_rec := get_rename_rec(
-                                     in_object_name  => out_type_rec.type_name,
-                                     in_object_owner => out_type_rec.owner,
-                                     in_object_type  => 'TYPE'
-                                   );
+    
+    g_adt_arr('"'||l_adt_rec.owner||'"."'||l_adt_rec.type_name) := l_adt_rec;
+  
+    FOR x IN (SELECT level, d.owner, d.name, d.type
+                FROM all_dependencies d
+               WHERE type = 'TYPE'
+               CONNECT BY referenced_owner = PRIOR d.owner
+                      AND referenced_name = PRIOR d.name
+                      AND referenced_type = PRIOR d.type
+               START WITH referenced_owner = in_owner
+                      AND referenced_name = out_type_rec.type_name
+                      AND referenced_type = 'TYPE'
+               ORDER BY level
+              ) 
+    LOOP
+      l_indx := out_type_rec.type_dependency_arr.COUNT + 1;
+      out_type_rec.type_dependency_arr(l_indx).owner           := x.owner;
+      out_type_rec.type_dependency_arr(l_indx).name            := x.name;
+    END LOOP;
+    
+     
+    read_privileges(
+      in_owner         => out_type_rec.owner,
+      in_object_name   => out_type_rec.type_name,
+      io_privilege_arr => out_type_rec.privilege_arr
+    );
 
     stop_timer;
   END read_type;
+  
 
   -- read view metadata
   PROCEDURE read_view(
@@ -3589,10 +4148,9 @@ end;';
 
   -- renames table and table's indexes, named constraints, named log groups, triggers and external references
   PROCEDURE rename_table_cascade(
-    io_table_rec     IN OUT NOCOPY gt_table_rec,
-    in_rename_mode   IN VARCHAR2,
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr
+    io_table_rec   IN OUT NOCOPY gt_table_rec,
+    in_rename_mode IN VARCHAR2,
+    io_change_arr  IN OUT NOCOPY gt_change_arr
   )
   AS
     l_indx PLS_INTEGER;
@@ -3600,46 +4158,41 @@ end;';
     FOR i IN 1..io_table_rec.index_arr.COUNT LOOP
       IF io_table_rec.index_arr(i).rename_rec.generated = 'N' THEN
         IF object_exists(
-             in_rename_rec        => io_table_rec.index_arr(i).rename_rec
+             in_rename_rec     => io_table_rec.index_arr(i).rename_rec
            )
         THEN
           cort_comp_pkg.rename_object(
-            in_rename_mode   => in_rename_mode,
-            io_rename_rec    => io_table_rec.index_arr(i).rename_rec,
-            io_frwd_stmt_arr => io_frwd_stmt_arr,
-            io_rlbk_stmt_arr => io_rlbk_stmt_arr
+            in_rename_mode => in_rename_mode,
+            io_rename_rec  => io_table_rec.index_arr(i).rename_rec,
+            io_change_arr  => io_change_arr
           );
         END IF;
       END IF;
     END LOOP;
     FOR i IN 1..io_table_rec.constraint_arr.COUNT LOOP
       IF io_table_rec.constraint_arr(i).generated = 'USER NAME' THEN
-        IF constraint_exists(
-             in_cons_name   => io_table_rec.constraint_arr(i).rename_rec.current_name,
-             in_owner       => io_table_rec.constraint_arr(i).owner
+        IF object_exists(
+             in_rename_rec   => io_table_rec.constraint_arr(i).rename_rec
            )
         THEN
           cort_comp_pkg.rename_object(
-            in_rename_mode   => in_rename_mode,
-            io_rename_rec    => io_table_rec.constraint_arr(i).rename_rec,
-            io_frwd_stmt_arr => io_frwd_stmt_arr,
-            io_rlbk_stmt_arr => io_rlbk_stmt_arr
+            in_rename_mode => in_rename_mode,
+            io_rename_rec  => io_table_rec.constraint_arr(i).rename_rec,
+            io_change_arr  => io_change_arr
           );
         END IF;
       END IF;
     END LOOP;
     FOR i IN 1..io_table_rec.log_group_arr.COUNT LOOP
       IF io_table_rec.log_group_arr(i).generated = 'USER NAME' THEN
-        IF constraint_exists(
-             in_cons_name   => io_table_rec.log_group_arr(i).rename_rec.current_name,
-             in_owner       => io_table_rec.log_group_arr(i).owner
+        IF object_exists(
+             in_rename_rec   => io_table_rec.log_group_arr(i).rename_rec
            )
         THEN
-          cort_comp_pkg.rename_object(
-            in_rename_mode   => in_rename_mode,
-            io_rename_rec    => io_table_rec.log_group_arr(i).rename_rec,
-            io_frwd_stmt_arr => io_frwd_stmt_arr,
-            io_rlbk_stmt_arr => io_rlbk_stmt_arr
+          cort_comp_pkg.rename_log_group(
+            in_rename_mode => in_rename_mode,
+            io_log_group   => io_table_rec.log_group_arr(i),
+            io_change_arr  => io_change_arr
           );
         END IF;
       END IF;
@@ -3649,10 +4202,9 @@ end;';
     WHILE l_indx IS NOT NULL LOOP
       IF io_table_rec.lob_arr(l_indx).rename_rec.generated = 'N' THEN
         cort_comp_pkg.rename_object(
-          in_rename_mode   => in_rename_mode,
-          io_rename_rec    => io_table_rec.lob_arr(l_indx).rename_rec,
-          io_frwd_stmt_arr => io_frwd_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_stmt_arr
+          in_rename_mode => in_rename_mode,
+          io_rename_rec  => io_table_rec.lob_arr(l_indx).rename_rec,
+          io_change_arr  => io_change_arr
         );
       END IF;
       l_indx := io_table_rec.lob_arr.NEXT(l_indx);
@@ -3660,14 +4212,13 @@ end;';
 
     FOR i IN 1..io_table_rec.nested_tables_arr.COUNT LOOP
       IF object_exists(
-           in_rename_rec        => io_table_rec.nested_tables_arr(i).rename_rec
+           in_rename_rec => io_table_rec.nested_tables_arr(i).rename_rec
          )
       THEN
         cort_comp_pkg.rename_object(
-          in_rename_mode   => in_rename_mode,
-          io_rename_rec    => io_table_rec.nested_tables_arr(i).rename_rec,
-          io_frwd_stmt_arr => io_frwd_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_stmt_arr
+          in_rename_mode => in_rename_mode,
+          io_rename_rec  => io_table_rec.nested_tables_arr(i).rename_rec,
+          io_change_arr  => io_change_arr
         );
       END IF;
     END LOOP;
@@ -3676,1264 +4227,122 @@ end;';
          in_object_type  => 'TABLE',
          in_object_name  => io_table_rec.rename_rec.current_name,
          in_object_owner => io_table_rec.owner
+       
        )
     THEN
       cort_comp_pkg.rename_object(
-        in_rename_mode   => in_rename_mode,
-        io_rename_rec    => io_table_rec.rename_rec,
-        io_frwd_stmt_arr => io_frwd_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_stmt_arr
+        in_rename_mode => in_rename_mode,
+        io_rename_rec  => io_table_rec.rename_rec,
+        io_change_arr  => io_change_arr
       );
     END IF;
   END rename_table_cascade;
-
-  -- finds all check constraint that was implicitly created by NOT NULL column constraint and mark their type as 'N'
-  PROCEDURE mark_notnull_constraints(
-    io_constraint_arr IN OUT NOCOPY gt_constraint_arr,
-    io_column_arr     IN OUT NOCOPY gt_column_arr
-  )
-  AS
-    l_column_indx   arrays.gt_int_indx;
-    l_indx          PLS_INTEGER;
-  BEGIN
-    -- bild index
-    FOR i IN 1..io_column_arr.COUNT LOOP
-      l_column_indx(io_column_arr(i).column_name) := i;
-    END LOOP;
-
-    -- find all check constraints
-    FOR i IN 1..io_constraint_arr.COUNT LOOP
-      IF io_constraint_arr(i).constraint_type = 'C' AND
-         io_constraint_arr(i).column_arr.COUNT = 1 AND
-         io_constraint_arr(i).search_condition = '"'||io_constraint_arr(i).column_arr(1)||'" IS NOT NULL' AND
-         l_column_indx.EXISTS(io_constraint_arr(i).column_arr(1))
-      THEN
-        l_indx := l_column_indx(io_constraint_arr(i).column_arr(1));
-        IF io_column_arr(l_indx).nullable = 'N' THEN
-          io_constraint_arr(i).constraint_type := 'N';
-          debug(io_constraint_arr(i).constraint_name||' ('||io_constraint_arr(i).column_arr(1)||') is NOT NULL constraint');
-          IF io_constraint_arr(i).generated = 'USER NAME' THEN
-            io_column_arr(l_indx).notnull_constraint_name := io_constraint_arr(i).constraint_name;
-          END IF;
-        END IF;
-      END IF;
-
-      IF io_constraint_arr(i).constraint_type = 'F' AND
-         io_constraint_arr(i).column_arr.COUNT > 1
-      THEN
-        FOR j IN 1..io_constraint_arr(i).column_arr.COUNT LOOP
-          IF io_constraint_arr(i).search_condition = '"'||io_constraint_arr(i).column_arr(j)||'" IS NOT NULL' AND
-             l_column_indx.EXISTS(io_constraint_arr(i).column_arr(j))
-          THEN
-            l_indx := l_column_indx(io_constraint_arr(i).column_arr(j));
-            IF io_column_arr(l_indx).nullable = 'N' THEN
-              io_constraint_arr(i).constraint_type := 'N';
-              debug(io_constraint_arr(i).constraint_name||' is NOT NULL constraint');
-              IF io_constraint_arr(i).generated = 'USER NAME' THEN
-                io_column_arr(l_indx).notnull_constraint_name := io_constraint_arr(i).constraint_name;
-              END IF;
-            END IF;
-          END IF;
-        END LOOP;
-      END IF;
-    END LOOP;
-  END mark_notnull_constraints;
-
-  -- update triggers definition - include table name in double quotes - workaround for Oracle bug
-  PROCEDURE update_triggers(
-    in_table_rec IN gt_table_rec
-  )
-  AS
-    l_frwd_alter_stmt_arr      arrays.gt_clob_arr;
-    l_rlbk_alter_stmt_arr      arrays.gt_clob_arr;
-  BEGIN
-    FOR i IN 1..in_table_rec.trigger_arr.COUNT LOOP
-      cort_comp_pkg.update_trigger(
-        in_table_rec           => in_table_rec,
-        in_trigger_rec         => in_table_rec.trigger_arr(i),
-        io_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
-        io_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr
-      );
-    END LOOP;
-    apply_changes(
-      in_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
-      in_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr
-    );
-  END update_triggers;
 
   -- copy table's and columns' comments
   PROCEDURE copy_comments(
     in_source_table_rec IN gt_table_rec,
     in_target_table_rec IN gt_table_rec,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr
+    io_change_arr       IN OUT NOCOPY gt_change_arr
   )
   AS
-    l_col_arr         arrays.gt_name_arr;
-    l_col_comment_arr arrays.gt_lstr_arr;
-    l_ddl             VARCHAR2(4200);
-    l_col_name        arrays.gt_name;
-    l_indx            PLS_INTEGER;
+    l_col_name        arrays.gt_name;    
   BEGIN
     IF in_source_table_rec.tab_comment IS NOT NULL THEN
-      l_ddl := 'COMMENT ON TABLE "'||in_target_table_rec.owner||'"."'||in_target_table_rec.table_name||'" IS Q''{'||in_source_table_rec.tab_comment||'}''';
-      cort_comp_pkg.add_stmt(
-        io_frwd_stmt_arr => io_frwd_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_stmt_arr,
-        in_frwd_stmt     => l_ddl,
-        in_rlbk_stmt     => NULL
-      );
+      add_change(io_change_arr, change_rec('COPY COMMENTS', 'COMMENT ON TABLE "'||in_target_table_rec.owner||'"."'||in_target_table_rec.table_name||'" IS Q''{'||in_source_table_rec.tab_comment||'}'''));
     END IF;
-    SELECT column_name, comments
-      BULK COLLECT
-      INTO l_col_arr, l_col_comment_arr
-      FROM all_col_comments
-     WHERE owner = in_source_table_rec.owner
-       AND table_name = in_source_table_rec.table_name
-       AND comments IS NOT NULL;
-     FOR i IN 1..l_col_comment_arr.COUNT LOOP
-       l_col_name := l_col_arr(i);
-       IF in_source_table_rec.column_indx_arr.EXISTS(l_col_name) THEN
-         l_indx := in_source_table_rec.column_indx_arr(l_col_name);
-         l_col_name := NVL(in_source_table_rec.column_arr(l_indx).new_column_name, in_source_table_rec.column_arr(l_indx).column_name);
-         IF in_target_table_rec.column_indx_arr.EXISTS(l_col_name) THEN
-           l_ddl := 'COMMENT ON COLUMN "'||in_target_table_rec.owner||'"."'||in_target_table_rec.table_name||'"."'||l_col_name||'" IS Q''{'||l_col_comment_arr(i)||'}''';
-           cort_comp_pkg.add_stmt(
-             io_frwd_stmt_arr => io_frwd_stmt_arr,
-             io_rlbk_stmt_arr => io_rlbk_stmt_arr,
-             in_frwd_stmt     => l_ddl,
-             in_rlbk_stmt     => NULL
-           );
-         END IF;
-       END IF;
-     END LOOP;
+    
+    FOR i IN 1..in_source_table_rec.column_arr.COUNT LOOP
+      IF in_source_table_rec.column_arr(i).col_comment IS NOT NULL AND
+         in_source_table_rec.column_arr(i).col_comment NOT LIKE cort_params_pkg.gc_prefix||'%'  
+      THEN
+        l_col_name := NVL(in_source_table_rec.column_arr(i).new_column_name, in_source_table_rec.column_arr(i).column_name);
+        IF in_target_table_rec.column_indx_arr.EXISTS(l_col_name) THEN
+          add_change(io_change_arr, change_rec('COPY COMMENTS',  'COMMENT ON COLUMN "'||in_target_table_rec.owner||'"."'||in_target_table_rec.table_name||'"."'||l_col_name||'" IS Q''{'||in_source_table_rec.column_arr(i).col_comment||'}'''));
+        END IF;
+      END IF;
+    END LOOP;
   END copy_comments;
 
-  -- change comment on source table
-  PROCEDURE comment_table(
-    in_table_rec     IN gt_table_rec,
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr
+  -- copies table privileges
+  PROCEDURE copy_table_privileges(
+    in_source_table_rec IN gt_table_rec,
+    io_target_table_rec IN OUT gt_table_rec,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
   )
   AS
+    l_indx        PLS_INTEGER;
+    l_col_name    arrays.gt_name;
   BEGIN
-    cort_comp_pkg.add_stmt(
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr,
-      in_frwd_stmt     => 'COMMENT ON TABLE "'||in_table_rec.owner||'"."'||in_table_rec.table_name||'" IS Q''{'||in_table_rec.table_name||'}''',
-      in_rlbk_stmt     => 'COMMENT ON TABLE "'||in_table_rec.owner||'"."'||in_table_rec.table_name||'" IS Q''{'||in_table_rec.tab_comment||'}'''
-    );
-  END comment_table;
+    io_target_table_rec.privilege_arr.DELETE;
+    FOR i IN 1..in_source_table_rec.privilege_arr.COUNT LOOP
+      l_col_name := in_source_table_rec.privilege_arr(i).column_name;
+      IF l_col_name IS NOT NULL THEN
+        IF in_source_table_rec.column_indx_arr.EXISTS(l_col_name) THEN
+          l_indx := in_source_table_rec.column_indx_arr(l_col_name);
+          l_col_name := NVL(in_source_table_rec.column_arr(l_indx).new_column_name,in_source_table_rec.column_arr(l_indx).column_name);
+          IF io_target_table_rec.column_indx_arr.EXISTS(l_col_name) THEN
+            l_indx := io_target_table_rec.privilege_arr.COUNT+1;
+            io_target_table_rec.privilege_arr(l_indx) := in_source_table_rec.privilege_arr(i);
+            io_target_table_rec.privilege_arr(l_indx).table_schema := io_target_table_rec.owner;
+            io_target_table_rec.privilege_arr(l_indx).table_name := io_target_table_rec.table_name;
+            io_target_table_rec.privilege_arr(l_indx).column_name := l_col_name;
+          END IF;
+        END IF;
+      ELSE
+        l_indx := io_target_table_rec.privilege_arr.COUNT+1;
+        io_target_table_rec.privilege_arr(l_indx) := in_source_table_rec.privilege_arr(i);
+        io_target_table_rec.privilege_arr(l_indx).table_schema := io_target_table_rec.owner;
+        io_target_table_rec.privilege_arr(l_indx).table_name := io_target_table_rec.table_name;
+      END IF;
+    END LOOP;
 
-  -- copy table's privileges
-  PROCEDURE copy_privileges(
-    io_source_table_rec IN OUT NOCOPY gt_table_rec,
-    io_target_table_rec IN OUT NOCOPY gt_table_rec,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-  BEGIN
-    read_privileges(
-      in_owner         => io_source_table_rec.owner,
-      in_table_name    => io_source_table_rec.table_name,
-      io_privilege_arr => io_source_table_rec.privilege_arr
+    cort_comp_pkg.get_privileges_stmt(
+      in_privilege_arr => io_target_table_rec.privilege_arr,
+      io_change_arr    => io_change_arr
     );
-    cort_comp_pkg.copy_privileges(
-      in_source_table_rec      => io_source_table_rec,
-      io_target_table_rec      => io_target_table_rec,
-      io_frwd_alter_stmt_arr   => io_frwd_stmt_arr,
-      io_rlbk_alter_stmt_arr   => io_rlbk_stmt_arr
-    );
-  END copy_privileges;
 
-  -- copy sequence's privileges
-  PROCEDURE copy_privileges(
-    io_source_sequence_rec IN OUT NOCOPY gt_sequence_rec,
-    io_target_sequence_rec IN OUT NOCOPY gt_sequence_rec,
-    io_frwd_stmt_arr       IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr       IN OUT NOCOPY arrays.gt_clob_arr
+  END copy_table_privileges;
+
+  -- copies sequence privileges
+  PROCEDURE copy_sequence_privileges(
+    in_source_sequence_rec IN gt_sequence_rec,
+    io_target_sequence_rec IN OUT gt_sequence_rec,
+    io_change_arr          IN OUT NOCOPY gt_change_arr
   )
   AS
   BEGIN
-    read_privileges(
-      in_owner         => io_source_sequence_rec.owner,
-      in_table_name    => io_source_sequence_rec.sequence_name,
-      io_privilege_arr => io_source_sequence_rec.privilege_arr
-    );
-    io_target_sequence_rec.privilege_arr := io_source_sequence_rec.privilege_arr;
+    io_target_sequence_rec.privilege_arr := in_source_sequence_rec.privilege_arr;
 
     FOR i IN 1..io_target_sequence_rec.privilege_arr.COUNT LOOP
       io_target_sequence_rec.privilege_arr(i).table_name := io_target_sequence_rec.sequence_name;
     END LOOP;
 
     cort_comp_pkg.get_privileges_stmt(
-      in_privilege_arr         => io_target_sequence_rec.privilege_arr,
-      io_frwd_alter_stmt_arr   => io_frwd_stmt_arr,
-      io_rlbk_alter_stmt_arr   => io_rlbk_stmt_arr
+      in_privilege_arr => io_target_sequence_rec.privilege_arr,
+      io_change_arr    => io_change_arr
     );
+  END copy_sequence_privileges;
 
-  END copy_privileges;
 
-
-  -- Disable/Enable all FK before/after data load
-  PROCEDURE change_status_for_all_fk(
-    in_table_rec     IN gt_table_rec,
-    in_action        IN VARCHAR2,  -- DISABLE/ENABLE
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr
+  -- copies type privileges
+  PROCEDURE copy_type_privileges(
+    in_source_type_rec IN gt_type_rec,
+    io_target_type_rec IN OUT gt_type_rec,
+    io_change_arr      IN OUT NOCOPY gt_change_arr
   )
   AS
-    l_validate VARCHAR2(10);
-    l_sql      VARCHAR2(1000);
   BEGIN
-    IF in_action NOT IN ('ENABLE','DISABLE') THEN
-      RETURN;
-    END IF;
+    io_target_type_rec.privilege_arr := in_source_type_rec.privilege_arr;
 
-    FOR i IN 1..in_table_rec.constraint_arr.COUNT LOOP
-      IF in_table_rec.constraint_arr(i).constraint_type = 'R' AND
-         in_table_rec.constraint_arr(i).status = 'ENABLED'
-      THEN
-        IF in_action = 'ENABLE' THEN
-          IF NOT g_params.validate.get_bool_value THEN
-            l_validate := 'NOVALIDATE';
-          ELSE
-            l_validate := NULL;
-          END IF;
-        END IF;
-        l_sql := 'ALTER TABLE "'||in_table_rec.owner||'"."'||in_table_rec.table_name||'" '||
-                 in_action||' '||l_validate||' CONSTRAINT "'||in_table_rec.constraint_arr(i).constraint_name||'"';
-        cort_comp_pkg.add_stmt(
-          io_frwd_stmt_arr => io_frwd_stmt_arr,
-          io_rlbk_stmt_arr => io_rlbk_stmt_arr,
-          in_frwd_stmt     => l_sql,
-          in_rlbk_stmt     => NULL
-        );
-      END IF;
-    END LOOP;
-  END change_status_for_all_fk;
-
-  PROCEDURE change_status_for_policies(
-    in_table_rec     IN gt_table_rec,
-    in_action        IN VARCHAR2,  -- DISABLE/ENABLE
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_frwd_sql VARCHAR2(1000);
-    l_rlbk_sql VARCHAR2(1000);
-    l_enable   VARCHAR2(10);
-  BEGIN
-    CASE in_action
-      WHEN 'ENABLE' THEN l_enable := 'TRUE';
-      WHEN 'DISABLE' THEN l_enable := 'FALSE';
-      ELSE RETURN;
-    END CASE;
-
-    FOR i IN 1..in_table_rec.policy_arr.COUNT LOOP
-      l_frwd_sql := '
-begin
-  dbms_rls.enable_policy(
-    object_schema => ''"'||in_table_rec.policy_arr(i).object_owner||'"'',
-    object_name   => ''"'||in_table_rec.policy_arr(i).object_name||'"'',
-    policy_name   => ''"'||in_table_rec.policy_arr(i).policy_name||'"'',
-    enable        => '||l_enable||'
-  );
-end;';
-      l_rlbk_sql := '
-begin
-  dbms_rls.enable_policy(
-    object_schema => ''"'||in_table_rec.policy_arr(i).object_owner||'"'',
-    object_name   => ''"'||in_table_rec.policy_arr(i).object_name||'"'',
-    policy_name   => ''"'||in_table_rec.policy_arr(i).policy_name||'"'',
-    enable        => NOT '||l_enable||'
-  );
-end;';
-      cort_comp_pkg.add_stmt(
-        io_frwd_stmt_arr => io_frwd_stmt_arr,
-        io_rlbk_stmt_arr => io_rlbk_stmt_arr,
-        in_frwd_stmt     => l_frwd_sql,
-        in_rlbk_stmt     => l_rlbk_sql
-      );
-    END LOOP;
-  END change_status_for_policies;
-
-  PROCEDURE get_copy_data_sql(
-    in_source_table_rec     IN gt_table_rec,
-    in_target_table_rec     IN gt_table_rec,
-    in_source_partition_rec IN gt_partition_rec,
-    in_target_partition_rec IN gt_partition_rec,
-    in_column_list          IN CLOB,
-    in_values_list          IN CLOB,
-    in_filter_sql           IN CLOB,
-    io_sql_arr              IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_source_partition_clause  VARCHAR2(100);
-    l_target_partition_clause  VARCHAR2(100);
-    l_sql                      CLOB;
-    l_append                   VARCHAR2(100);
-    l_parallel                 VARCHAR2(100);
-  BEGIN
-    -- partitioned table
-    IF in_source_partition_rec.partition_name IS NOT NULL THEN
-      l_source_partition_clause := in_source_partition_rec.partition_level||' ("'||in_source_partition_rec.partition_name||'")';
-      IF in_target_partition_rec.partition_name IS NOT NULL THEN
-        l_target_partition_clause := in_target_partition_rec.partition_level||' ("'||in_target_partition_rec.partition_name||'")';
-        l_append := 'APPEND';
-      END IF;
-      $IF cort_options_pkg.gc_threading $THEN
-        -- in case of threading we can use append only when data are copied from partition to partition to prevent blocking
-        IF g_params.threading.get_value = 'NONE' THEN
-          l_append := 'APPEND';
-        END IF;
-      $ELSE
-        l_append := 'APPEND';
-      $END
-    ELSE
-      -- non partitioned table
-      l_source_partition_clause := NULL;
-      l_target_partition_clause := NULL;
-      l_append := 'APPEND';
-    END IF;
-
-    IF g_params.parallel.get_num_value > 1 THEN
-      l_parallel := 'PARALLEL ('||g_params.parallel.get_value||')';
-    END IF;
-
-    IF g_params.test.get_bool_value AND NOT g_params.debug.get_bool_value AND io_sql_arr.count > 1 THEN
-      -- short version of SQL for output only
-      l_sql :=
-      'INSERT /*+ '||l_append||' '||l_parallel||' */'||chr(10)||
-      '  INTO "'||in_target_table_rec.owner||'"."'||in_target_table_rec.rename_rec.current_name||'" '||l_target_partition_clause||' (...)'||chr(10)||
-      'SELECT /*+ '||l_parallel||' full('||g_params.alias.get_value||') */ ...'||chr(10)||
-      '  FROM "'||in_source_table_rec.owner||'"."'||in_source_table_rec.rename_rec.current_name||'" '||l_source_partition_clause||' '||g_params.alias.get_value||chr(10)||
-      case when length(in_filter_sql) > 100 then substr(in_filter_sql, 1, 97)||'...' else in_filter_sql end;
-    ELSE
-      -- copy data
-      l_sql :=
-      'INSERT /*+ '||l_append||' '||l_parallel||' */'||chr(10)||
-      '  INTO "'||in_target_table_rec.owner||'"."'||in_target_table_rec.rename_rec.current_name||'" '||l_target_partition_clause||chr(10)||
-      '      ('||in_column_list||')'||chr(10)||
-      'SELECT /*+ '||l_parallel||' full('||g_params.alias.get_value||') */'||chr(10)||
-              in_values_list||chr(10)||
-      '  FROM "'||in_source_table_rec.owner||'"."'||in_source_table_rec.rename_rec.current_name||'" '||l_source_partition_clause||' '||g_params.alias.get_value||chr(10)||
-      in_filter_sql;
-    END IF;
-
-    $IF cort_options_pkg.gc_threading $THEN
-    IF in_source_partition_rec.partition_name IS NOT NULL THEN
-      cort_thread_exec_pkg.make_sql_threadable(
-        io_sql => l_sql
-      );
-    END IF;
-    $END
-    io_sql_arr(io_sql_arr.count+1) := l_sql;
-
-  END get_copy_data_sql;
-
-  PROCEDURE get_online_copy_data_sql(
-    in_source_table_rec     IN gt_table_rec,
-    in_target_table_rec     IN gt_table_rec,
-    in_source_partition_rec IN gt_partition_rec,
-    in_target_partition_rec IN gt_partition_rec,
-    in_column_list          IN CLOB,
-    in_filter_sql           IN CLOB,
-    io_sql_arr              IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_source_partition_clause  VARCHAR2(100);
-    l_target_partition_clause  VARCHAR2(100);
-    l_sql                      CLOB;
-    l_append                   VARCHAR2(100);
-    l_parallel                 VARCHAR2(100);
-  BEGIN
-
-    l_sql := q'{
-    DECLARE
-      CURSOR l_cur IS
-      SELECT * FROM
-
-    BEGIN
-    END;}';
-
-  END get_online_copy_data_sql;
-
-  PROCEDURE get_stats_sql(
-    in_source_table_rec     IN gt_table_rec,
-    in_target_table_rec     IN gt_table_rec,
-    in_source_partition_rec IN gt_partition_rec,
-    in_target_partition_rec IN gt_partition_rec,
-    io_sql_arr              IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_sql      CLOB;
-  BEGIN
-    IF g_params.stats.get_value = 'COPY' AND in_target_partition_rec.partition_name IS NOT NULL AND in_source_partition_rec.partition_name IS NOT NULL THEN
-      l_sql := '
-begin
-  cort_exec_pkg.copy_stats(
-    in_owner        => '''||in_source_table_rec.owner||''',
-    in_source_table => '''||in_source_table_rec.rename_rec.current_name||''',
-    in_target_table => '''||in_target_table_rec.rename_rec.current_name||''',
-    in_source_part  => '''||in_source_partition_rec.partition_name||''',
-    in_target_part  => '''||in_target_partition_rec.partition_name||''',
-    in_part_level   => '''||in_target_partition_rec.partition_level||'''
-  );
-end;';
-      $IF cort_options_pkg.gc_threading $THEN
-        cort_thread_exec_pkg.make_sql_threadable(
-          io_sql => l_sql
-        );
-      $END
-      io_sql_arr(io_sql_arr.count+1) := l_sql;
-    ELSIF g_params.stats.get_value = 'COPY' AND in_target_partition_rec.partition_name IS NULL AND in_source_partition_rec.partition_name IS NULL THEN
-      l_sql := '
-begin
-  cort_exec_pkg.copy_stats(
-    in_owner        => '''||in_source_table_rec.owner||''',
-    in_source_table => '''||in_source_table_rec.rename_rec.current_name||''',
-    in_target_table => '''||in_target_table_rec.rename_rec.current_name||'''
-  );
-end;';
-    ELSIF g_params.stats.get_value IN ('APPROX_GLOBAL AND PARTITION',in_target_partition_rec.partition_level) AND in_target_partition_rec.partition_name IS NOT NULL THEN
-      l_sql := '
-begin
-  dbms_stats.gather_table_stats(
-    ownname          => ''"'||in_target_table_rec.owner||'"'',
-    tabname          => ''"'||in_target_table_rec.rename_rec.current_name||'"'',
-    partname         => ''"'||in_target_partition_rec.partition_name||'"'',
-    granularity      => '''||g_params.stats.get_value||''',
-    estimate_percent => '||NVL(g_params.stats_estimate_pct.get_num_value, dbms_stats.default_estimate_percent)||',
-    method_opt       => '||NVL(SUBSTR(g_params.stats_method_opt.get_value, 2, LENGTH(g_params.stats_method_opt.get_value)-2), 'dbms_stats.default_method_opt')||',
-    degree           => '||NVL(g_params.parallel.get_num_value, dbms_stats.default_degree_value)||',
-    cascade          => true,
-    no_invalidate    => false
-  );
-end;';
-      $IF cort_options_pkg.gc_threading $THEN
-        cort_thread_exec_pkg.make_sql_threadable(
-          io_sql => l_sql
-        );
-      $END
-      io_sql_arr(io_sql_arr.count+1) := l_sql;
-    ELSIF g_params.stats.get_value IN ('ALL','AUTO','GLOBAL','GLOBAL AND PARTITION') AND in_target_partition_rec.partition_name IS NULL THEN
-      l_sql := '
-begin
-  dbms_stats.gather_table_stats(
-    ownname          => ''"'||in_target_table_rec.owner||'"'',
-    tabname          => ''"'||in_target_table_rec.rename_rec.current_name||'"'',
-    granularity      => '''||g_params.stats.get_value||''',
-    estimate_percent => '||NVL(g_params.stats_estimate_pct.get_num_value, dbms_stats.default_estimate_percent)||',
-    method_opt       => '||NVL(SUBSTR(g_params.stats_method_opt.get_value, 2, LENGTH(g_params.stats_method_opt.get_value)-2), 'dbms_stats.default_method_opt')||',
-    degree           => '||NVL(g_params.parallel.get_num_value, dbms_stats.default_degree_value)||',
-    cascade          => true,
-    no_invalidate    => false
-  );
-end;';
-    ELSE
-      l_sql := null;
-    END IF;
-  END get_stats_sql;
-
-  PROCEDURE build_partition_loop_sql(
-    in_source_table_rec IN gt_table_rec,
-    in_target_table_rec IN gt_table_rec,
-    in_column_list      IN CLOB,
-    in_values_list      IN CLOB,
-    in_filter_sql       IN CLOB,
-    in_recreate_mode    IN PLS_INTEGER,
-    io_sql_arr          IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_source_partition_rec     gt_partition_rec;
-    l_target_partition_rec     gt_partition_rec;
-    l_cnt                      PLS_INTEGER;
-  BEGIN
-    start_timer;
-
-    IF in_source_table_rec.partitioning_type IS NULL THEN
-      raise_error('Copy data by partitions is not supported. Source table is not partitioned');
-    END IF;
-
-    l_cnt := 1;
-
-    FOR i IN REVERSE 1..in_source_table_rec.partition_arr.COUNT LOOP
-      l_source_partition_rec := in_source_table_rec.partition_arr(i);
-
-      IF l_source_partition_rec.is_partition_empty THEN
-        debug('partition '||l_source_partition_rec.partition_name||' is empty');
-      END IF;
-
-      IF (l_source_partition_rec.matching_indx IS NOT NULL AND in_recreate_mode = cort_comp_pkg.gc_result_part_exchange) OR
-          l_source_partition_rec.is_partition_empty
-      THEN
-        -- move data
-        NULL;
-      ELSE
-        IF l_source_partition_rec.matching_indx = -1 THEN
-          NULL; -- skip partition
-        ELSE
-          IF l_source_partition_rec.matching_indx > 0 THEN
-            l_target_partition_rec := in_target_table_rec.partition_arr(l_source_partition_rec.matching_indx);
-          ELSE
-            l_target_partition_rec := NULL;
-          END IF;
-
-          get_copy_data_sql(
-            in_source_table_rec     => in_source_table_rec,
-            in_target_table_rec     => in_target_table_rec,
-            in_source_partition_rec => l_source_partition_rec,
-            in_target_partition_rec => l_target_partition_rec,
-            in_column_list          => in_column_list,
-            in_values_list          => in_values_list,
-            in_filter_sql           => in_filter_sql,
-            io_sql_arr              => io_sql_arr
-          );
-
-          l_cnt := l_cnt + 1;
-        END IF;
-      END IF;
+    FOR i IN 1..io_target_type_rec.privilege_arr.COUNT LOOP
+      io_target_type_rec.privilege_arr(i).table_name := io_target_type_rec.type_name;
     END LOOP;
 
-    stop_timer;
-  END build_partition_loop_sql;
-
-  PROCEDURE build_partition_loop_stats(
-    in_source_table_rec IN gt_table_rec,
-    in_target_table_rec IN gt_table_rec,
-    io_sql_arr          IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_source_partition_rec     gt_partition_rec;
-    l_target_partition_rec     gt_partition_rec;
-  BEGIN
-    start_timer;
-
-    IF in_target_table_rec.partitioning_type IS NULL THEN
-      raise_error('Gather stats by partitions is not supported. Target table is not partitioned');
-    END IF;
-
-
-    FOR i IN REVERSE 1..in_target_table_rec.partition_arr.COUNT LOOP
-      l_target_partition_rec := in_target_table_rec.partition_arr(i);
-
-      IF l_target_partition_rec.matching_indx > 0 THEN
-        l_source_partition_rec := in_source_table_rec.partition_arr(l_target_partition_rec.matching_indx);
-      ELSE
-        l_source_partition_rec := NULL;
-      END IF;
-
-      get_stats_sql(
-        in_source_table_rec     => in_source_table_rec,
-        in_target_table_rec     => in_target_table_rec,
-        in_source_partition_rec => l_source_partition_rec,
-        in_target_partition_rec => l_target_partition_rec,
-        io_sql_arr              => io_sql_arr
-      );
-
-    END LOOP;
-
-    stop_timer;
-  END build_partition_loop_stats;
-
-  PROCEDURE build_subpartition_loop_sql(
-    in_source_table_rec IN gt_table_rec,
-    in_target_table_rec IN gt_table_rec,
-    in_column_list      IN CLOB,
-    in_values_list      IN CLOB,
-    in_filter_sql       IN CLOB,
-    in_recreate_mode    IN PLS_INTEGER,
-    io_sql_arr          IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_source_partition_rec     gt_partition_rec;
-    l_source_subpartition_rec  gt_partition_rec;
-    l_target_subpartition_rec  gt_partition_rec;
-    l_cnt                      PLS_INTEGER;
-  BEGIN
-    start_timer;
-
-    IF in_source_table_rec.subpartitioning_type IS NULL THEN
-      raise_error('Copy data by subpartitions is not supported. Source table is not subpartitioned');
-    END IF;
-
-    l_cnt := 1;
-
-    FOR i IN REVERSE 1..in_source_table_rec.partition_arr.COUNT LOOP
-      l_source_partition_rec := in_source_table_rec.partition_arr(i);
-      FOR j IN l_source_partition_rec.subpartition_from_indx..l_source_partition_rec.subpartition_to_indx LOOP
-        l_source_subpartition_rec := in_source_table_rec.subpartition_arr(j);
-        IF l_source_partition_rec.matching_indx > 0 AND l_source_subpartition_rec.matching_indx > 0 THEN
-          l_target_subpartition_rec := in_target_table_rec.subpartition_arr(l_source_subpartition_rec.matching_indx);
-        ELSE
-          l_target_subpartition_rec := NULL;
-        END IF;
-
-        IF (l_source_partition_rec.matching_indx IS NOT NULL AND
-            l_source_subpartition_rec.matching_indx IS NOT NULL AND
-            in_recreate_mode = cort_comp_pkg.gc_result_part_exchange) OR
-           l_source_partition_rec.is_partition_empty
-        THEN
-          -- move data
-          NULL;
-        ELSE
-          get_copy_data_sql(
-            in_source_table_rec     => in_source_table_rec,
-            in_target_table_rec     => in_target_table_rec,
-            in_source_partition_rec => l_source_subpartition_rec,
-            in_target_partition_rec => l_target_subpartition_rec,
-            in_column_list          => in_column_list,
-            in_values_list          => in_values_list,
-            in_filter_sql           => in_filter_sql,
-            io_sql_arr              => io_sql_arr
-          );
-          l_cnt := l_cnt + 1;
-        END IF;
-      END LOOP;
-
-    END LOOP;
-
-    stop_timer;
-  END build_subpartition_loop_sql;
-
-  PROCEDURE build_subpartition_loop_stats(
-    in_source_table_rec IN gt_table_rec,
-    in_target_table_rec IN gt_table_rec,
-    io_sql_arr          IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_target_partition_rec     gt_partition_rec;
-    l_target_subpartition_rec  gt_partition_rec;
-    l_source_subpartition_rec  gt_partition_rec;
-  BEGIN
-    start_timer;
-
-    IF in_target_table_rec.subpartitioning_type IS NULL THEN
-      raise_error('Gather stats by subpartitions is not supported. Target table is not subpartitioned');
-    END IF;
-
-    FOR i IN REVERSE 1..in_target_table_rec.partition_arr.COUNT LOOP
-      l_target_partition_rec := in_target_table_rec.partition_arr(i);
-      FOR j IN l_target_partition_rec.subpartition_from_indx..l_target_partition_rec.subpartition_to_indx LOOP
-        l_target_subpartition_rec := in_target_table_rec.subpartition_arr(j);
-        IF l_target_partition_rec.matching_indx > 0 AND l_target_subpartition_rec.matching_indx > 0 THEN
-          l_source_subpartition_rec := in_source_table_rec.subpartition_arr(l_target_subpartition_rec.matching_indx);
-        ELSE
-          l_source_subpartition_rec := NULL;
-        END IF;
-
-        get_stats_sql(
-          in_target_table_rec     => in_target_table_rec,
-          in_source_table_rec     => in_source_table_rec,
-          in_target_partition_rec => l_target_subpartition_rec,
-          in_source_partition_rec => l_source_subpartition_rec,
-          io_sql_arr              => io_sql_arr
-        );
-      END LOOP;
-
-    END LOOP;
-
-    stop_timer;
-  END build_subpartition_loop_stats;
-
-  -- copying data from old tale to new one
-  PROCEDURE copy_data(
-    in_source_table_rec IN gt_table_rec,
-    in_target_table_rec IN gt_table_rec,
-    in_recreate_mode    IN PLS_INTEGER,
-    in_filter_sql       IN CLOB,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_column_list   CLOB;
-    l_values_list   CLOB;
-    l_last_indx     PLS_INTEGER;
-  BEGIN
-    start_timer;
-
-    cort_comp_pkg.get_column_values_list(
-      in_source_table_rec => in_source_table_rec,
-      in_target_table_rec => in_target_table_rec,
-      out_columns_list    => l_column_list,
-      out_values_list     => l_values_list
+    cort_comp_pkg.get_privileges_stmt(
+      in_privilege_arr => io_target_type_rec.privilege_arr,
+      io_change_arr    => io_change_arr
     );
-
-    --check for non-empty strings
-    IF l_column_list IS NULL OR
-       l_values_list IS NULL
-    THEN
-      RETURN;
-    END IF;
-
-    -- disable all foreign keys
-    change_status_for_all_fk(
-      in_table_rec     => in_target_table_rec,
-      in_action        => 'DISABLE',
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr
-    );
-    change_status_for_policies(
-      in_table_rec     => in_source_table_rec,
-      in_action        => 'DISABLE',
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr
-    );
-
-    l_last_indx := io_frwd_stmt_arr.COUNT;
-
-    IF in_source_table_rec.partitioned = 'NO' THEN
-
-      get_copy_data_sql(
-        in_source_table_rec     => in_source_table_rec,
-        in_target_table_rec     => in_target_table_rec,
-        in_source_partition_rec => null,
-        in_target_partition_rec => null,
-        in_column_list          => l_column_list,
-        in_values_list          => l_values_list,
-        in_filter_sql           => in_filter_sql,
-        io_sql_arr              => io_frwd_stmt_arr
-      );
-
-      IF in_target_table_rec.partitioned = 'YES' AND in_target_table_rec.interval IS NULL THEN
-        -- build loop by partitions only if new partitions are hardcoded and not interval
-        -- because interval partitions are created when data are copied and not defined yet at this moment
-        build_partition_loop_stats(
-          in_source_table_rec => in_source_table_rec,
-          in_target_table_rec => in_target_table_rec,
-          io_sql_arr          => io_frwd_stmt_arr
-        );
-        $IF cort_options_pkg.gc_threading $THEN
-        cort_thread_exec_pkg.add_threading_sql(
-          io_sql_arr          => io_frwd_stmt_arr
-        );
-        $END
-      ELSE
-        get_stats_sql(
-          in_target_table_rec     => in_target_table_rec,
-          in_source_table_rec     => in_source_table_rec,
-          in_target_partition_rec => null,
-          in_source_partition_rec => null,
-          io_sql_arr              => io_frwd_stmt_arr
-        );
-      END IF;
-
-    ELSE
-      IF in_source_table_rec.subpartitioning_type <> 'NONE' AND in_source_table_rec.subpartitioning_type = in_target_table_rec.subpartitioning_type THEN
-        build_subpartition_loop_sql(
-          in_source_table_rec => in_source_table_rec,
-          in_target_table_rec => in_target_table_rec,
-          in_column_list      => l_column_list,
-          in_values_list      => l_values_list,
-          in_filter_sql       => in_filter_sql,
-          in_recreate_mode    => in_recreate_mode,
-          io_sql_arr          => io_frwd_stmt_arr
-        );
-        build_subpartition_loop_stats(
-          in_source_table_rec => in_source_table_rec,
-          in_target_table_rec => in_target_table_rec,
-          io_sql_arr          => io_frwd_stmt_arr
-        );
-      ELSE
-        build_partition_loop_sql(
-          in_source_table_rec => in_source_table_rec,
-          in_target_table_rec => in_target_table_rec,
-          in_column_list      => l_column_list,
-          in_values_list      => l_values_list,
-          in_filter_sql       => in_filter_sql,
-          in_recreate_mode    => in_recreate_mode,
-          io_sql_arr          => io_frwd_stmt_arr
-        );
-        IF in_target_table_rec.partitioned = 'YES' THEN
-          build_partition_loop_stats(
-            in_source_table_rec => in_source_table_rec,
-            in_target_table_rec => in_target_table_rec,
-            io_sql_arr          => io_frwd_stmt_arr
-          );
-        END IF;
-      END IF;
-      $IF cort_options_pkg.gc_threading $THEN
-      cort_thread_exec_pkg.add_threading_sql(
-        io_sql_arr          => io_frwd_stmt_arr
-      );
-      $END
-    END IF;
-
-    -- Gather global stats (if needed)
-    get_stats_sql(
-      in_target_table_rec     => in_target_table_rec,
-      in_source_table_rec     => in_source_table_rec,
-      in_target_partition_rec => null,
-      in_source_partition_rec => null,
-      io_sql_arr              => io_frwd_stmt_arr
-    );
-
-
-    -- add nulls to rollback ddl
-    FOR i IN l_last_indx+1..io_frwd_stmt_arr.COUNT LOOP
-      io_rlbk_stmt_arr(i) := NULL;
-    END LOOP;
-
-    -- enable all foreign keys
-    change_status_for_all_fk(
-      in_table_rec     => in_target_table_rec,
-      in_action        => 'ENABLE',
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr
-    );
-    change_status_for_policies(
-      in_table_rec     => in_source_table_rec,
-      in_action        => 'ENABLE',
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr
-    );
-
-    stop_timer;
-  END copy_data;
-
-  PROCEDURE exchange_partitions(
-    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_swap_table_rec   IN cort_exec_pkg.gt_table_rec,
-    in_source_part_rec  IN cort_exec_pkg.gt_partition_rec,
-    in_target_part_rec  IN cort_exec_pkg.gt_partition_rec,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  AS
-    l_frwd_stmt_arr          arrays.gt_clob_arr;
-    l_rlbk_stmt_arr          arrays.gt_clob_arr;
-  BEGIN
-    -- create swap table for given partition
-    cort_comp_pkg.create_swap_table_sql(
-      in_table_rec      => in_target_table_rec,
-      in_swap_table_rec => in_swap_table_rec,
-      io_frwd_stmt_arr  => l_frwd_stmt_arr,
-      io_rlbk_stmt_arr  => l_rlbk_stmt_arr
-    );
-    -- forward changes:
-    FOR j IN 1..l_frwd_stmt_arr.COUNT LOOP
-      io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_frwd_stmt_arr(j);
-    END LOOP;
-    FOR j IN 1..l_rlbk_stmt_arr.COUNT LOOP
-      io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(j);
-    END LOOP;
-
-    -- Exchange partition from source table with swap table
-    cort_comp_pkg.exchange_partition(
-      in_source_table_rec => in_source_table_rec,
-      in_target_table_rec => in_swap_table_rec,
-      in_partition_rec    => in_source_part_rec,
-      io_frwd_stmt_arr    => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-    );
-    -- Exchange partition from target table with swap table
-    cort_comp_pkg.exchange_partition(
-      in_source_table_rec => in_target_table_rec,
-      in_target_table_rec => in_swap_table_rec,
-      in_partition_rec    => in_target_part_rec,
-      io_frwd_stmt_arr    => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-    );
-
-    -- drop swap table for given partition (switch forward and rollback statements). Change becomes absolutely symmetric
-    FOR j IN 1..l_rlbk_stmt_arr.COUNT LOOP
-      io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(j);
-    END LOOP;
-    FOR j IN 1..l_frwd_stmt_arr.COUNT LOOP
-      io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_frwd_stmt_arr(j);
-    END LOOP;
-
-  END exchange_partitions;
-
-  PROCEDURE exchange_partitions(
-    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_swap_table_rec   IN cort_exec_pkg.gt_table_rec,
-    in_source_part_arr  IN cort_exec_pkg.gt_partition_arr,
-    in_target_part_arr  IN cort_exec_pkg.gt_partition_arr,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  AS
-    l_frwd_stmt_arr          arrays.gt_clob_arr;
-    l_rlbk_stmt_arr          arrays.gt_clob_arr;
-  BEGIN
-    -- create swap table for given partition
-    cort_comp_pkg.create_swap_table_sql(
-      in_table_rec      => in_target_table_rec,
-      in_swap_table_rec => in_swap_table_rec,
-      io_frwd_stmt_arr  => l_frwd_stmt_arr,
-      io_rlbk_stmt_arr  => l_rlbk_stmt_arr
-    );
-    -- forward changes:
-    FOR j IN 1..l_frwd_stmt_arr.COUNT LOOP
-      io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_frwd_stmt_arr(j);
-    END LOOP;
-    FOR j IN 1..l_rlbk_stmt_arr.COUNT LOOP
-      io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(j);
-    END LOOP;
-
-    FOR i IN 1..in_source_part_arr.COUNT LOOP
-      -- Exchange partition from source table with swap table
-      cort_comp_pkg.exchange_partition(
-        in_source_table_rec => in_source_table_rec,
-        in_target_table_rec => in_swap_table_rec,
-        in_partition_rec    => in_source_part_arr(i),
-        io_frwd_stmt_arr    => io_frwd_stmt_arr,
-        io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-      );
-      -- Exchange partition from target table with swap table
-      cort_comp_pkg.exchange_partition(
-        in_source_table_rec => in_target_table_rec,
-        in_target_table_rec => in_swap_table_rec,
-        in_partition_rec    => in_target_part_arr(i),
-        io_frwd_stmt_arr    => io_frwd_stmt_arr,
-        io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-      );
-     END LOOP;
-
-    -- drop swap table for given partition (switch forward and rollback statements). Change becomes absolutely symmetric
-    FOR j IN 1..l_rlbk_stmt_arr.COUNT LOOP
-      io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(j);
-    END LOOP;
-    FOR j IN 1..l_frwd_stmt_arr.COUNT LOOP
-      io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_frwd_stmt_arr(j);
-    END LOOP;
-
-  END exchange_partitions;
-
-  PROCEDURE exchange_partition(
-    in_source_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec,
-    in_swap_table_rec   IN cort_exec_pkg.gt_table_rec,
-    in_swap_part_rec    IN cort_exec_pkg.gt_partition_rec,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
-  )
-  AS
-    l_frwd_stmt_arr          arrays.gt_clob_arr;
-    l_rlbk_stmt_arr          arrays.gt_clob_arr;
-  BEGIN
-    -- create swap table for given partition
-    cort_comp_pkg.create_swap_table_sql(
-      in_table_rec      => in_target_table_rec,
-      in_swap_table_rec => in_swap_table_rec,
-      io_frwd_stmt_arr  => l_frwd_stmt_arr,
-      io_rlbk_stmt_arr  => l_rlbk_stmt_arr
-    );
-    -- forward changes:
-    FOR j IN 1..l_frwd_stmt_arr.COUNT LOOP
-      io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_frwd_stmt_arr(j);
-    END LOOP;
-    FOR j IN 1..l_rlbk_stmt_arr.COUNT LOOP
-      io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(j);
-    END LOOP;
-
-    -- Exchange partition from source table with swap table
-    cort_comp_pkg.exchange_partition(
-      in_source_table_rec => in_swap_table_rec,
-      in_target_table_rec => in_source_table_rec,
-      in_partition_rec    => in_swap_part_rec,
-      io_frwd_stmt_arr    => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-    );
-    -- Exchange partition from target table with swap table
-    cort_comp_pkg.exchange_partition(
-      in_source_table_rec => in_swap_table_rec,
-      in_target_table_rec => in_target_table_rec,
-      in_partition_rec    => in_swap_part_rec,
-      io_frwd_stmt_arr    => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-    );
-
-    -- drop swap table for given partition (switch forward and rollback statements). Change becomes absolutely symmetric
-    FOR j IN 1..l_rlbk_stmt_arr.COUNT LOOP
-      io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(j);
-    END LOOP;
-    FOR j IN 1..l_frwd_stmt_arr.COUNT LOOP
-      io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_frwd_stmt_arr(j);
-    END LOOP;
-
-  END exchange_partition;
-
-  -- move data using exchange partition mechanism
-  PROCEDURE move_data(
-    in_source_table_rec IN gt_table_rec,
-    in_target_table_rec IN gt_table_rec,
-    in_recreate_mode    IN PLS_INTEGER,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_swap_table_name        arrays.gt_name;
-    l_swap_table_rec         gt_table_rec;
-    l_swap_part_rec          gt_partition_rec;
-    l_source_part_rec        gt_partition_rec;
-    l_target_part_rec        gt_partition_rec;
-    l_source_subpart_rec     gt_partition_rec;
-    l_target_subpart_rec     gt_partition_rec;
-    l_source_part_arr        gt_partition_arr;
-    l_target_part_arr        gt_partition_arr;
-  BEGIN
-    start_timer;
-    l_swap_table_name := get_object_temp_name(
-                           in_object_id   => in_source_table_rec.rename_rec.object_id,
-                           in_owner       => in_source_table_rec.owner,
-                           in_prefix      => cort_params_pkg.gc_swap_prefix
-                         );
-    l_swap_table_rec.table_name := l_swap_table_name;
-    l_swap_table_rec.owner := in_source_table_rec.owner;
-    l_swap_table_rec.rename_rec.object_name := l_swap_table_name;
-    l_swap_table_rec.rename_rec.object_owner := in_source_table_rec.owner;
-    l_swap_table_rec.rename_rec.current_name := l_swap_table_name;
-
-    IF in_source_table_rec.partitioned = 'NO' THEN
-      -- create swap table with 1 list or system partition
-      l_swap_table_rec.partitioned := 'YES';
-      l_swap_table_rec.partitioning_type := 'LIST';
-      l_swap_table_rec.subpartitioning_type := 'NONE';
-      l_swap_table_rec.part_key_column_arr(1) := cort_comp_pkg.get_column_for_partitioning(in_source_table_rec);
-
-      l_swap_part_rec.table_owner := l_swap_table_rec.owner;
-      l_swap_part_rec.table_name := l_swap_table_rec.table_name;
-      l_swap_part_rec.partition_name := 'P_DEF';
-      l_swap_part_rec.partition_level := 'PARTITION';
-      l_swap_part_rec.partition_type := 'LIST';
-      l_swap_part_rec.high_value := 'DEFAULT';
-      l_swap_part_rec.composite := 'NO';
-      l_swap_part_rec.position := 1;
-      l_swap_part_rec.physical_attr_rec  := in_source_table_rec.physical_attr_rec;
-      l_swap_part_rec.subpartition_from_indx := null;
-      l_swap_part_rec.subpartition_to_indx   := null;
-
-      l_swap_table_rec.partition_arr(1) := l_swap_part_rec;
-      l_swap_table_rec.partition_indx_arr('P_DEF') := 1;
-
-      exchange_partition(
-        in_source_table_rec => in_source_table_rec,
-        in_target_table_rec => in_target_table_rec,
-        in_swap_table_rec   => l_swap_table_rec,
-        in_swap_part_rec    => l_swap_part_rec,
-        io_frwd_stmt_arr    => io_frwd_stmt_arr,
-        io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-      );
-
-    ELSIF in_source_table_rec.partitioned = 'YES' AND in_source_table_rec.subpartitioning_type = 'NONE' THEN
-
-        IF cort_comp_pkg.is_subpartitioning_available(in_target_table_rec) AND in_recreate_mode = cort_comp_pkg.gc_result_exchange THEN
-
-          l_swap_table_rec.partitioned := 'YES';
-          l_swap_table_rec.partitioning_type := 'LIST';
-          l_swap_table_rec.subpartitioning_type := in_source_table_rec.subpartitioning_type;
-          l_swap_table_rec.part_key_column_arr(1) := cort_comp_pkg.get_column_for_partitioning(in_source_table_rec);
-          l_swap_table_rec.subpart_key_column_arr := in_source_table_rec.part_key_column_arr;
-
-          l_swap_part_rec.table_owner := l_swap_table_rec.owner;
-          l_swap_part_rec.table_name := l_swap_table_rec.table_name;
-          l_swap_part_rec.partition_name := 'P_DEF';
-          l_swap_part_rec.partition_level := 'PARTITION';
-          l_swap_part_rec.partition_type := 'LIST';
-          l_swap_part_rec.high_value := 'DEFAULT';
-          l_swap_part_rec.composite := 'YES';
-          l_swap_part_rec.position := 1;
-          l_swap_part_rec.physical_attr_rec  := in_source_table_rec.partition_arr(1).physical_attr_rec;
-          l_swap_part_rec.subpartition_from_indx := 1;
-          l_swap_part_rec.subpartition_to_indx := in_source_table_rec.partition_arr.COUNT;
-
-          l_swap_table_rec.partition_arr(1) := l_swap_part_rec;
-          l_swap_table_rec.partition_indx_arr('P_DEF') := 1;
-          l_swap_table_rec.subpartition_arr := in_source_table_rec.partition_arr;
-
-          exchange_partitions(
-            in_source_table_rec => in_source_table_rec,
-            in_target_table_rec => in_target_table_rec,
-            in_swap_table_rec   => l_swap_table_rec,
-            in_source_part_rec  => l_source_part_rec,
-            in_target_part_rec  => l_target_part_rec,
-            io_frwd_stmt_arr    => io_frwd_stmt_arr,
-            io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-          );
-        ELSE
-           l_swap_table_rec.partitioned := 'NO';
-           l_swap_table_rec.partitioning_type := NULL;
-           l_swap_table_rec.subpartitioning_type := NULL;
-           l_swap_table_rec.part_key_column_arr.DELETE;
-           l_swap_table_rec.partition_arr.DELETE;
-           l_target_part_arr.DELETE;
-           l_source_part_arr.DELETE;
-
-           -- repeat for every partition
-           FOR i IN 1..in_target_table_rec.partition_arr.COUNT LOOP
-
-             --for partition which exists in both tables
-             IF in_target_table_rec.partition_arr(i).matching_indx > 0 THEN
-
-               l_target_part_rec := in_target_table_rec.partition_arr(i);
-               l_source_part_rec := in_source_table_rec.partition_arr(l_target_part_rec.matching_indx);
-
-               debug('Move data from partition '||l_source_part_rec.partition_name||' into partition '||l_target_part_rec.partition_name);
-
-               IF NOT l_source_part_rec.is_partition_empty THEN
-                 l_target_part_arr(l_target_part_arr.COUNT+1) := l_target_part_rec;
-                 l_source_part_arr(l_source_part_arr.COUNT+1) := l_source_part_rec;
-               END IF;
-             END IF;
-           END LOOP;
-
-           exchange_partitions(
-             in_source_table_rec => in_source_table_rec,
-             in_target_table_rec => in_target_table_rec,
-             in_swap_table_rec   => l_swap_table_rec,
-             in_source_part_arr  => l_source_part_arr,
-             in_target_part_arr  => l_target_part_arr,
-             io_frwd_stmt_arr    => io_frwd_stmt_arr,
-             io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-           );
-        END IF;
-
-    ELSIF in_source_table_rec.partitioned = 'YES' AND in_source_table_rec.subpartitioning_type <> 'NONE' THEN
-
-      -- repeat for every partition
-      FOR i IN 1..in_target_table_rec.partition_arr.COUNT LOOP
-
-        --for partition which exists in both tables
-        IF in_target_table_rec.partition_arr(i).matching_indx > 0 THEN
-
-          l_target_part_rec := in_target_table_rec.partition_arr(i);
-          l_source_part_rec := in_source_table_rec.partition_arr(l_target_part_rec.matching_indx);
-
-
-          IF in_target_table_rec.partition_arr(i).subpart_comp_result = cort_comp_pkg.gc_result_nochange THEN
-
-            debug('Move data from partition '||l_source_part_rec.partition_name||' into partition '||l_target_part_rec.partition_name||' for all subpartitions');
-            l_swap_table_rec.partitioned := 'YES';
-            l_swap_table_rec.partitioning_type := 'LIST';
-            l_swap_table_rec.subpartitioning_type := 'NONE';
-            l_swap_table_rec.part_key_column_arr := in_target_table_rec.subpart_key_column_arr;
-            l_swap_table_rec.partition_arr.DELETE;
-            l_target_part_arr.DELETE;
-            l_source_part_arr.DELETE;
-
-            FOR j IN in_target_table_rec.partition_arr(i).subpartition_from_indx..in_target_table_rec.partition_arr(i).subpartition_to_indx LOOP
-              l_swap_part_rec.table_owner := l_swap_table_rec.owner;
-              l_swap_part_rec.table_name := l_swap_table_rec.table_name;
-              l_swap_part_rec.partition_name := in_target_table_rec.subpartition_arr(j).partition_name;
-              l_swap_part_rec.partition_level := 'PARTITION';
-              l_swap_part_rec.partition_type := in_target_table_rec.subpartition_arr(j).partition_type;
-              l_swap_part_rec.high_value := in_target_table_rec.subpartition_arr(j).high_value;
-              l_swap_part_rec.composite := 'NO';
-              l_swap_part_rec.position := in_target_table_rec.subpartition_arr(j).position;
-              l_swap_part_rec.physical_attr_rec  := in_target_table_rec.subpartition_arr(j).physical_attr_rec;
-              l_swap_table_rec.partition_arr(l_swap_table_rec.partition_arr.COUNT+1) := l_swap_part_rec;
-              l_swap_table_rec.partition_indx_arr(l_swap_part_rec.partition_name) := l_swap_table_rec.partition_arr.COUNT;
-            END LOOP;
-
-            exchange_partitions(
-              in_source_table_rec => in_source_table_rec,
-              in_target_table_rec => in_target_table_rec,
-              in_swap_table_rec   => l_swap_table_rec,
-              in_source_part_rec  => l_source_part_rec,
-              in_target_part_rec  => l_target_part_rec,
-              io_frwd_stmt_arr    => io_frwd_stmt_arr,
-              io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-            );
-          ELSE
-            -- if subpartitions don't match
-            -- exchange every subpartition individually
-
-            debug('Move data from partition '||l_source_part_rec.partition_name||' into partition '||l_target_part_rec.partition_name||' for all each subsubpartition individually');
-            l_swap_table_rec.partitioned := 'NO';
-            l_swap_table_rec.partitioning_type := NULL;
-            l_swap_table_rec.subpartitioning_type := NULL;
-            l_swap_table_rec.part_key_column_arr.DELETE;
-            l_swap_table_rec.partition_arr.DELETE;
-            l_target_part_arr.DELETE;
-            l_source_part_arr.DELETE;
-
-            FOR j IN l_target_part_rec.subpartition_from_indx..l_target_part_rec.subpartition_to_indx LOOP
-              l_target_subpart_rec := in_target_table_rec.subpartition_arr(j);
-
-              IF l_target_subpart_rec.matching_indx > 0 THEN
-                l_source_subpart_rec := in_source_table_rec.subpartition_arr(l_target_subpart_rec.matching_indx);
-                IF NOT l_source_subpart_rec.is_partition_empty THEN
-                  debug('Move data from subpartition '||l_source_subpart_rec.partition_name||' into subpartition '||l_target_subpart_rec.partition_name);
-                  l_target_part_arr(l_target_part_arr.COUNT+1) := l_target_subpart_rec;
-                  l_source_part_arr(l_source_part_arr.COUNT+1) := l_source_subpart_rec;
-                END IF;
-              END IF;
-            END LOOP;
-
-            exchange_partitions(
-              in_source_table_rec => in_source_table_rec,
-              in_target_table_rec => in_target_table_rec,
-              in_swap_table_rec   => l_swap_table_rec,
-              in_source_part_arr  => l_source_part_arr,
-              in_target_part_arr  => l_target_part_arr,
-              io_frwd_stmt_arr    => io_frwd_stmt_arr,
-              io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-            );
-
-          END IF;
-
-        END IF;
-
-      END LOOP;
-
-    END IF;
-    stop_timer;
-  END move_data;
-
-
-  -- copy all table's triggers
-  PROCEDURE copy_triggers(
-    io_source_table_rec IN OUT NOCOPY gt_table_rec,
-    io_target_table_rec IN OUT NOCOPY gt_table_rec
-  )
-  AS
-    l_frwd_alter_stmt_arr      arrays.gt_clob_arr;
-    l_rlbk_alter_stmt_arr      arrays.gt_clob_arr;
-  BEGIN
-    cort_comp_pkg.copy_triggers(
-      in_source_table_rec      => io_source_table_rec,
-      io_target_table_rec      => io_target_table_rec,
-      io_frwd_alter_stmt_arr   => l_frwd_alter_stmt_arr,
-      io_rlbk_alter_stmt_arr   => l_rlbk_alter_stmt_arr
-    );
-
-    apply_changes(
-      in_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
-      in_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr,
-      in_test                => g_params.test.get_bool_value
-    );
-
-  END copy_triggers;
-
-  -- copy all table's policies
-  PROCEDURE copy_policies(
-    in_source_table_rec IN gt_table_rec,
-    in_target_table_rec IN gt_table_rec
-  )
-  AS
-    l_frwd_alter_stmt_arr      arrays.gt_clob_arr;
-    l_rlbk_alter_stmt_arr      arrays.gt_clob_arr;
-  BEGIN
-    cort_comp_pkg.copy_policies(
-      in_source_table_rec      => in_source_table_rec,
-      in_target_table_rec      => in_target_table_rec,
-      io_frwd_alter_stmt_arr   => l_frwd_alter_stmt_arr,
-      io_rlbk_alter_stmt_arr   => l_rlbk_alter_stmt_arr
-    );
-
-    apply_changes(
-      in_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
-      in_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr,
-      in_test                => g_params.test.get_bool_value
-    );
-
-  END copy_policies;
+  END copy_type_privileges;
 
   PROCEDURE copy_stats(
     in_owner        IN VARCHAR2,
@@ -4986,325 +4395,177 @@ end;';
     COMMIT;
   END copy_stats;
 
-  -- rename tables, copy data, move references, copy comments, copy grants, reassign synonyms
-  PROCEDURE recreate_table(
-    io_source_table_rec IN OUT NOCOPY gt_table_rec,
-    io_target_table_rec IN OUT NOCOPY gt_table_rec,
-    io_frwd_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr    IN OUT NOCOPY arrays.gt_clob_arr,
-    in_recreate_mode    IN PLS_INTEGER,
-    in_data_filter      IN CLOB,
-    in_job_rec          IN cort_jobs%ROWTYPE,
-    out_last_ddl_index  OUT PLS_INTEGER
+  -- Disable/Enable all FK before/after data load
+  PROCEDURE change_status_for_all_keys(
+    in_table_rec  IN gt_table_rec,
+    in_action     IN VARCHAR2,  -- DISABLE/ENABLE
+    io_change_arr IN OUT NOCOPY gt_change_arr
   )
   AS
-    l_frwd_stmt_arr    arrays.gt_clob_arr;
-    l_rlbk_stmt_arr    arrays.gt_clob_arr;
-    l_indx             PLS_INTEGER;
+    l_revert_action   VARCHAR2(15);
+    l_sql             VARCHAR2(1000);
   BEGIN
-    start_timer;
+    IF in_action NOT IN ('ENABLE','DISABLE') THEN
+      RETURN;
+    END IF;
 
-    BEGIN
-/*
-      IF g_params.data.get_value = 'PRELIMINARY_COPY' AND
-         NOT io_source_table_rec.is_table_empty AND
-         in_recreate_mode in (cort_comp_pkg.gc_result_recreate) THEN
-        create_sync_objects(
-          in_source_table_rec => io_source_table_rec,
-          in_target_table_rec => io_target_table_rec,
-          in_recreate_mode    => in_recreate_mode,
-          io_frwd_stmt_arr    => l_frwd_stmt_arr,
-          io_rlbk_stmt_arr    => l_rlbk_stmt_arr
-        );
+    IF in_action = 'ENABLE' THEN
+      l_revert_action := 'DISABLE';
+    ELSE
+      l_revert_action := 'ENABLE';
+    END IF;
 
-        copy_data(
-          in_source_table_rec => io_source_table_rec,
-          in_target_table_rec => io_target_table_rec,
-          in_recreate_mode    => in_recreate_mode,
-          in_filter_sql       => in_data_filter,
-          io_frwd_stmt_arr    => l_frwd_stmt_arr,
-          io_rlbk_stmt_arr    => l_rlbk_stmt_arr
-        );
-      END IF;
-*/
-
-      -- following changes are added to the queue
-      IF g_params.data.get_value = 'COPY' AND
-         NOT io_source_table_rec.is_table_empty AND
-         in_recreate_mode in (cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_part_exchange)
+    FOR i IN 1..in_table_rec.constraint_arr.COUNT LOOP
+      IF in_table_rec.constraint_arr(i).constraint_type in ('P','U','R') AND
+         in_table_rec.constraint_arr(i).status = l_revert_action AND
+         NOT (in_table_rec.constraint_arr(i).constraint_type = 'P' AND in_table_rec.iot_name IS NOT NULL)
       THEN
-        debug ('in_sql_rec.data_filter = '||in_data_filter);
-
-        copy_data(
-          in_source_table_rec => io_source_table_rec,
-          in_target_table_rec => io_target_table_rec,
-          in_recreate_mode    => in_recreate_mode,
-          in_filter_sql       => in_data_filter,
-          io_frwd_stmt_arr    => l_frwd_stmt_arr,
-          io_rlbk_stmt_arr    => l_rlbk_stmt_arr
+        add_change(
+          io_change_arr, 
+          change_rec(
+            in_group_type => in_action||' KEY',
+            in_change_sql => 'ALTER TABLE "'||in_table_rec.owner||'"."'||in_table_rec.table_name||'" '||in_action||' CONSTRAINT "'||in_table_rec.constraint_arr(i).constraint_name||'"',
+            in_revert_sql => 'ALTER TABLE "'||in_table_rec.owner||'"."'||in_table_rec.table_name||'" '||l_revert_action||' CONSTRAINT "'||in_table_rec.constraint_arr(i).constraint_name||'"',
+            in_threadable => 'Y'
+          )
         );
       END IF;
-
-      IF NOT io_source_table_rec.is_table_empty AND
-         in_recreate_mode in (cort_comp_pkg.gc_result_exchange, cort_comp_pkg.gc_result_part_exchange)
-      THEN
-        -- add create swap table exchange partition and drop swap table statements into the queue
-        move_data(
-          in_source_table_rec => io_source_table_rec,
-          in_target_table_rec => io_target_table_rec,
-          in_recreate_mode    => in_recreate_mode,
-          io_frwd_stmt_arr    => l_frwd_stmt_arr,
-          io_rlbk_stmt_arr    => l_rlbk_stmt_arr
-        );
-      END IF;
-
-      apply_changes(
-        in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-        in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-        in_test                => g_params.test.get_bool_value
-      );
-
-    EXCEPTION
-      WHEN OTHERS THEN
-        cort_log_pkg.error('Error. Rolling back...');
-        exec_drop_table(
-          in_table_name => io_target_table_rec.owner,
-          in_owner      => io_target_table_rec.rename_rec.current_name,
-          in_echo       => FALSE
-        );
-        RAISE;
-    END;
-
-    FOR i IN 1..l_frwd_stmt_arr.COUNT LOOP
-      io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_frwd_stmt_arr(i);
-      io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(i);
     END LOOP;
+  END change_status_for_all_keys;
 
-    l_frwd_stmt_arr.DELETE;
-    l_rlbk_stmt_arr.DELETE;
+  PROCEDURE change_status_for_policies(
+    in_table_rec  IN gt_table_rec,
+    in_action     IN VARCHAR2,  -- DISABLE/ENABLE
+    io_change_arr IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_change_sql VARCHAR2(1000);
+    l_revert_sql VARCHAR2(1000);
+    l_enable     VARCHAR2(10);
+  BEGIN
+    CASE in_action
+      WHEN 'ENABLE' THEN l_enable := 'TRUE';
+      WHEN 'DISABLE' THEN l_enable := 'FALSE';
+      ELSE RETURN;
+    END CASE;
 
-    BEGIN
-      IF g_params.keep_objects.value_exists('COMMENTS') THEN
-        copy_comments(
-          in_source_table_rec => io_source_table_rec,
-          in_target_table_rec => io_target_table_rec,
-          io_frwd_stmt_arr    => l_frwd_stmt_arr,
-          io_rlbk_stmt_arr    => l_rlbk_stmt_arr
-        );
-      END IF;
-      IF g_params.keep_objects.value_exists('POLICIES') THEN
-        cort_comp_pkg.copy_policies(
-          in_source_table_rec      => io_source_table_rec,
-          in_target_table_rec      => io_target_table_rec,
-          io_frwd_alter_stmt_arr   => l_frwd_stmt_arr,
-          io_rlbk_alter_stmt_arr   => l_rlbk_stmt_arr
-        );
-      END IF;
-      IF g_params.keep_objects.value_exists('REFERENCES') THEN
-        cort_comp_pkg.copy_references(
-          in_source_table_rec      => io_source_table_rec,
-          io_target_table_rec      => io_target_table_rec,
-          io_frwd_alter_stmt_arr   => l_frwd_stmt_arr,
-          io_rlbk_alter_stmt_arr   => l_rlbk_stmt_arr
-        );
+    FOR i IN 1..in_table_rec.policy_arr.COUNT LOOP
+      l_change_sql := '
+begin
+  dbms_rls.enable_policy(
+    object_schema => ''"'||in_table_rec.policy_arr(i).object_owner||'"'',
+    object_name   => ''"'||in_table_rec.policy_arr(i).object_name||'"'',
+    policy_name   => ''"'||in_table_rec.policy_arr(i).policy_name||'"'',
+    enable        => '||l_enable||'
+  );
+end;';
+      l_revert_sql := '
+begin
+  dbms_rls.enable_policy(
+    object_schema => ''"'||in_table_rec.policy_arr(i).object_owner||'"'',
+    object_name   => ''"'||in_table_rec.policy_arr(i).object_name||'"'',
+    policy_name   => ''"'||in_table_rec.policy_arr(i).policy_name||'"'',
+    enable        => NOT '||l_enable||'
+  );
+end;';
+      add_change(
+        io_change_arr, 
+        change_rec(
+          in_group_type => in_action||' POLICIES',
+          in_change_sql => l_change_sql,
+          in_revert_sql => l_revert_sql,
+          in_threadable => 'Y'
+        )
+      );
+    END LOOP;
+  END change_status_for_policies;
+
+
+  -- Disable/Enable all indexes
+  PROCEDURE change_status_for_all_indexes(
+    in_table_rec  IN gt_table_rec,
+    in_action     IN VARCHAR2,  -- DISABLE/ENABLE
+    io_change_arr IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_action          VARCHAR2(15);
+    l_revert_action   VARCHAR2(15);
+    l_sql             VARCHAR2(1000);
+    l_parallel        VARCHAR2(100);
+  BEGIN
+    IF in_action NOT IN ('ENABLE','DISABLE') THEN
+      RETURN;
+    END IF;
+
+    FOR i IN 1..in_table_rec.index_arr.COUNT LOOP
+      IF in_table_rec.index_arr(i).index_type like 'FUNCTION-BASED%' THEN
+        IF in_action = 'ENABLE' THEN
+          l_action := 'ENABLE';
+          l_revert_action := 'DISABLE';
+        ELSE
+          l_action := 'DISABLE';
+          l_revert_action := 'ENABLE';
+        END IF;
       ELSE
-        cort_comp_pkg.drop_references(
-          in_source_table_rec      => io_source_table_rec,
-          io_frwd_alter_stmt_arr   => l_frwd_stmt_arr,
-          io_rlbk_alter_stmt_arr   => l_rlbk_stmt_arr
-        );
-      END IF;
-      cort_comp_pkg.drop_triggers(
-        in_table_rec             => io_source_table_rec,
-        io_frwd_alter_stmt_arr   => l_frwd_stmt_arr,
-        io_rlbk_alter_stmt_arr   => l_rlbk_stmt_arr
-      );
-      IF g_params.keep_objects.value_exists('TRIGGERS') THEN
-        cort_comp_pkg.copy_triggers(
-          in_source_table_rec      => io_source_table_rec,
-          io_target_table_rec      => io_target_table_rec,
-          io_frwd_alter_stmt_arr   => l_frwd_stmt_arr,
-          io_rlbk_alter_stmt_arr   => l_rlbk_stmt_arr
-        );
+        IF in_action = 'ENABLE' THEN
+          l_action := 'REBUILD';
+          l_revert_action := 'UNUSABLE';
+        ELSE
+          l_action := 'UNUSABLE';
+          l_revert_action := 'REBUILD';
+        END IF;
+      END IF;   
+
+      IF g_run_params.parallel.get_num_value > 1 THEN
+        l_parallel := 'PARALLEL ('||g_run_params.parallel.get_value||')';
       END IF;
 
-      -- move depending objects ignoring errors
-      apply_changes_ignore_errors(
-        io_stmt_arr => l_frwd_stmt_arr,
-        in_test     => g_params.test.get_bool_value
-      );
-    EXCEPTION
-      WHEN OTHERS THEN
-        cort_log_pkg.error('Error. Rolling back...');
-        exec_drop_table(
-          in_table_name => io_source_table_rec.owner,
-          in_owner      => io_source_table_rec.rename_rec.temp_name,
-          in_echo       => FALSE
+      CASE
+      WHEN in_table_rec.index_arr(i).constraint_name IS NOT NULL THEN
+        CONTINUE;
+      WHEN in_table_rec.index_arr(i).partitioned = 'NO' THEN
+        $IF cort_options_pkg.gc_threading $THEN
+        IF cort_thread_exec_pkg.is_threadable THEN
+          l_parallel := 'PARALLEL ('||ROUND(cort_thread_exec_pkg.get_thread_number/in_table_rec.index_arr.COUNT)||')';
+        END IF; 
+        $END    
+        add_change(
+          io_change_arr, 
+          change_rec(
+            in_group_type => in_action||' INDEXES',
+            in_change_sql => 'ALTER INDEX "'||in_table_rec.index_arr(i).owner||'"."'||in_table_rec.index_arr(i).index_name||'" '||l_action||' '||l_parallel,
+            in_revert_sql => 'ALTER INDEX "'||in_table_rec.index_arr(i).owner||'"."'||in_table_rec.index_arr(i).index_name||'" '||l_revert_action||' '||l_parallel,
+            in_threadable => 'Y'
+          )
         );
-        RAISE;
-    END;
-
-    l_indx := l_frwd_stmt_arr.FIRST;
-    WHILE l_indx IS NOT NULL LOOP
-      io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_frwd_stmt_arr(l_indx);
-      io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(l_indx);
-      l_indx := l_frwd_stmt_arr.NEXT(l_indx);
+      WHEN in_table_rec.index_arr(i).partitioned = 'YES' AND in_table_rec.index_arr(i).subpartitioning_type = 'NONE' THEN
+        FOR j IN 1..in_table_rec.index_arr(i).partition_arr.COUNT LOOP
+          add_change(
+            io_change_arr, 
+            change_rec(
+              in_group_type => in_action||' PART INDEXES',
+              in_change_sql => 'ALTER INDEX "'||in_table_rec.index_arr(i).owner||'"."'||in_table_rec.index_arr(i).index_name||'" '||l_action||' PARTITION "'||in_table_rec.index_arr(i).partition_arr(j).partition_name||'" '||l_parallel,
+              in_revert_sql => 'ALTER INDEX "'||in_table_rec.index_arr(i).owner||'"."'||in_table_rec.index_arr(i).index_name||'" '||l_revert_action||' PARTITION "'||in_table_rec.index_arr(i).partition_arr(j).partition_name||'" '||l_parallel,
+              in_threadable => 'Y'
+            )
+          );
+        END LOOP;
+      WHEN in_table_rec.index_arr(i).partitioned = 'YES' AND in_table_rec.index_arr(i).subpartitioning_type <> 'NONE' THEN
+        FOR j IN 1..in_table_rec.index_arr(i).subpartition_arr.COUNT LOOP
+          add_change(
+            io_change_arr, 
+            change_rec(
+              in_group_type => in_action||' PART INDEXES',
+              in_change_sql => 'ALTER INDEX "'||in_table_rec.index_arr(i).owner||'"."'||in_table_rec.index_arr(i).index_name||'" '||l_action||' SUBPARTITION "'||in_table_rec.index_arr(i).subpartition_arr(j).partition_name||'" '||l_parallel,
+              in_revert_sql => 'ALTER INDEX "'||in_table_rec.index_arr(i).owner||'"."'||in_table_rec.index_arr(i).index_name||'" '||l_revert_action||' SUBPARTITION "'||in_table_rec.index_arr(i).subpartition_arr(j).partition_name||'" '||l_parallel,
+              in_threadable => 'Y'
+            )
+          );
+        END LOOP;
+      END CASE;
     END LOOP;
-
-    l_frwd_stmt_arr.DELETE;
-    l_rlbk_stmt_arr.DELETE;
-
-    -- if in build
-    IF SYS_CONTEXT('USERENV','CLIENT_INFO') IS NOT NULL THEN
-      cort_comp_pkg.drop_triggers(
-        in_table_rec             => io_source_table_rec,
-        io_frwd_alter_stmt_arr   => l_frwd_stmt_arr,
-        io_rlbk_alter_stmt_arr   => l_rlbk_stmt_arr
-      );
-      -- register state for all existing triggers on current table
-      FOR i IN 1..io_source_table_rec.trigger_arr.COUNT LOOP
-        cort_aux_pkg.register_change(
-          in_object_owner   => io_source_table_rec.trigger_arr(i).owner,
-          in_object_name    => io_source_table_rec.trigger_arr(i).trigger_name,
-          in_object_type    => 'TRIGGER',
-          in_job_rec        => in_job_rec,
-          in_sql            => NULL,
-          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                                 in_object_owner   => io_source_table_rec.trigger_arr(i).owner,
-                                 in_object_name    => io_source_table_rec.trigger_arr(i).trigger_name,
-                                 in_object_type    => 'TRIGGER'
-                               ),
-          in_change_type    => cort_comp_pkg.gc_result_recreate,
-          in_revert_name    => NULL,
-          in_last_ddl_index => NULL,
-          in_frwd_stmt_arr  => l_frwd_stmt_arr,
-          in_rlbk_stmt_arr  => l_rlbk_stmt_arr
-        );
-      END LOOP;
-    END IF;
-
-    IF g_params.data.get_value = 'PRELIMINARY_COPY' AND
-       NOT io_source_table_rec.is_table_empty AND
-       in_recreate_mode in (cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_part_exchange)
-    THEN
-      l_frwd_stmt_arr.DELETE;
-      l_rlbk_stmt_arr.DELETE;
-      FOR i IN 1..l_frwd_stmt_arr.COUNT LOOP
-        io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_frwd_stmt_arr(i);
-        io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(i);
-      END LOOP;
-
-
-      -- moving renaming sql into second part of the job.
-      out_last_ddl_index := io_frwd_stmt_arr.COUNT;
-    END IF;
-
-
-    -- Final 2 steps - renaming
-
-    l_frwd_stmt_arr.DELETE;
-    l_rlbk_stmt_arr.DELETE;
-
-    comment_table(
-      in_table_rec     => io_source_table_rec,
-      io_frwd_stmt_arr => l_frwd_stmt_arr,
-      io_rlbk_stmt_arr => l_rlbk_stmt_arr
-    );
-
-    -- rename existing (old) table and all depending objects and log groups to cort_name
-    rename_table_cascade(
-      io_table_rec     => io_source_table_rec,
-      in_rename_mode   => 'TO_CORT',
-      io_frwd_stmt_arr => l_frwd_stmt_arr,
-      io_rlbk_stmt_arr => l_rlbk_stmt_arr
-    );
-
-    -- rename new table and all depending objects to actual names
-    rename_table_cascade(
-      io_table_rec     => io_target_table_rec,
-      in_rename_mode   => 'TO_ORIGINAL',
-      io_frwd_stmt_arr => l_frwd_stmt_arr,
-      io_rlbk_stmt_arr => l_rlbk_stmt_arr
-    );
-
-    FOR i IN 1..l_frwd_stmt_arr.COUNT LOOP
-      io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_frwd_stmt_arr(i);
-      io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(i);
-    END LOOP;
-
-
-    -- for CREATE AS SELECT FROM itself
-    -- check if selecting from recreating table
-    -- if yes source session will hold shared lock on this table and will not allow to rename the table.
-    -- so last 2 steps need to be done after release trigger's lock.
-    IF (in_recreate_mode = cort_comp_pkg.gc_result_cas_from_itself) AND NOT g_params.test.get_bool_value THEN
-      debug('CREATE AS SELECT FROM itself');
-
-      IF g_params.data.get_value != 'PRELIMINARY_COPY' THEN
-        -- Just output DDL commands without execution
-        apply_changes(
-          in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-          in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-          in_test                => TRUE
-        );
-      END IF;
-
-      -- Terminate the waiting loop and set status to pending
-      IF NOT g_params.test.get_bool_value THEN
-        cort_job_pkg.suspend_job(
-          in_rec => in_job_rec
-        );
-        g_job_rec.sid := null;
-      END IF;
-      -- Continue execution in the backgrouond
-    END IF;
-
-    enable_policies(
-      in_policy_arr => io_source_table_rec.policy_arr
-    );
-
-    -- execute all changes in the queue
-    apply_changes(
-      in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-      in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-      in_test                => g_params.test.get_bool_value
-    );
-
-    -- update current_name in rename_rec
-
-    -- deffered data copy
-
-    IF g_params.data.get_value = 'DEFERRED_COPY' AND
-       NOT io_source_table_rec.is_table_empty AND
-       in_recreate_mode in (cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_part_exchange)
-    THEN
-      l_frwd_stmt_arr.DELETE;
-      l_rlbk_stmt_arr.DELETE;
-      out_last_ddl_index := io_frwd_stmt_arr.COUNT;
-      copy_data(
-        in_source_table_rec => io_source_table_rec,
-        in_target_table_rec => io_target_table_rec,
-        in_recreate_mode    => in_recreate_mode,
-        in_filter_sql       => in_data_filter,
-        io_frwd_stmt_arr    => l_frwd_stmt_arr,
-        io_rlbk_stmt_arr    => l_rlbk_stmt_arr
-      );
-      FOR i IN 1..l_frwd_stmt_arr.COUNT LOOP
-        io_frwd_stmt_arr(io_frwd_stmt_arr.COUNT+1) := l_frwd_stmt_arr(i);
-        io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT+1) := l_rlbk_stmt_arr(i);
-      END LOOP;
-    END IF;
-
-    -- for CREATE AS SELECT FROM itself
-    IF (in_recreate_mode = cort_comp_pkg.gc_result_cas_from_itself) AND NOT g_params.test.get_bool_value THEN
-      -- resume pending job to complete it in main procedure
-      cort_job_pkg.success_job(
-        in_rec => in_job_rec
-      );
-    END IF;
-
-    stop_timer;
-  END recreate_table;
+    
+  END change_status_for_all_indexes;
 
   -- Parses SQL syntax. Do not call for DDL!!! It executes DDL!
   FUNCTION is_sql_valid(in_sql IN CLOB)
@@ -5315,6 +4576,7 @@ end;';
     l_result  VARCHAR2(4000);
   BEGIN
     cort_aux_pkg.clob_to_varchar2a(in_sql, l_sql_arr);
+    debug('Check if sql valid', in_sql);
     l_cursor := dbms_sql.open_cursor;
     BEGIN
       dbms_sql.parse(
@@ -5338,66 +4600,1760 @@ end;';
     END IF;
     RETURN l_result;
   END is_sql_valid;
-
-  -- Check for all columns cort values
-  PROCEDURE check_cort_values(
-    io_sql_rec       IN OUT NOCOPY cort_parse_pkg.gt_sql_rec,
-    io_new_table_rec IN OUT NOCOPY gt_table_rec,
-    in_old_table_rec IN gt_table_rec
+  
+  PROCEDURE check_data_source(
+    in_data_source      IN VARCHAR2, 
+    in_data_source_type IN VARCHAR2
   )
   AS
-    l_data_source  CLOB;
-    l_sql          CLOB;
-    l_sql_errm     VARCHAR2(4000);
+    l_sql     CLOB;
+    l_sqlerrm VARCHAR2(1000);
   BEGIN
-    IF io_sql_rec.data_source IS NOT NULL THEN
-      l_data_source := '('||io_sql_rec.data_source||') a';
-      l_sql := 'SELECT * FROM '||l_data_source;
-      l_sql_errm := is_sql_valid(l_sql);
-      IF l_sql_errm IS NOT NULL THEN
-        debug('Invalid data source sql - '||l_sql_errm, l_sql);
-        cort_log_pkg.echo('Warning! Invalid data source sql - '||l_sql_errm);
-        io_sql_rec.data_source := null;
-        l_data_source := '"'||in_old_table_rec.owner||'"."'||in_old_table_rec.rename_rec.current_name||'" '||g_params.alias.get_value;
-      END IF;
-    ELSIF io_sql_rec.data_filter IS NOT NULL THEN
-      l_data_source := '"'||in_old_table_rec.owner||'"."'||in_old_table_rec.rename_rec.current_name||'" '||g_params.alias.get_value||CHR(10)||io_sql_rec.data_filter;
-      l_sql := 'SELECT * FROM '||l_data_source;
-      l_sql_errm := is_sql_valid(l_sql);
-      IF l_sql_errm IS NOT NULL THEN
-        debug('Invalid data filter sql - '||l_sql_errm, l_sql);
-        cort_log_pkg.echo('Warning! Invalid data filter sql - '||l_sql_errm);
-        io_sql_rec.data_filter := null;
-        l_data_source := '"'||in_old_table_rec.owner||'"."'||in_old_table_rec.rename_rec.current_name||'" '||g_params.alias.get_value;
+    l_sql := 'SELECT 1 FROM '||in_data_source;
+    l_sqlerrm := is_sql_valid(l_sql);
+    IF l_sqlerrm IS NOT NULL THEN
+      cort_log_pkg.error('Invalid '||in_data_source_type||' sql: '||l_sqlerrm, l_sql);
+    END IF;  
+  END check_data_source;
+  
+  
+  FUNCTION get_sql_columns(in_sql IN CLOB) 
+  RETURN gt_column_arr
+  AS
+    l_sql_arr     dbms_sql.varchar2a;
+    l_cursor      NUMBER;
+    l_col_cnt     INTEGER;
+    l_col_arr     dbms_sql.desc_tab3;
+    l_column_rec  gt_column_rec;
+    l_column_arr  gt_column_arr;
+  BEGIN
+    cort_aux_pkg.clob_to_varchar2a(in_sql, l_sql_arr);
+    l_cursor := dbms_sql.open_cursor;
+    BEGIN
+      dbms_sql.parse(
+        c             => l_cursor,
+        statement     => l_sql_arr,
+        lb            => 1,
+        ub            => l_sql_arr.COUNT,
+        lfflg         => FALSE,
+        language_flag => dbms_sql.native
+      );
+      dbms_sql.describe_columns3(l_cursor, l_col_cnt, l_col_arr);
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF dbms_sql.is_open(l_cursor) THEN
+          dbms_sql.close_cursor(l_cursor);
+        END IF;
+    END;
+    IF dbms_sql.is_open(l_cursor) THEN
+      dbms_sql.close_cursor(l_cursor);
+    END IF;
+    
+    FOR i IN 1..l_col_arr.COUNT LOOP      
+      IF l_col_arr(i).col_name IS NOT NULL THEN
+        l_column_rec.column_name := SUBSTR(l_col_arr(i).col_name, 1, arrays.gc_name_max_length);
+        l_column_rec.column_indx := i;
+        l_column_rec.data_type_mod := case when l_col_arr(i).col_type in (dbms_sql.ref_type, dbms_types.typecode_ref) then 'REF' end;
+        l_column_rec.data_type_owner := l_col_arr(i).col_schema_name;
+        l_column_rec.data_type := 
+          case 
+            when l_col_arr(i).col_type in (dbms_types.typecode_char, dbms_types.typecode_varchar, dbms_types.typecode_varchar2) then 'VARCHAR2'
+            when l_col_arr(i).col_type in (dbms_types.typecode_nchar, dbms_types.typecode_nvarchar2) then 'NVARCHAR2' 
+            when l_col_arr(i).col_type = dbms_types.typecode_clob then 'CLOB'
+            when l_col_arr(i).col_type = dbms_types.typecode_nclob then 'NCLOB'
+            when l_col_arr(i).col_type = dbms_types.typecode_number then 'NUMBER'
+            when l_col_arr(i).col_type = dbms_types.typecode_date then 'DATE'
+            when l_col_arr(i).col_type in (dbms_sql.timestamp_type, dbms_types.typecode_timestamp) then 'TIMESTAMP'
+            when l_col_arr(i).col_type in (dbms_sql.timestamp_with_tz_type, dbms_types.typecode_timestamp_tz) then 'TIMESTAMP WITH TIME ZONE'
+            when l_col_arr(i).col_type in (dbms_sql.timestamp_with_local_tz_type, dbms_types.typecode_timestamp_ltz) then 'TIMESTAMP WITH LOCAL TIME ZONE'
+            when l_col_arr(i).col_type in (dbms_sql.raw_type, dbms_types.typecode_raw, 23) then 'RAW'  
+            when l_col_arr(i).col_type in (dbms_sql.interval_year_to_month_type, dbms_types.typecode_interval_ym) then 'INTERVAL YEAR TO MONTH'    
+            when l_col_arr(i).col_type in (dbms_sql.interval_day_to_second_type, dbms_types.typecode_interval_ds) then 'INTERVAL DAY TO SECOND'
+            when l_col_arr(i).col_type = dbms_types.typecode_bfloat  then 'BFLOAT'
+            when l_col_arr(i).col_type = dbms_types.typecode_bdouble  then 'BDOUBLE'
+            when l_col_arr(i).col_type in (dbms_sql.rowid_type, 69) then 'ROWID'
+            when l_col_arr(i).col_type in (dbms_sql.urowid_type, dbms_types.typecode_urowid) then 'UROWID'
+            else l_col_arr(i).col_type_name
+          end;
+        l_column_rec.data_length := l_col_arr(i).col_max_len;
+        l_column_rec.data_precision := l_col_arr(i).col_precision;
+        l_column_rec.data_scale := l_col_arr(i).col_scale;
+        
+        l_column_arr(i) := l_column_rec;
+      END IF;  
+    END LOOP;
+    
+    RETURN l_column_arr;
+  END get_sql_columns;  
+
+  FUNCTION get_canonical_name(in_name IN VARCHAR2)
+  RETURN VARCHAR2
+  AS
+    l_result VARCHAR2(32767);
+  BEGIN
+    BEGIN
+      dbms_utility.canonicalize(in_name, l_result, 32767);
+    EXCEPTION
+      WHEN OTHERS THEN
+        l_result := in_name;
+    END;     
+    RETURN l_result;
+  END get_canonical_name;  
+  
+  PROCEDURE get_copy_data_sql(
+    in_data_source_rec      IN gt_data_source_rec,
+    in_source_table_rec     IN gt_table_rec,
+    in_target_table_rec     IN gt_table_rec,
+    in_source_partition_rec IN gt_partition_rec,
+    in_target_partition_rec IN gt_partition_rec,
+    in_column_list          IN CLOB,
+    in_values_list          IN CLOB,
+    io_change_arr           IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_source_partition_clause  VARCHAR2(100);
+    l_target_partition_clause  VARCHAR2(100);
+    l_append                   VARCHAR2(100);
+    l_parallel                 VARCHAR2(100);
+  BEGIN
+    -- partitioned table
+    IF in_source_partition_rec.partition_name IS NOT NULL THEN
+      l_source_partition_clause := in_source_partition_rec.partition_level||' ("'||in_source_partition_rec.partition_name||'")';
+      IF in_target_partition_rec.partition_name IS NOT NULL THEN
+        l_target_partition_clause := in_target_partition_rec.partition_level||' ("'||in_target_partition_rec.partition_name||'")';
+        l_append := 'APPEND';
+      ELSE
+        -- in case of threading we can use append only when data are copied from partition to partition to prevent blocking
+        IF g_run_params.threading.get_value = 'NONE' THEN
+          l_append := 'APPEND';
+        END IF;
       END IF;
     ELSE
-      l_data_source := '"'||in_old_table_rec.owner||'"."'||in_old_table_rec.rename_rec.current_name||'" '||g_params.alias.get_value;
+      -- non partitioned table
+      l_source_partition_clause := NULL;
+      l_target_partition_clause := NULL;
+      l_append := 'APPEND';
     END IF;
 
-    FOR i IN 1..io_new_table_rec.column_arr.COUNT LOOP
-      IF io_new_table_rec.column_arr(i).cort_value IS NOT NULL THEN
-        l_sql := 'SELECT '||io_new_table_rec.column_arr(i).cort_value||' FROM '||l_data_source;
-        l_sql_errm := is_sql_valid(l_sql);
-        IF l_sql_errm IS NOT NULL THEN
-          debug('Invalid cort value on column - '||io_new_table_rec.column_arr(i).column_name||' - '||l_sql_errm, l_sql);
-          cort_log_pkg.echo('Warning! invalid cort value on column '||io_new_table_rec.column_arr(i).column_name||' - '||l_sql_errm);
-          io_new_table_rec.column_arr(i).cort_value := NULL;
+    IF g_run_params.parallel.get_num_value > 1 THEN
+      l_parallel := 'PARALLEL ('||g_run_params.parallel.get_value||')';
+    END IF;
+    
+    $IF cort_options_pkg.gc_threading $THEN
+    IF in_source_partition_rec.partition_name IS NOT NULL THEN
+      l_parallel := cort_thread_exec_pkg.get_dml_parallel;
+    END IF; 
+    $END    
+    
+    IF in_data_source_rec.change_result IN (cort_comp_pkg.gc_result_create_as_select, cort_comp_pkg.gc_result_recreate_as_select, cort_comp_pkg.gc_result_cas_from_itself) THEN
+      add_change(
+        io_change_arr,
+        change_rec(
+          in_group_type  => 'COPY DATA',
+          in_change_sql  => trim(chr(10) from 
+                            'INSERT /*+ '||l_append||' '||l_parallel||' */'||chr(10)||
+                            '  INTO "'||in_target_table_rec.owner||'"."'||in_target_table_rec.rename_rec.current_name||'" '||l_target_partition_clause||chr(10)||
+                            in_data_source_rec.data_source_sql)
+        )
+      );
+    
+    ELSIF in_data_source_rec.data_source_sql IS NOT NULL THEN
+      add_change(
+        io_change_arr,
+        change_rec(
+          in_group_type  => 'COPY DATA',
+          in_change_sql  => trim(chr(10) from 
+                            'INSERT /*+ '||l_append||' '||l_parallel||' */'||chr(10)||
+                            '  INTO "'||in_target_table_rec.owner||'"."'||in_target_table_rec.rename_rec.current_name||'" '||l_target_partition_clause||chr(10)||
+                            '      ('||in_column_list||')'||chr(10)||
+                            'SELECT /*+ '||l_parallel||' */'||chr(10)||
+                                     in_values_list||chr(10)||
+                            '  FROM '||in_data_source_rec.data_source_sql||chr(10)||
+                            ' WHERE '||in_target_partition_rec.filter_clause),
+          in_display_sql => trim(chr(10) from 
+                            'INSERT /*+ '||l_append||' '||l_parallel||' */'||chr(10)||
+                            '  INTO "'||in_target_table_rec.owner||'"."'||in_target_table_rec.rename_rec.current_name||'" '||l_target_partition_clause||' (...)'||chr(10)||
+                            'SELECT /*+ '||l_parallel||' */ ...'||chr(10)||
+                            '  FROM '||in_data_source_rec.data_source_sql)               
+        )
+      );
+    ELSE
+      add_change(
+        io_change_arr,
+        change_rec(
+          in_group_type  => 'COPY DATA',
+          in_change_sql  => trim(chr(10) from 
+                            'INSERT /*+ '||l_append||' '||l_parallel||' */'||chr(10)||
+                            '  INTO "'||in_target_table_rec.owner||'"."'||in_target_table_rec.rename_rec.current_name||'" '||l_target_partition_clause||chr(10)||
+                            '      ('||in_column_list||')'||chr(10)||
+                            'SELECT /*+ '||l_parallel||' */'||chr(10)||
+                                     in_values_list||chr(10)||
+                            '  FROM "'||in_source_table_rec.owner||'"."'||in_source_table_rec.rename_rec.current_name||'" '||l_source_partition_clause||' '||g_params.alias.get_value||' '||chr(10)||in_data_source_rec.data_filter),
+          in_display_sql => trim(chr(10) from 
+                            'INSERT /*+ '||l_append||' '||l_parallel||' */'||chr(10)||
+                            '  INTO "'||in_target_table_rec.owner||'"."'||in_target_table_rec.rename_rec.current_name||'" '||l_target_partition_clause||' (...)'||chr(10)||
+                            'SELECT /*+ '||l_parallel||' */ ...'||chr(10)||
+                            '  FROM "'||in_source_table_rec.owner||'"."'||in_source_table_rec.rename_rec.current_name||'" '||l_source_partition_clause||' '||g_params.alias.get_value||' '||chr(10)||
+                            CASE WHEN LENGTH(in_data_source_rec.data_filter) > 100 THEN SUBSTR(in_data_source_rec.data_filter, 1, 97)||'...' ELSE in_data_source_rec.data_filter END),                  
+          in_threadable  => CASE WHEN in_source_partition_rec.partition_name IS NOT NULL THEN 'Y' ELSE 'N' END
+        )
+      );
+    END IF;  
+  END get_copy_data_sql;
+
+  PROCEDURE get_online_copy_data_sql(
+    in_source_table_rec     IN gt_table_rec,
+    in_target_table_rec     IN gt_table_rec,
+    in_source_partition_rec IN gt_partition_rec,
+    in_target_partition_rec IN gt_partition_rec,
+    in_column_list          IN CLOB,
+    in_sql_rec              IN cort_parse_pkg.gt_sql_rec,
+    io_sql_arr              IN OUT NOCOPY arrays.gt_clob_arr
+  )
+  AS
+    l_source_partition_clause  VARCHAR2(100);
+    l_target_partition_clause  VARCHAR2(100);
+    l_sql                      CLOB;
+    l_append                   VARCHAR2(100);
+    l_parallel                 VARCHAR2(100);
+  BEGIN
+
+    l_sql := q'{
+    DECLARE
+      CURSOR l_cur IS
+      SELECT * FROM
+
+    BEGIN
+    END;}';
+
+  END get_online_copy_data_sql;
+
+  PROCEDURE get_stats_sql(
+    in_source_table_rec     IN gt_table_rec,
+    in_target_table_rec     IN gt_table_rec,
+    in_source_partition_rec IN gt_partition_rec,
+    in_target_partition_rec IN gt_partition_rec,
+    io_change_arr           IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_sql        CLOB;
+    l_parallel   NUMBER;
+  BEGIN
+    l_parallel := g_run_params.parallel.get_num_value;
+    
+    IF g_run_params.stats.get_value = 'COPY' AND in_target_partition_rec.partition_name IS NOT NULL AND in_source_partition_rec.partition_name IS NOT NULL THEN
+      l_sql := '
+begin
+  cort_exec_pkg.copy_stats(
+    in_owner        => '''||in_source_table_rec.owner||''',
+    in_source_table => '''||in_source_table_rec.rename_rec.current_name||''',
+    in_target_table => '''||in_target_table_rec.rename_rec.current_name||''',
+    in_source_part  => '''||in_source_partition_rec.partition_name||''',
+    in_target_part  => '''||in_target_partition_rec.partition_name||''',
+    in_part_level   => '''||in_target_partition_rec.partition_level||'''
+  );
+end;';
+    ELSIF g_run_params.stats.get_value = 'COPY' AND in_target_partition_rec.partition_name IS NULL AND in_source_partition_rec.partition_name IS NULL THEN
+      l_sql := '
+begin
+  cort_exec_pkg.copy_stats(
+    in_owner        => '''||in_source_table_rec.owner||''',
+    in_source_table => '''||in_source_table_rec.rename_rec.current_name||''',
+    in_target_table => '''||in_target_table_rec.rename_rec.current_name||'''
+  );
+end;';
+    ELSIF g_run_params.stats.get_value IN ('APPROX_GLOBAL AND PARTITION',in_target_partition_rec.partition_level) AND in_target_partition_rec.partition_name IS NOT NULL THEN
+      l_sql := '
+begin
+  dbms_stats.gather_table_stats(
+    ownname          => ''"'||in_target_table_rec.owner||'"'',
+    tabname          => ''"'||in_target_table_rec.rename_rec.current_name||'"'',
+    partname         => ''"'||in_target_partition_rec.partition_name||'"'',
+    granularity      => '''||g_run_params.stats.get_value||''',
+    estimate_percent => '||NVL(g_run_params.stats_estimate_pct.get_num_value, dbms_stats.default_estimate_percent)||',
+    method_opt       => '||NVL(SUBSTR(g_run_params.stats_method_opt.get_value, 2, LENGTH(g_run_params.stats_method_opt.get_value)-2), 'dbms_stats.default_method_opt')||',
+    degree           => '||NVL(g_run_params.parallel.get_num_value, dbms_stats.default_degree_value)||',
+    cascade          => true,
+    no_invalidate    => false
+  );
+end;';
+    ELSIF g_run_params.stats.get_value IN ('ALL','AUTO','GLOBAL','GLOBAL AND PARTITION') AND in_target_partition_rec.partition_name IS NULL THEN
+      IF in_target_table_rec.partition_arr.COUNT <= 1 THEN
+        l_parallel := GREATEST(8, g_run_params.parallel.get_num_value);
+      ELSE
+        l_parallel := g_run_params.parallel.get_num_value;
+      END IF; 
+       
+      l_sql := '
+begin
+  dbms_stats.gather_table_stats(
+    ownname          => ''"'||in_target_table_rec.owner||'"'',
+    tabname          => ''"'||in_target_table_rec.rename_rec.current_name||'"'',
+    granularity      => '''||g_run_params.stats.get_value||''',
+    estimate_percent => '||NVL(g_run_params.stats_estimate_pct.get_num_value, dbms_stats.default_estimate_percent)||',
+    method_opt       => '||NVL(g_run_params.stats_method_opt.get_value, 'dbms_stats.default_method_opt')||',
+    degree           => '||NVL(l_parallel, dbms_stats.default_degree_value)||',
+    cascade          => true,
+    no_invalidate    => false
+  );
+end;';
+    ELSE
+      RETURN;
+    END IF;
+ 
+    add_change( 
+      io_change_arr,
+      change_rec(
+        in_group_type => 'ENABLE STATS',
+        in_change_sql => l_sql,
+        in_threadable => 'Y'
+      )
+    );    
+  END get_stats_sql;
+
+  PROCEDURE build_partition_loop_sql(
+    in_data_source_rec  IN gt_data_source_rec,
+    in_source_table_rec IN gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    in_column_list      IN CLOB,
+    in_values_list      IN CLOB,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_source_partition_rec     gt_partition_rec;
+    l_target_partition_rec     gt_partition_rec;
+    l_cnt                      PLS_INTEGER;
+  BEGIN
+    start_timer;
+
+    IF in_source_table_rec.partitioning_type IS NULL THEN
+      raise_error('Copy data by partitions is not supported. Source table is not partitioned');
+    END IF;
+
+    FOR i IN REVERSE 1..in_source_table_rec.partition_arr.COUNT LOOP
+      l_source_partition_rec := in_source_table_rec.partition_arr(i);
+
+      IF l_source_partition_rec.is_partition_empty THEN
+        debug('partition '||l_source_partition_rec.partition_name||' is empty');
+      END IF;
+
+      IF (l_source_partition_rec.matching_indx IS NOT NULL AND in_data_source_rec.change_result = cort_comp_pkg.gc_result_part_exchange) OR
+          l_source_partition_rec.is_partition_empty
+      THEN
+        -- move data
+        NULL;
+      ELSE
+        IF l_source_partition_rec.matching_indx = -1 THEN
+          NULL; -- skip partition
+        ELSE
+          IF l_source_partition_rec.matching_indx > 0 THEN
+            l_target_partition_rec := in_target_table_rec.partition_arr(l_source_partition_rec.matching_indx);
+          ELSE
+            l_target_partition_rec := NULL;
+          END IF;
+
+          get_copy_data_sql(
+            in_data_source_rec      => in_data_source_rec,
+            in_source_table_rec     => in_source_table_rec, 
+            in_target_table_rec     => in_target_table_rec,
+            in_source_partition_rec => l_source_partition_rec,
+            in_target_partition_rec => l_target_partition_rec,
+            in_column_list          => in_column_list,
+            in_values_list          => in_values_list,
+            io_change_arr           => io_change_arr
+          );
+
         END IF;
       END IF;
     END LOOP;
 
+    stop_timer;
+  END build_partition_loop_sql;
 
-  END check_cort_values;
+  PROCEDURE build_partition_loop_stats(
+    in_source_table_rec IN gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_source_partition_rec     gt_partition_rec;
+    l_target_partition_rec     gt_partition_rec;
+  BEGIN
+    start_timer;
+
+    IF in_target_table_rec.partitioning_type IS NULL THEN
+      raise_error('Gather stats by partitions is not supported. Target table is not partitioned');
+    END IF;
+
+
+    FOR i IN REVERSE 1..in_target_table_rec.partition_arr.COUNT LOOP
+      l_target_partition_rec := in_target_table_rec.partition_arr(i);
+
+      IF l_target_partition_rec.matching_indx > 0 AND in_source_table_rec.table_name IS NOT NULL THEN
+        l_source_partition_rec := in_source_table_rec.partition_arr(l_target_partition_rec.matching_indx);
+      ELSE
+        l_source_partition_rec := NULL;
+      END IF;
+
+      get_stats_sql(
+        in_source_table_rec     => in_source_table_rec,
+        in_target_table_rec     => in_target_table_rec,
+        in_source_partition_rec => l_source_partition_rec,
+        in_target_partition_rec => l_target_partition_rec,
+        io_change_arr           => io_change_arr
+      );
+
+    END LOOP;
+
+    stop_timer;
+  END build_partition_loop_stats;
+
+  PROCEDURE build_subpartition_loop_sql(
+    in_data_source_rec  IN gt_data_source_rec,
+    in_source_table_rec IN gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    in_column_list      IN CLOB,
+    in_values_list      IN CLOB,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_source_partition_rec     gt_partition_rec;
+    l_source_subpartition_rec  gt_partition_rec;
+    l_target_subpartition_rec  gt_partition_rec;
+  BEGIN
+    start_timer;
+
+    IF in_source_table_rec.subpartitioning_type IS NULL THEN
+      raise_error('Copy data by subpartitions is not supported. Source table is not subpartitioned');
+    END IF;
+
+    FOR i IN REVERSE 1..in_source_table_rec.partition_arr.COUNT LOOP
+      l_source_partition_rec := in_source_table_rec.partition_arr(i);
+      FOR j IN l_source_partition_rec.subpartition_from_indx..l_source_partition_rec.subpartition_to_indx LOOP
+        l_source_subpartition_rec := in_source_table_rec.subpartition_arr(j);
+        IF l_source_partition_rec.matching_indx > 0 AND l_source_subpartition_rec.matching_indx > 0 THEN
+          l_target_subpartition_rec := in_target_table_rec.subpartition_arr(l_source_subpartition_rec.matching_indx);
+        ELSE
+          l_target_subpartition_rec := NULL;
+        END IF;
+
+        IF (l_source_partition_rec.matching_indx IS NOT NULL AND
+            l_source_subpartition_rec.matching_indx IS NOT NULL AND
+            in_data_source_rec.change_result = cort_comp_pkg.gc_result_part_exchange) OR
+           l_source_partition_rec.is_partition_empty
+        THEN
+          -- move data
+          NULL;
+        ELSE
+          get_copy_data_sql(
+            in_data_source_rec      => in_data_source_rec,
+            in_source_table_rec     => in_source_table_rec, 
+            in_target_table_rec     => in_target_table_rec,
+            in_source_partition_rec => l_source_subpartition_rec,
+            in_target_partition_rec => l_target_subpartition_rec,
+            in_column_list          => in_column_list,
+            in_values_list          => in_values_list,
+            io_change_arr           => io_change_arr
+          );
+        END IF;
+      END LOOP;
+
+    END LOOP;
+
+    stop_timer;
+  END build_subpartition_loop_sql;
+
+  PROCEDURE build_subpartition_loop_stats(
+    in_source_table_rec IN gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_target_partition_rec     gt_partition_rec;
+    l_target_subpartition_rec  gt_partition_rec;
+    l_source_subpartition_rec  gt_partition_rec;
+  BEGIN
+    start_timer;
+
+    IF in_target_table_rec.subpartitioning_type IS NULL THEN
+      raise_error('Gather stats by subpartitions is not supported. Target table is not subpartitioned');
+    END IF;
+
+    FOR i IN REVERSE 1..in_target_table_rec.partition_arr.COUNT LOOP
+      l_target_partition_rec := in_target_table_rec.partition_arr(i);
+      FOR j IN l_target_partition_rec.subpartition_from_indx..l_target_partition_rec.subpartition_to_indx LOOP
+        l_target_subpartition_rec := in_target_table_rec.subpartition_arr(j);
+        IF l_target_partition_rec.matching_indx > 0 AND l_target_subpartition_rec.matching_indx > 0 THEN
+          l_source_subpartition_rec := in_source_table_rec.subpartition_arr(l_target_subpartition_rec.matching_indx);
+        ELSE
+          l_source_subpartition_rec := NULL;
+        END IF;
+
+        get_stats_sql(
+          in_target_table_rec     => in_target_table_rec,
+          in_source_table_rec     => in_source_table_rec,
+          in_target_partition_rec => l_target_subpartition_rec,
+          in_source_partition_rec => l_source_subpartition_rec,
+          io_change_arr           => io_change_arr
+        );
+      END LOOP;
+
+    END LOOP;
+
+    stop_timer;
+  END build_subpartition_loop_stats;
+
+  -- forward declaration  
+  FUNCTION get_adt_col_value(
+    in_adt_rec            IN gt_adt_rec,
+    in_qualified_name     IN VARCHAR2,
+    in_column_arr         IN gt_column_arr,  -- array of source columns
+    in_qualified_indx_arr IN arrays.gt_int_indx,
+    in_data_values        IN arrays.gt_xlstr_indx
+  )
+  RETURN VARCHAR2;
+
+  -- return constructor collecting for given object column
+  FUNCTION get_adt_attr_values(
+    in_adt_rec             IN gt_adt_rec,
+    in_base_adt_attributes IN PLS_INTEGER,
+    in_qualified_name      IN VARCHAR2,
+    in_column_arr          IN gt_column_arr,  -- array of source columns
+    in_qualified_indx_arr  IN arrays.gt_int_indx,
+    in_data_values         IN arrays.gt_xlstr_indx
+  )
+  RETURN VARCHAR2
+  AS
+    l_result           VARCHAR2(32767);
+    l_qualified_name   VARCHAR2(32767);
+    l_attr_def         VARCHAR2(32767);
+    l_adt_rec          gt_adt_rec;
+  BEGIN
+    FOR i in NVL(in_base_adt_attributes,0)+1..in_adt_rec.attribute_arr.count LOOP
+      
+      IF in_base_adt_attributes IS NULL THEN 
+        IF in_qualified_name = '"SYS_NC_ROWINFO$"' THEN
+          l_qualified_name := in_adt_rec.attribute_arr(i).attr_name;
+        ELSE  
+          l_qualified_name := in_qualified_name ||'."'||in_adt_rec.attribute_arr(i).attr_name||'"';
+        END IF;   
+      ELSE
+        IF in_qualified_name = '"SYS_NC_ROWINFO$"' THEN
+          l_qualified_name := 'TREAT(SYS_NC_ROWINFO$ AS "'||in_adt_rec.owner||'"."'||in_adt_rec.attribute_arr(i).defined_type_name||'")."'||in_adt_rec.attribute_arr(i).attr_name||'"';
+        ELSE  
+          l_qualified_name := 'TREAT('||in_qualified_name||' AS "'||in_adt_rec.attribute_arr(i).defined_type_name||'")."'||in_adt_rec.attribute_arr(i).attr_name||'"';
+        END IF;   
+      END IF;
+
+      l_attr_def := 'NULL';
+
+      IF in_data_values.EXISTS(l_qualified_name) THEN
+        l_attr_def := in_data_values(l_qualified_name);
+      ELSE  
+        IF in_adt_rec.attribute_arr(i).attr_type_owner IS NOT NULL AND 
+           NOT (in_adt_rec.attribute_arr(i).attr_type_owner = 'SYS' AND in_adt_rec.attribute_arr(i).attr_type_name IN ('XMLTYPE', 'ANYDATA', 'ANYDATATYPE', 'ANYDATASET')) 
+        THEN
+          -- adt data type
+          l_adt_rec := get_adt_rec(    
+                          in_owner      => in_adt_rec.attribute_arr(i).attr_type_owner,
+                          in_type_name  => in_adt_rec.attribute_arr(i).attr_type_name
+                        );
+
+          l_attr_def := get_adt_col_value(
+                          in_adt_rec            => l_adt_rec,
+                          in_qualified_name     => CASE WHEN in_qualified_name = '"SYS_NC_ROWINFO$"' THEN '"'||l_qualified_name||'"' ELSE l_qualified_name END,
+                          in_column_arr         => in_column_arr,
+                          in_qualified_indx_arr => in_qualified_indx_arr,
+                          in_data_values        => in_data_values
+                        );
+        ELSE
+          -- simple data type
+          IF in_qualified_indx_arr.EXISTS(l_qualified_name) THEN
+            l_attr_def := g_params.alias.get_value||'."'||in_column_arr(in_qualified_indx_arr(l_qualified_name)).column_name||'"';
+          ELSE
+            debug('get_adt_attr_values: value for column '||l_qualified_name||' not found');  
+          END IF;   
+        END IF;
+      END IF;
+
+      l_result := l_result ||l_attr_def||',';
+      
+    END LOOP;
+   
+    RETURN l_result;
+
+  END get_adt_attr_values;
+
+
+  FUNCTION get_adt_col_value(
+    in_adt_rec            IN gt_adt_rec,
+    in_qualified_name     IN VARCHAR2,
+    in_column_arr         IN gt_column_arr,  -- array of source columns
+    in_qualified_indx_arr IN arrays.gt_int_indx,
+    in_data_values        IN arrays.gt_xlstr_indx
+  )
+  RETURN VARCHAR2
+  AS
+    l_result          VARCHAR2(32767);
+    l_adt_rec         gt_adt_rec;
+    l_subtype_adt_rec gt_adt_rec;
+    l_typid_qual_col  VARCHAR2(32767);
+    l_typid_column    VARCHAR2(32767);
+    l_base_attributes CLOB;
+    l_attributes      CLOB;
+    l_column_name     arrays.gt_name;
+  BEGIN
+    IF in_qualified_indx_arr.EXISTS(get_canonical_name(in_qualified_name)) THEN
+      l_column_name := in_column_arr(in_qualified_indx_arr(get_canonical_name(in_qualified_name))).column_name;
+    ELSE
+      debug('Qualified column '||get_canonical_name(in_qualified_name)||' not found');
+      RETURN 'NULL';
+    END IF;
+    
+    
+    l_typid_qual_col := 'TYPE_NAME('||in_qualified_name||')';
+    IF in_data_values.EXISTS(l_typid_qual_col) THEN
+      l_typid_column := in_data_values(l_typid_qual_col);
+    ELSE
+      l_typid_qual_col := 'SYS_TYPEID('||in_qualified_name||')';
+      IF in_qualified_indx_arr.EXISTS(l_typid_qual_col) THEN
+        l_typid_column := 'decode('||g_params.alias.get_value||'."'||in_column_arr(in_qualified_indx_arr(l_typid_qual_col)).column_name||'",'||l_adt_rec.typeid_name||')';
+      ELSE
+        l_typid_qual_col := 'TYPE_NAME('||in_qualified_name||')';
+        IF in_qualified_indx_arr.EXISTS(l_typid_qual_col) THEN
+          l_typid_column := g_params.alias.get_value||'."'||in_column_arr(in_qualified_indx_arr(l_typid_qual_col)).column_name||'"';
+        END IF; 
+      END IF;
+    END IF;  
+    
+    l_base_attributes := get_adt_attr_values(
+                           in_adt_rec             => in_adt_rec,
+                           in_base_adt_attributes => NULL,
+                           in_qualified_name      => in_qualified_name,
+                           in_column_arr          => in_column_arr,
+                           in_qualified_indx_arr  => in_qualified_indx_arr,
+                           in_data_values         => in_data_values        
+                         );
+            
+    IF l_typid_column IS NULL THEN
+      -- not substitutable
+      l_result := 'NVL2("'||l_column_name||'","'||in_adt_rec.owner||'"."'||in_adt_rec.type_name||'"('||trim(',' from l_base_attributes)||'), NULL)';
+    ELSE
+      -- substitutable
+      l_result := '
+CASE '||l_typid_column||'
+  WHEN ''"'||in_adt_rec.owner||'"."'||in_adt_rec.type_name||'"'' THEN ';
+      l_result := l_result || '"'||in_adt_rec.owner||'"."'||in_adt_rec.type_name||'"('||trim(',' from l_base_attributes)||')';
+      
+      FOR I IN 1..in_adt_rec.subtype_adt_arr.COUNT LOOP
+        l_result := l_result || '
+  WHEN ''"'||in_adt_rec.owner||'"."'||in_adt_rec.subtype_adt_arr(i)||'"'' THEN ';
+        l_subtype_adt_rec := get_adt_rec(in_adt_rec.owner, in_adt_rec.subtype_adt_arr(i));
+        
+        l_attributes := get_adt_attr_values(
+                          in_adt_rec             => l_subtype_adt_rec,
+                          in_base_adt_attributes => in_adt_rec.attributes,
+                          in_qualified_name      => in_qualified_name,
+                          in_column_arr          => in_column_arr,
+                          in_qualified_indx_arr  => in_qualified_indx_arr,
+                          in_data_values         => in_data_values        
+                        );
+      l_result := l_result || '"'||l_subtype_adt_rec.owner||'"."'||l_subtype_adt_rec.type_name||'"('||trim(',' from l_base_attributes||l_attributes)||')';
+    END LOOP;
+    l_result := l_result||'
+END';
+   END IF;
+    
+    
+    RETURN l_result;
+  END get_adt_col_value;
+
+  -- Returns list of column name for INSERT statement and list of column values for SELECT statement from source table
+  PROCEDURE get_column_values_list(
+    in_column_arr       IN gt_column_arr,  -- array of source columns
+    in_column_indx_arr  IN arrays.gt_int_indx,           
+    in_target_table_rec IN gt_table_rec,
+    in_data_values      IN arrays.gt_xlstr_indx,
+    out_columns_list    OUT NOCOPY CLOB,
+    out_values_list     OUT NOCOPY CLOB
+  )
+  AS
+    l_column_indx   PLS_INTEGER;
+    l_column_alias  VARCHAR2(100);
+    l_data_value    VARCHAR2(32767);
+    l_adt_rec       gt_adt_rec;
+  BEGIN
+    -- for object tables with substitutable level
+    IF in_target_table_rec.table_type_owner IS NOT NULL AND 
+       in_target_table_rec.table_type IS NOT NULL 
+    THEN
+      IF in_target_table_rec.column_indx_arr.EXISTS('SYS_NC_ROWINFO$') THEN
+        l_column_indx := in_target_table_rec.column_indx_arr('SYS_NC_ROWINFO$');
+        IF in_target_table_rec.column_arr(l_column_indx).substitutable = 'Y' THEN
+  
+          debug('Copying data for SYS_NC_ROWINFO column only');
+
+          l_adt_rec := get_adt_rec(in_target_table_rec.column_arr(l_column_indx).data_type_owner, in_target_table_rec.column_arr(l_column_indx).data_type);
+
+          out_columns_list := '"SYS_NC_ROWINFO$"';
+          l_column_alias := ' AS "SYS_NC_ROWINFO$"';
+          out_values_list := get_adt_col_value(
+                               in_adt_rec            => l_adt_rec,
+                               in_qualified_name     => '"SYS_NC_ROWINFO$"',
+                               in_column_arr         => in_column_arr,
+                               in_qualified_indx_arr => in_column_indx_arr,
+                               in_data_values        => in_data_values
+                             )||l_column_alias;
+          RETURN;                   
+        END IF;
+      END IF;
+    END IF;
+    
+    FOR i IN 1..in_target_table_rec.column_arr.COUNT LOOP
+      IF in_target_table_rec.column_arr(i).virtual_column = 'NO' AND
+         in_target_table_rec.column_arr(i).hidden_column = 'NO'
+      THEN
+        debug('Copying data for nonhidden, nonvirtual column '||in_target_table_rec.column_arr(i).column_name);
+        out_columns_list := out_columns_list||'"'||in_target_table_rec.column_arr(i).column_name||'",';
+        l_column_alias := ' AS "'||in_target_table_rec.column_arr(i).column_name||'",';
+        IF in_column_indx_arr.EXISTS(in_target_table_rec.column_arr(i).column_name) THEN
+          -- existing column
+          l_column_indx := in_column_indx_arr(in_target_table_rec.column_arr(i).column_name);
+          IF in_data_values.exists(in_target_table_rec.column_arr(i).column_name) THEN
+            l_data_value := in_data_values(in_target_table_rec.column_arr(i).column_name);
+            -- if forced value
+            IF SUBSTR(l_data_value, 1, 1) = '=' THEN
+              -- update value
+              out_values_list := out_values_list||SUBSTR(l_data_value, 2)||l_column_alias;
+              -- if data type was changed  
+            ELSIF cort_comp_pkg.comp_data_type(in_column_arr(l_column_indx), in_target_table_rec.column_arr(i)) = 1 THEN
+              -- update value
+              out_values_list := out_values_list||l_data_value||l_column_alias;
+            ELSE
+              -- use default mapping
+              out_values_list := out_values_list||cort_comp_pkg.get_type_convert_expression(in_column_arr(l_column_indx), in_target_table_rec.column_arr(i), cort_exec_pkg.g_params.alias.get_value)||l_column_alias;
+            END IF; 
+          ELSE
+            IF in_target_table_rec.column_arr(i).adt_flag THEN
+              debug('Convert data to '||in_target_table_rec.column_arr(i).data_type_owner||'.'||in_target_table_rec.column_arr(i).data_type||' for column '||in_column_arr(l_column_indx).column_name);
+            
+              l_adt_rec := get_adt_rec(in_target_table_rec.column_arr(i).data_type_owner, in_target_table_rec.column_arr(i).data_type);
+              
+              out_values_list := out_values_list||
+                                 get_adt_col_value(
+                                   in_adt_rec            => l_adt_rec,
+                                   in_qualified_name     => '"'||in_column_arr(l_column_indx).column_name||'"',
+                                   in_column_arr         => in_column_arr,
+                                   in_qualified_indx_arr => in_column_indx_arr,
+                                   in_data_values        => in_data_values
+                                 )||l_column_alias;
+            ELSE
+              -- use default mapping
+              out_values_list := out_values_list||cort_comp_pkg.get_type_convert_expression(in_column_arr(l_column_indx), in_target_table_rec.column_arr(i), cort_exec_pkg.g_params.alias.get_value)||l_column_alias;
+            END IF;
+          END IF;
+        ELSIF in_data_values.exists(in_target_table_rec.column_arr(i).column_name) THEN
+          l_data_value := in_data_values(in_target_table_rec.column_arr(i).column_name);
+           -- if forced value
+          IF SUBSTR(l_data_value, 1, 1) = '=' THEN
+            l_data_value := SUBSTR(l_data_value, 2); 
+          END IF;
+          out_values_list := out_values_list||l_data_value||l_column_alias;
+        ELSE
+          out_values_list := out_values_list||NVL(in_target_table_rec.column_arr(i).data_default,'NULL')||l_column_alias;
+        END IF;
+      ELSE
+        debug('Not copying data for hidden or virtual column '||in_target_table_rec.column_arr(i).column_name);
+      END IF;
+    END LOOP;
+    out_values_list := TRIM(',' FROM out_values_list);
+    out_columns_list := TRIM(',' FROM out_columns_list);
+  END get_column_values_list;
+
+  -- copying data from old tale to new one
+  PROCEDURE copy_data(
+    in_data_source_rec  IN gt_data_source_rec,
+    in_source_table_rec IN gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_column_list       CLOB;
+    l_values_list       CLOB;
+  BEGIN
+    start_timer;
+
+    $IF cort_options_pkg.gc_threading $THEN
+    cort_thread_exec_pkg.init_threading(
+      in_data_source_rec  => in_data_source_rec,
+      in_source_table_rec => in_source_table_rec,
+      in_target_table_rec => in_target_table_rec
+    );    
+    $END    
+
+    IF in_data_source_rec.change_result NOT IN (cort_comp_pkg.gc_result_create_as_select, cort_comp_pkg.gc_result_recreate_as_select, cort_comp_pkg.gc_result_cas_from_itself) THEN
+      get_column_values_list(
+        in_column_arr       => CASE WHEN in_data_source_rec.data_source_sql IS NOT NULL THEN in_data_source_rec.column_arr ELSE in_source_table_rec.column_arr END,
+        in_column_indx_arr  => CASE WHEN in_data_source_rec.data_source_sql IS NOT NULL THEN in_data_source_rec.column_indx_arr ELSE in_source_table_rec.column_qualified_indx_arr END,
+        in_target_table_rec => in_target_table_rec,
+        in_data_values      => in_data_source_rec.data_values,
+        out_columns_list    => l_column_list,
+        out_values_list     => l_values_list
+      );
+      --check for non-empty strings
+      IF l_column_list IS NULL OR
+         l_values_list IS NULL
+      THEN
+        RETURN;
+      END IF;
+      
+    END IF;
+    
+    -- disable all  keys
+    change_status_for_all_keys(
+      in_table_rec  => in_target_table_rec,
+      in_action     => 'DISABLE',
+      io_change_arr => io_change_arr
+    );
+    change_status_for_policies(
+      in_table_rec  => in_target_table_rec,
+      in_action     => 'DISABLE',
+      io_change_arr => io_change_arr
+    );
+    IF in_data_source_rec.data_source_sql IS NULL THEN 
+      change_status_for_policies(
+        in_table_rec  => in_source_table_rec,
+        in_action     => 'DISABLE',
+        io_change_arr => io_change_arr
+      );
+    END IF;
+    change_status_for_all_indexes(
+      in_table_rec  => in_target_table_rec,
+      in_action     => 'DISABLE',
+      io_change_arr => io_change_arr
+    );
+
+    IF in_data_source_rec.data_source_sql IS NOT NULL OR in_source_table_rec.partitioned = 'NO' THEN
+      -- check if we can 
+      IF in_data_source_rec.data_source_sql IS NOT NULL AND in_target_table_rec.partitioned = 'YES' THEN
+        build_partition_loop_sql(
+          in_data_source_rec  => in_data_source_rec,
+          in_source_table_rec => in_source_table_rec,
+          in_target_table_rec => in_target_table_rec,
+          in_column_list      => l_column_list,
+          in_values_list      => l_values_list,
+          io_change_arr       => io_change_arr
+        );
+      ELSE 
+        -- copy full table 
+        get_copy_data_sql(
+          in_data_source_rec      => in_data_source_rec,
+          in_source_table_rec     => in_source_table_rec,
+          in_target_table_rec     => in_target_table_rec,
+          in_source_partition_rec => null,
+          in_target_partition_rec => null,
+          in_column_list          => l_column_list,
+          in_values_list          => l_values_list,
+          io_change_arr           => io_change_arr
+        );
+      END IF;
+
+      -- use threading for stats gathering if possible
+      IF in_target_table_rec.partitioned = 'YES' AND in_target_table_rec.interval IS NULL THEN
+        -- build loop by partitions only if new partitions are hardcoded and not interval
+        -- because interval partitions are created when data are copied and not defined yet at this moment
+        build_partition_loop_stats(
+          in_source_table_rec => in_source_table_rec,
+          in_target_table_rec => in_target_table_rec,
+          io_change_arr       => io_change_arr
+        );
+      END IF;
+
+    ELSE
+      IF in_source_table_rec.subpartitioning_type <> 'NONE' AND in_source_table_rec.subpartitioning_type = in_target_table_rec.subpartitioning_type THEN
+        build_subpartition_loop_sql(
+          in_data_source_rec  => in_data_source_rec,
+          in_source_table_rec => in_source_table_rec,
+          in_target_table_rec => in_target_table_rec,
+          in_column_list      => l_column_list,
+          in_values_list      => l_values_list,
+          io_change_arr       => io_change_arr
+        );
+        build_subpartition_loop_stats(
+          in_source_table_rec => in_source_table_rec,
+          in_target_table_rec => in_target_table_rec,
+          io_change_arr       => io_change_arr
+        );
+      ELSE
+        build_partition_loop_sql(
+          in_data_source_rec  => in_data_source_rec,
+          in_source_table_rec => in_source_table_rec,
+          in_target_table_rec => in_target_table_rec,
+          in_column_list      => l_column_list,
+          in_values_list      => l_values_list,
+          io_change_arr       => io_change_arr
+        );
+        IF in_target_table_rec.partitioned = 'YES' AND in_target_table_rec.interval IS NULL THEN
+          build_partition_loop_stats(
+            in_source_table_rec => in_source_table_rec,
+            in_target_table_rec => in_target_table_rec,
+            io_change_arr       => io_change_arr
+          );
+        END IF;
+      END IF;
+    END IF;
+
+    -- Gather global stats (if needed)
+    get_stats_sql(
+      in_target_table_rec     => in_target_table_rec,
+      in_source_table_rec     => in_source_table_rec,
+      in_target_partition_rec => null,
+      in_source_partition_rec => null,
+      io_change_arr           => io_change_arr
+    );
+
+    -- enable all keys
+    change_status_for_all_keys(
+      in_table_rec  => in_target_table_rec,
+      in_action     => 'ENABLE',
+      io_change_arr => io_change_arr
+    );
+    change_status_for_policies(
+      in_table_rec  => in_target_table_rec,
+      in_action     => 'ENABLE',
+      io_change_arr => io_change_arr
+    );
+    IF in_data_source_rec.data_source_sql IS NULL THEN 
+      change_status_for_policies(
+        in_table_rec  => in_source_table_rec,
+        in_action     => 'ENABLE',
+        io_change_arr => io_change_arr
+      );
+    END IF;
+    change_status_for_all_indexes(
+      in_table_rec  => in_target_table_rec,
+      in_action     => 'ENABLE',
+      io_change_arr => io_change_arr
+    );
+
+    stop_timer;
+  END copy_data;
+  
+
+  PROCEDURE exchange_partition(
+    in_source_table_rec IN gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    in_swap_table_rec   IN gt_table_rec,
+    in_source_part_rec  IN gt_partition_rec,
+    in_target_part_rec  IN gt_partition_rec,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_change_arr          gt_change_arr;
+  BEGIN
+    -- create swap table for given partition
+    cort_comp_pkg.create_swap_table_sql(
+      in_table_rec      => in_target_table_rec,
+      in_swap_table_rec => in_swap_table_rec,
+      io_change_arr     => l_change_arr
+    );
+    
+    add_changes(io_change_arr, l_change_arr);
+
+    -- Exchange partition from source table with swap table
+    cort_comp_pkg.exchange_partition(
+      in_source_table_rec => in_source_table_rec,
+      in_target_table_rec => in_swap_table_rec,
+      in_partition_rec    => in_source_part_rec,
+      io_change_arr       => io_change_arr
+    );
+    -- Exchange partition from target table with swap table
+    cort_comp_pkg.exchange_partition(
+      in_source_table_rec => in_target_table_rec,
+      in_target_table_rec => in_swap_table_rec,
+      in_partition_rec    => in_target_part_rec,
+      io_change_arr       => io_change_arr
+    );
+
+    FOR i IN REVERSE 1..l_change_arr.COUNT LOOP
+      add_change(
+        io_change_arr,
+        change_rec(
+          in_group_type  => l_change_arr(i).group_type, 
+          in_change_sql  => l_change_arr(i).revert_sql,
+          in_revert_sql  => l_change_arr(i).change_sql
+        )
+      ); 
+    END LOOP;
+
+  END exchange_partition;
+
+  PROCEDURE exchange_partitions(
+    in_source_table_rec IN gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    in_swap_table_rec   IN gt_table_rec,
+    in_source_part_arr  IN gt_partition_arr,
+    in_target_part_arr  IN gt_partition_arr,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_change_arr          gt_change_arr;
+  BEGIN
+    -- create swap table for given partition
+    cort_comp_pkg.create_swap_table_sql(
+      in_table_rec      => in_target_table_rec,
+      in_swap_table_rec => in_swap_table_rec,
+      io_change_arr     => l_change_arr
+    );
+
+    add_changes(io_change_arr, l_change_arr);
+
+    FOR i IN 1..in_source_part_arr.COUNT LOOP
+      -- Exchange partition from source table with swap table
+      cort_comp_pkg.exchange_partition(
+        in_source_table_rec => in_source_table_rec,
+        in_target_table_rec => in_swap_table_rec,
+        in_partition_rec    => in_source_part_arr(i),
+        io_change_arr       => io_change_arr
+      );
+      -- Exchange partition from target table with swap table
+      cort_comp_pkg.exchange_partition(
+        in_source_table_rec => in_target_table_rec,
+        in_target_table_rec => in_swap_table_rec,
+        in_partition_rec    => in_target_part_arr(i),
+        io_change_arr       => io_change_arr
+      );
+     END LOOP;
+
+    -- add dropping table
+    FOR i IN REVERSE 1..l_change_arr.COUNT LOOP
+      add_change(
+        io_change_arr,
+        change_rec(
+          in_group_type => l_change_arr(i).group_type, 
+          in_change_sql => l_change_arr(i).revert_sql,
+          in_revert_sql => l_change_arr(i).change_sql
+        )
+      ); 
+    END LOOP;
+
+  END exchange_partitions;
+
+  PROCEDURE exchange_partition(
+    in_source_table_rec IN gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    in_swap_table_rec   IN gt_table_rec,
+    in_swap_part_rec    IN gt_partition_rec,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_change_arr          gt_change_arr;
+  BEGIN
+    -- create swap table for given partition
+    cort_comp_pkg.create_swap_table_sql(
+      in_table_rec      => in_target_table_rec,
+      in_swap_table_rec => in_swap_table_rec,
+      io_change_arr     => l_change_arr
+    );
+
+    -- Exchange partition from source table with swap table
+    cort_comp_pkg.exchange_partition(
+      in_source_table_rec => in_swap_table_rec,
+      in_target_table_rec => in_source_table_rec,
+      in_partition_rec    => in_swap_part_rec,
+      io_change_arr       => io_change_arr
+    );
+    -- Exchange partition from target table with swap table
+    cort_comp_pkg.exchange_partition(
+      in_source_table_rec => in_swap_table_rec,
+      in_target_table_rec => in_target_table_rec,
+      in_partition_rec    => in_swap_part_rec,
+      io_change_arr       => io_change_arr
+    );
+
+    FOR i IN REVERSE 1..l_change_arr.COUNT LOOP
+      add_change(
+        io_change_arr,
+        change_rec(
+          in_group_type  => l_change_arr(i).group_type, 
+          in_change_sql  => l_change_arr(i).revert_sql,
+          in_revert_sql  => l_change_arr(i).change_sql
+        )
+      ); 
+    END LOOP;
+
+  END exchange_partition;
+
+  -- move data using exchange partition mechanism
+  PROCEDURE move_data(
+    in_source_table_rec IN gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    in_recreate_mode    IN PLS_INTEGER,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_swap_table_name        arrays.gt_name;
+    l_swap_table_rec         gt_table_rec;
+    l_swap_part_rec          gt_partition_rec;
+    l_source_part_rec        gt_partition_rec;
+    l_target_part_rec        gt_partition_rec;
+    l_source_subpart_rec     gt_partition_rec;
+    l_target_subpart_rec     gt_partition_rec;
+    l_source_part_arr        gt_partition_arr;
+    l_target_part_arr        gt_partition_arr;
+  BEGIN
+    start_timer;
+    -- disable all keys
+    change_status_for_all_keys(
+      in_table_rec  => in_target_table_rec,
+      in_action     => 'DISABLE',
+      io_change_arr => io_change_arr
+    );
+    change_status_for_policies(
+      in_table_rec  => in_source_table_rec,
+      in_action     => 'DISABLE',
+      io_change_arr => io_change_arr
+    );
+
+
+    l_swap_table_name := get_object_temp_name(
+                           in_object_type  => in_source_table_rec.rename_rec.object_type,
+                           in_object_name  => in_source_table_rec.rename_rec.object_name,
+                           in_object_owner => in_source_table_rec.owner,
+                           in_prefix       => cort_params_pkg.gc_swap_prefix
+                         );
+    l_swap_table_rec.table_name := l_swap_table_name;
+    l_swap_table_rec.owner := in_source_table_rec.owner;
+    l_swap_table_rec.rename_rec.object_name := l_swap_table_name;
+    l_swap_table_rec.rename_rec.object_owner := in_source_table_rec.owner;
+    l_swap_table_rec.rename_rec.current_name := l_swap_table_name;
+
+    IF in_source_table_rec.partitioned = 'NO' THEN
+      -- create swap table with 1 list or system partition
+      l_swap_table_rec.partitioned := 'YES';
+      l_swap_table_rec.partitioning_type := 'LIST';
+      l_swap_table_rec.subpartitioning_type := 'NONE';
+      l_swap_table_rec.part_key_column_arr(1) := cort_comp_pkg.get_column_for_partitioning(in_source_table_rec);
+
+      l_swap_part_rec.object_type := 'TABLE';
+      l_swap_part_rec.object_owner := l_swap_table_rec.owner;
+      l_swap_part_rec.object_name := l_swap_table_rec.table_name;
+      l_swap_part_rec.partition_name := 'P_DEF';
+      l_swap_part_rec.partition_level := 'PARTITION';
+      l_swap_part_rec.partition_type := 'LIST';
+      l_swap_part_rec.high_value := 'DEFAULT';
+      l_swap_part_rec.composite := 'NO';
+      l_swap_part_rec.position := 1;
+      l_swap_part_rec.physical_attr_rec  := in_source_table_rec.physical_attr_rec;
+      l_swap_part_rec.subpartition_from_indx := null;
+      l_swap_part_rec.subpartition_to_indx   := null;
+
+      l_swap_table_rec.partition_arr(1) := l_swap_part_rec;
+      l_swap_table_rec.partition_indx_arr('P_DEF') := 1;
+
+      exchange_partition(
+        in_source_table_rec => in_source_table_rec,
+        in_target_table_rec => in_target_table_rec,
+        in_swap_table_rec   => l_swap_table_rec,
+        in_swap_part_rec    => l_swap_part_rec,
+        io_change_arr       => io_change_arr
+      );
+
+    ELSIF in_source_table_rec.partitioned = 'YES' AND in_source_table_rec.subpartitioning_type = 'NONE' THEN
+
+        IF cort_comp_pkg.is_subpartitioning_available(in_target_table_rec) AND in_recreate_mode = cort_comp_pkg.gc_result_exchange THEN
+
+          l_swap_table_rec.partitioned := 'YES';
+          l_swap_table_rec.partitioning_type := 'LIST';
+          l_swap_table_rec.subpartitioning_type := in_source_table_rec.subpartitioning_type;
+          l_swap_table_rec.part_key_column_arr(1) := cort_comp_pkg.get_column_for_partitioning(in_source_table_rec);
+          l_swap_table_rec.subpart_key_column_arr := in_source_table_rec.part_key_column_arr;
+
+          l_swap_part_rec.object_type := 'TABLE';
+          l_swap_part_rec.object_owner := l_swap_table_rec.owner;
+          l_swap_part_rec.object_name := l_swap_table_rec.table_name;
+          l_swap_part_rec.partition_name := 'P_DEF';
+          l_swap_part_rec.partition_level := 'PARTITION';
+          l_swap_part_rec.partition_type := 'LIST';
+          l_swap_part_rec.high_value := 'DEFAULT';
+          l_swap_part_rec.composite := 'YES';
+          l_swap_part_rec.position := 1;
+          l_swap_part_rec.physical_attr_rec  := in_source_table_rec.partition_arr(1).physical_attr_rec;
+          l_swap_part_rec.subpartition_from_indx := 1;
+          l_swap_part_rec.subpartition_to_indx := in_source_table_rec.partition_arr.COUNT;
+
+          l_swap_table_rec.partition_arr(1) := l_swap_part_rec;
+          l_swap_table_rec.partition_indx_arr('P_DEF') := 1;
+          l_swap_table_rec.subpartition_arr := in_source_table_rec.partition_arr;
+
+          exchange_partition(
+            in_source_table_rec => in_source_table_rec,
+            in_target_table_rec => in_target_table_rec,
+            in_swap_table_rec   => l_swap_table_rec,
+            in_source_part_rec  => l_source_part_rec,
+            in_target_part_rec  => l_target_part_rec,
+            io_change_arr       => io_change_arr
+          );
+        ELSE
+           l_swap_table_rec.partitioned := 'NO';
+           l_swap_table_rec.partitioning_type := NULL;
+           l_swap_table_rec.subpartitioning_type := NULL;
+           l_swap_table_rec.part_key_column_arr.DELETE;
+           l_swap_table_rec.partition_arr.DELETE;
+           l_target_part_arr.DELETE;
+           l_source_part_arr.DELETE;
+
+           -- repeat for every partition
+           FOR i IN 1..in_target_table_rec.partition_arr.COUNT LOOP
+
+             --for partition which exists in both tables
+             IF in_target_table_rec.partition_arr(i).matching_indx > 0 THEN
+
+               l_target_part_rec := in_target_table_rec.partition_arr(i);
+               l_source_part_rec := in_source_table_rec.partition_arr(l_target_part_rec.matching_indx);
+
+               debug('Move data from partition '||l_source_part_rec.partition_name||' into partition '||l_target_part_rec.partition_name);
+
+               IF NOT l_source_part_rec.is_partition_empty THEN
+                 l_target_part_arr(l_target_part_arr.COUNT+1) := l_target_part_rec;
+                 l_source_part_arr(l_source_part_arr.COUNT+1) := l_source_part_rec;
+               END IF;
+             END IF;
+           END LOOP;
+
+           exchange_partitions(
+             in_source_table_rec => in_source_table_rec,
+             in_target_table_rec => in_target_table_rec,
+             in_swap_table_rec   => l_swap_table_rec,
+             in_source_part_arr  => l_source_part_arr,
+             in_target_part_arr  => l_target_part_arr,
+             io_change_arr       => io_change_arr
+           );
+        END IF;
+
+    ELSIF in_source_table_rec.partitioned = 'YES' AND in_source_table_rec.subpartitioning_type <> 'NONE' THEN
+
+      -- repeat for every partition
+      FOR i IN 1..in_target_table_rec.partition_arr.COUNT LOOP
+
+        --for partition which exists in both tables
+        IF in_target_table_rec.partition_arr(i).matching_indx > 0 THEN
+
+          l_target_part_rec := in_target_table_rec.partition_arr(i);
+          l_source_part_rec := in_source_table_rec.partition_arr(l_target_part_rec.matching_indx);
+            
+
+          IF in_target_table_rec.partition_arr(i).subpart_comp_result = cort_comp_pkg.gc_result_nochange THEN
+
+            debug('Move data from partition '||l_source_part_rec.partition_name||' into partition '||l_target_part_rec.partition_name||' for all subpartitions');
+            l_swap_table_rec.partitioned := 'YES';
+            l_swap_table_rec.partitioning_type := in_target_table_rec.subpartitioning_type;
+            l_swap_table_rec.subpartitioning_type := 'NONE';
+            l_swap_table_rec.part_key_column_arr := in_target_table_rec.subpart_key_column_arr;
+            l_swap_table_rec.partition_arr.DELETE;
+            l_target_part_arr.DELETE;
+            l_source_part_arr.DELETE;
+
+            FOR j IN in_target_table_rec.partition_arr(i).subpartition_from_indx..in_target_table_rec.partition_arr(i).subpartition_to_indx LOOP
+              l_swap_part_rec.object_type := 'TABLE';
+              l_swap_part_rec.object_owner := l_swap_table_rec.owner;
+              l_swap_part_rec.object_name := l_swap_table_rec.table_name;
+              l_swap_part_rec.partition_name := in_target_table_rec.subpartition_arr(j).partition_name;
+              l_swap_part_rec.partition_level := 'PARTITION';
+              l_swap_part_rec.partition_type := in_target_table_rec.subpartition_arr(j).partition_type;
+              l_swap_part_rec.high_value := in_target_table_rec.subpartition_arr(j).high_value;
+              l_swap_part_rec.composite := 'NO';
+              l_swap_part_rec.position := in_target_table_rec.subpartition_arr(j).position;
+              l_swap_part_rec.physical_attr_rec  := in_target_table_rec.subpartition_arr(j).physical_attr_rec;
+              l_swap_table_rec.partition_arr(l_swap_table_rec.partition_arr.COUNT+1) := l_swap_part_rec;
+              l_swap_table_rec.partition_indx_arr(l_swap_part_rec.partition_name) := l_swap_table_rec.partition_arr.COUNT;
+            END LOOP;
+
+            exchange_partition(
+              in_source_table_rec => in_source_table_rec,
+              in_target_table_rec => in_target_table_rec,
+              in_swap_table_rec   => l_swap_table_rec,
+              in_source_part_rec  => l_source_part_rec,
+              in_target_part_rec  => l_target_part_rec,
+              io_change_arr       => io_change_arr
+            );
+          ELSE
+            -- if subpartitions don't match
+            -- exchange every subpartition individually
+
+            debug('Move data from partition '||l_source_part_rec.partition_name||' into partition '||l_target_part_rec.partition_name||' for all each subsubpartition individually');
+            l_swap_table_rec.partitioned := 'NO';
+            l_swap_table_rec.partitioning_type := NULL;
+            l_swap_table_rec.subpartitioning_type := NULL;
+            l_swap_table_rec.part_key_column_arr.DELETE;
+            l_swap_table_rec.partition_arr.DELETE;
+            l_target_part_arr.DELETE;
+            l_source_part_arr.DELETE;
+
+            FOR j IN l_target_part_rec.subpartition_from_indx..l_target_part_rec.subpartition_to_indx LOOP
+              l_target_subpart_rec := in_target_table_rec.subpartition_arr(j);
+
+              IF l_target_subpart_rec.matching_indx > 0 THEN
+                l_source_subpart_rec := in_source_table_rec.subpartition_arr(l_target_subpart_rec.matching_indx);
+                IF NOT l_source_subpart_rec.is_partition_empty THEN
+                  debug('Move data from subpartition '||l_source_subpart_rec.partition_name||' into subpartition '||l_target_subpart_rec.partition_name);
+                  l_target_part_arr(l_target_part_arr.COUNT+1) := l_target_subpart_rec;
+                  l_source_part_arr(l_source_part_arr.COUNT+1) := l_source_subpart_rec;
+                END IF;
+              END IF;
+            END LOOP;
+
+            exchange_partitions(
+              in_source_table_rec => in_source_table_rec,
+              in_target_table_rec => in_target_table_rec,
+              in_swap_table_rec   => l_swap_table_rec,
+              in_source_part_arr  => l_source_part_arr,
+              in_target_part_arr  => l_target_part_arr,
+              io_change_arr       => io_change_arr
+            );
+
+          END IF;
+
+        END IF;
+
+      END LOOP;
+
+    END IF;
+    
+    -- enable all keys
+    change_status_for_all_keys(
+      in_table_rec      => in_target_table_rec,
+      in_action         => 'ENABLE',
+      io_change_arr     => io_change_arr
+    );
+    change_status_for_policies(
+      in_table_rec      => in_source_table_rec,
+      in_action         => 'ENABLE',
+      io_change_arr     => io_change_arr
+    );
+
+    
+    stop_timer;
+  END move_data;
+
+
+  -- rename tables, copy data, move references, copy comments, copy grants, reassign synonyms
+  PROCEDURE recreate_table(
+    in_data_source_rec  IN gt_data_source_rec,
+    io_source_table_rec IN OUT NOCOPY gt_table_rec,
+    io_target_table_rec IN OUT NOCOPY gt_table_rec,
+    io_change_arr       IN OUT NOCOPY gt_change_arr,
+    in_job_rec          IN cort_jobs%ROWTYPE
+  )
+  AS
+    l_change_arr      gt_change_arr;
+    l_old_change_rec  cort_objects%ROWTYPE;
+  BEGIN
+    start_timer;
+
+/*
+    IF g_params.data.get_value = 'PRELIMINARY_COPY' AND
+       NOT io_source_table_rec.is_table_empty AND
+       in_recreate_mode in (cort_comp_pkg.gc_result_recreate) THEN
+      create_sync_objects(
+        in_source_table_rec => io_source_table_rec,
+        in_target_table_rec => io_target_table_rec,
+        in_recreate_mode    => in_recreate_mode,
+        io_change_arr    => l_change_arr,
+        io_revert_sql_arr    => l_revert_sql_arr
+      );
+
+      copy_data(
+        in_source_table_rec => io_source_table_rec,
+        in_target_table_rec => io_target_table_rec,
+        in_recreate_mode    => in_recreate_mode,
+        in_filter_sql       => in_data_filter,
+        io_change_arr    => l_change_arr,
+        io_revert_sql_arr    => l_revert_sql_arr
+      );
+    END IF;
+*/
+
+    -- following changes are added to the queue
+    IF g_params.data.get_value = 'COPY' AND
+       (NOT io_source_table_rec.is_table_empty OR in_data_source_rec.data_source_sql IS NOT NULL) AND
+       in_data_source_rec.change_result in (cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_part_exchange, cort_comp_pkg.gc_result_create)
+    THEN
+      copy_data(
+        in_data_source_rec  => in_data_source_rec,
+        in_source_table_rec => io_source_table_rec,
+        in_target_table_rec => io_target_table_rec,
+        io_change_arr       => io_change_arr    
+      );
+    END IF;
+
+    IF (NOT io_source_table_rec.is_table_empty OR in_data_source_rec.data_source_sql IS NULL) AND
+       in_data_source_rec.change_result in (cort_comp_pkg.gc_result_exchange, cort_comp_pkg.gc_result_part_exchange)
+    THEN
+      -- add create swap table exchange partition and drop swap table statements into the queue
+      move_data(
+        in_source_table_rec => io_source_table_rec,
+        in_target_table_rec => io_target_table_rec,
+        in_recreate_mode    => in_data_source_rec.change_result,
+        io_change_arr       => io_change_arr
+      );
+    END IF;
+
+    apply_changes(
+      io_change_arr   => io_change_arr,
+      in_test         => g_run_params.test.get_bool_value,
+      in_act_on_error => 'RAISE'
+    );
+
+    copy_comments(
+      in_source_table_rec => io_source_table_rec,
+      in_target_table_rec => io_target_table_rec,
+      io_change_arr       => io_change_arr
+    );
+    cort_comp_pkg.copy_policies(
+      in_source_table_rec => io_source_table_rec,
+      in_target_table_rec => io_target_table_rec,
+      io_change_arr       => io_change_arr
+    );
+    IF g_params.references.get_value <> 'DROP' THEN
+      cort_comp_pkg.copy_references(
+        in_source_table_rec => io_source_table_rec,
+        io_target_table_rec => io_target_table_rec,
+        io_change_arr       => io_change_arr
+      );
+    END IF;
+
+    -- move depending objects ignoring errors
+    apply_changes(
+      io_change_arr    => io_change_arr,
+      in_test          => g_run_params.test.get_bool_value,
+      in_act_on_error  => 'SKIP'
+    );
+
+/*  We should keep triggers in case of preliminary_copy
+
+    -- if in build
+    IF g_run_params.build.get_value IS NOT NULL AND NOT g_run_params.test.get_bool_value THEN
+      cort_comp_pkg.drop_triggers(
+        in_table_rec        => io_source_table_rec,
+        io_change_arr   => l_change_arr
+      );
+      apply_changes(
+        io_change_arr => l_change_arr,
+        in_ignore_errors  => TRUE
+      );
+      -- register state for all existing triggers on current table
+      FOR i IN 1..io_source_table_rec.trigger_arr.COUNT LOOP
+        cort_aux_pkg.register_change(
+          in_object_owner   => io_source_table_rec.trigger_arr(i).owner,
+          in_object_name    => io_source_table_rec.trigger_arr(i).trigger_name,
+          in_object_type    => 'TRIGGER',
+          in_job_rec        => in_job_rec,
+          in_sql            => NULL,
+          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
+                                 in_object_owner   => io_source_table_rec.trigger_arr(i).owner,
+                                 in_object_name    => io_source_table_rec.trigger_arr(i).trigger_name,
+                                 in_object_type    => 'TRIGGER'
+                               ),
+          in_change_type    => cort_comp_pkg.gc_result_drop,
+          in_revert_name    => NULL,
+          in_last_ddl_index => NULL,
+          in_change_sql_arr => l_change_arr
+        );
+      END LOOP;
+    END IF;
+*/
+
+    IF g_params.data.get_value = 'PRELIMINARY_COPY' AND
+       (NOT io_source_table_rec.is_table_empty OR in_data_source_rec.data_source_sql IS NOT NULL)  AND
+       in_data_source_rec.change_result in (cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_part_exchange)
+    THEN
+      -- moving renaming sql into second part of the job.
+      NULL;
+    END IF;
+
+
+    l_old_change_rec := cort_aux_pkg.get_last_change(
+                          in_object_type  => 'TABLE',
+                          in_object_name  => io_source_table_rec.table_name,
+                          in_object_owner => io_source_table_rec.owner
+                        );
+
+
+    
+    -- Final 2 steps - renaming
+    -- place original name of recrating table into comment 
+    add_change(
+      io_change_arr, 
+      change_rec(
+        in_group_type => 'COMMENT TABLE',  
+        in_change_sql => 'COMMENT ON TABLE "'||io_source_table_rec.owner||'"."'||io_source_table_rec.table_name||'" IS Q''{'||io_source_table_rec.table_name||'}''',
+        in_revert_sql => 'COMMENT ON TABLE "'||io_source_table_rec.owner||'"."'||io_source_table_rec.table_name||'" IS Q''{'||io_source_table_rec.tab_comment||'}'''
+      )
+    );
+
+    -- rename existing (old) table and all depending objects and log groups to cort_name
+    rename_table_cascade(
+      io_table_rec   => io_source_table_rec,
+      in_rename_mode => 'TO_CORT',
+      io_change_arr  => io_change_arr
+    );
+
+    -- rename new table and all depending objects to actual names
+    rename_table_cascade(
+      io_table_rec   => io_target_table_rec,
+      in_rename_mode => 'TO_ORIGINAL',
+      io_change_arr  => io_change_arr
+    );
+
+    IF l_old_change_rec.release != g_run_params.release.get_value THEN
+      create_prev_synonym(
+        in_owner       => io_source_table_rec.rename_rec.object_owner,
+        in_table_name  => io_source_table_rec.rename_rec.object_name,
+        in_revert_name => io_source_table_rec.rename_rec.cort_name,        
+        io_change_arr  => io_change_arr
+      );
+    END IF;  
+ 
+    -- for CREATE AS SELECT FROM itself
+    -- check if selecting from recreating table
+    -- if yes source session will hold shared lock on this table and will not allow to rename the table.
+    -- so last 2 steps need to be done after release trigger's lock.
+    IF (in_data_source_rec.change_result = cort_comp_pkg.gc_result_cas_from_itself) AND NOT g_run_params.test.get_bool_value THEN
+      debug('CREATE AS SELECT FROM itself');
+
+      IF g_params.data.get_value != 'PRELIMINARY_COPY' THEN
+        -- Just output DDL commands without execution
+        display_changes(
+          io_change_sql_arr => io_change_arr,
+          in_test           => g_run_params.test.get_bool_value
+        );
+      END IF;
+
+      -- Terminate the waiting loop and set status to pending
+      IF NOT g_run_params.test.get_bool_value THEN
+        cort_job_pkg.suspend_job(
+          in_rec => in_job_rec
+        );
+        g_job_rec.sid := null;
+      END IF;
+      -- Continue execution in the backgrouond
+    END IF;
+
+    -- execute all changes in the queue
+    apply_changes(
+      io_change_arr => io_change_arr,
+      in_test       => g_run_params.test.get_bool_value
+    );
+
+    -- update current_name in rename_rec
+
+    -- deferred data copy
+
+    IF g_params.data.get_value = 'DEFERRED_COPY' AND
+       NOT io_source_table_rec.is_table_empty AND
+       in_data_source_rec.change_result in (cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_part_exchange, cort_comp_pkg.gc_result_create)
+    THEN
+      copy_data(
+        in_data_source_rec  => in_data_source_rec,
+        in_source_table_rec => io_source_table_rec,
+        in_target_table_rec => io_target_table_rec,
+        io_change_arr       => io_change_arr
+      );
+      
+      IF g_run_params.test.get_bool_value THEN
+        apply_changes(
+          io_change_arr => io_change_arr,
+          in_test       => TRUE
+        );
+      ELSE        
+        cort_aux_pkg.save_sql(io_change_arr);
+      END IF;  
+    END IF;
+
+    -- for CREATE AS SELECT FROM itself
+    IF (in_data_source_rec.change_result = cort_comp_pkg.gc_result_cas_from_itself) AND NOT g_run_params.test.get_bool_value THEN
+      -- resume pending job to complete it in main procedure
+      cort_job_pkg.complete_job(
+        in_rec => in_job_rec
+      );
+    END IF;
+
+
+    stop_timer;
+  END recreate_table;
+
+
+  PROCEDURE read_partition_source(
+    in_partition_source     IN CLOB,
+    out_part_source_tab_rec OUT NOCOPY gt_table_rec
+  )
+  AS
+    l_schema                VARCHAR2(128); 
+    l_table_name            VARCHAR2(128); 
+    l_part2                 VARCHAR2(128);
+    l_dblink                VARCHAR2(128); 
+    l_part1_type            VARCHAR2(128);
+    l_object_number         VARCHAR2(128);
+  BEGIN
+    IF in_partition_source IS NULL OR in_partition_source = '""' THEN 
+      RETURN;
+    END IF;
+    
+    start_timer;
+       
+    BEGIN
+      dbms_utility.name_resolve(
+        name          => in_partition_source, 
+        context       => 0,
+        schema        => l_schema, 
+        part1         => l_table_name, 
+        part2         => l_part2,
+        dblink        => l_dblink, 
+        part1_type    => l_part1_type, 
+        object_number => l_object_number
+      );
+    EXCEPTION
+      WHEN OTHERS THEN
+        raise_error('Invalid table name specified in partition_source param - in_partition_source'||chr(10)||sqlerrm);
+    END;
+
+    read_table(
+      in_table_name      => l_table_name,
+      in_owner           => l_schema,
+      in_read_data       => FALSE,
+      out_table_rec      => out_part_source_tab_rec
+    );
+    read_table_columns(
+      io_table_rec       => out_part_source_tab_rec
+    );
+    read_partitions(
+      io_table_rec       => out_part_source_tab_rec,
+      in_read_data       => FALSE
+    );
+    read_subpartitions(
+      io_table_rec       => out_part_source_tab_rec,
+      in_read_data       => FALSE
+    );
+
+    stop_timer;
+  END read_partition_source;
+
+  
+  FUNCTION get_data_source_rec(
+    in_sql_rec   IN cort_parse_pkg.gt_sql_rec
+  ) 
+  RETURN gt_data_source_rec 
+  AS
+    l_rec                    gt_data_source_rec;
+    l_prev_change_rec        cort_objects%ROWTYPE;
+    l_prev_change_params     cort_params_pkg.gt_params_rec;
+    l_data_values_obj        cort_param_value_obj;
+    l_data_source            VARCHAR2(32767);
+    l_sql                    CLOB;
+    l_column_name            VARCHAR2(32767);
+    l_data_value             VARCHAR2(32767);
+  BEGIN
+    IF g_params.change.get_value = 'ALWAYS' THEN
+      l_rec.change_result := cort_comp_pkg.gc_result_recreate;
+    ELSE  
+      l_rec.change_result := cort_comp_pkg.gc_result_nochange; 
+    END IF;
+    
+    CASE 
+    WHEN in_sql_rec.as_select_flag THEN
+      l_data_source := '('||in_sql_rec.as_select_sql||') '||g_params.alias.get_value;
+      check_data_source(l_data_source, 'AS SELECT');
+      
+      IF in_sql_rec.as_select_fromitself THEN
+        l_rec.change_result := cort_comp_pkg.gc_result_cas_from_itself;
+      ELSE
+        l_rec.change_result := cort_comp_pkg.gc_result_recreate_as_select;
+      END IF;
+    WHEN g_params.data_source.get_value IS NOT NULL THEN
+      l_data_source := '( '||chr(10)||g_params.data_source.get_value||chr(10)||' ) '||g_params.alias.get_value;
+      check_data_source(l_data_source, 'data_source');
+      l_rec.data_source_sql := l_data_source;
+
+      l_prev_change_rec := cort_aux_pkg.get_last_change(
+                            in_object_type  => in_sql_rec.object_type,
+                            in_object_name  => in_sql_rec.object_name,
+                            in_object_owner => in_sql_rec.object_owner
+                          );
+      IF l_prev_change_rec.change_params IS NOT NULL THEN 
+        cort_params_pkg.read_from_xml(l_prev_change_params, XMLTYPE(l_prev_change_rec.change_params));
+      END IF;
+
+      IF NVL(l_prev_change_params.data_source.get_value, '?') != g_params.data_source.get_value THEN
+        debug('Data source is not null so we need to recreate table...', g_params.data_source.get_value);
+        l_rec.change_result := cort_comp_pkg.gc_result_recreate;
+       
+        l_rec.column_arr := get_sql_columns(l_rec.data_source_sql);
+        FOR i IN 1..l_rec.column_arr.COUNT LOOP
+          l_rec.column_indx_arr(l_rec.column_arr(i).column_name) := i;
+        END LOOP;
+      END IF;  
+
+    WHEN g_params.data_filter.get_value IS NOT NULL THEN
+      l_data_source := '"'||in_sql_rec.object_owner||'"."'||in_sql_rec.object_name||'" '||g_params.alias.get_value||CHR(10)||g_params.data_filter.get_value;
+      check_data_source(l_data_source, 'data_filter');
+      l_rec.data_filter := g_params.data_filter.get_value;
+
+      l_prev_change_rec := cort_aux_pkg.get_last_change(
+                            in_object_type  => in_sql_rec.object_type,
+                            in_object_name  => in_sql_rec.object_name,
+                            in_object_owner => in_sql_rec.object_owner
+                          );
+      IF l_prev_change_rec.change_params IS NOT NULL THEN 
+        cort_params_pkg.read_from_xml(l_prev_change_params, XMLTYPE(l_prev_change_rec.change_params));
+      END IF;
+
+      IF NVL(l_prev_change_params.data_filter.get_value, '?') != g_params.data_filter.get_value THEN
+        debug('Data filter is not null so we need to recreate table...', g_params.data_filter.get_value);
+        l_rec.change_result := cort_comp_pkg.gc_result_recreate;
+      END IF;      
+    ELSE
+      l_data_source := '"'||in_sql_rec.object_owner||'"."'||in_sql_rec.object_name||'" '||g_params.alias.get_value;
+    END CASE;
+
+    l_data_values_obj := TREAT(g_params.data_values AS cort_param_value_obj);
+    FOR i IN 1..l_data_values_obj.key_array.COUNT LOOP 
+      l_column_name := get_canonical_name(l_data_values_obj.key_array(i));
+      l_data_value := l_data_values_obj.value_array(i);
+      l_sql := 'SELECT '||CASE WHEN l_data_value LIKE '=%' THEN SUBSTR(l_data_value, 2) ELSE l_data_value END||' FROM '||l_data_source;
+      IF is_sql_valid(l_sql) IS NULL THEN
+        debug('set data value for column '||l_column_name||' = '||l_data_value);
+        l_rec.data_values(l_column_name) := l_data_value;
+        -- if there is at least one param with forced data value then we need to recreate table
+        IF SUBSTR(l_data_value, 1, 1) = '=' AND l_rec.change_result = cort_comp_pkg.gc_result_nochange THEN
+          l_rec.change_result := cort_comp_pkg.gc_result_recreate;
+        END IF;  
+      ELSE
+        cort_log_pkg.warning('Invalid data value for column '||l_column_name||': '||l_data_value, l_sql);
+      END IF;
+    END LOOP;
+    
+    -- read explicitly specified partitions source table
+    IF g_params.partitions_source.get_value <> '"' THEN
+      read_partition_source(g_params.partitions_source.get_value, l_rec.part_source_tab_rec);
+      IF cort_comp_pkg.comp_partitioning(l_rec.part_source_tab_rec, in_sql_rec) <> 0 THEN
+        raise_error('Partitions source has different type of partitioning: '||l_rec.part_source_tab_rec.partitioning_type||', target table partitioning: '||in_sql_rec.partitioning_type);
+      END IF;       
+    END IF; 
+
+    RETURN l_rec;
+  END get_data_source_rec;
+
 
 
   -- find indexes used for PK/UK and set contsraint_name property for them
   PROCEDURE mark_pk_uk_indexes(
-    io_source_table_rec IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec
+    io_source_table_rec IN OUT NOCOPY gt_table_rec,
+    in_target_table_rec IN gt_table_rec
   )
   AS
     l_indx       PLS_INTEGER;
-    l_index_name VARCHAR2(65);
+    l_index_name arrays.gt_full_name;
   BEGIN
     -- find renaming columns
     FOR i IN 1..in_target_table_rec.index_arr.COUNT LOOP
@@ -5416,79 +6372,176 @@ end;';
 
   -- find renaming columns and set new_column_name property for them
   PROCEDURE find_renaming_columns(
-    io_source_table_rec IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    in_target_table_rec IN cort_exec_pkg.gt_table_rec
+    io_source_table_rec IN OUT NOCOPY gt_table_rec,
+    in_target_table_rec IN gt_table_rec,
+    in_data_source_rec  IN gt_data_source_rec
   )
   AS
-    l_cort_value  VARCHAR2(32767);
-    l_name1       VARCHAR2(4000);
-    l_name2       VARCHAR2(4000);
-    l_name3       VARCHAR2(4000);
-    l_name4       VARCHAR2(4000);
-    l_col_name    arrays.gt_name;
-    l_pos         PLS_INTEGER;
+    l_data_value              VARCHAR2(32767);
+    l_name1                   VARCHAR2(4000);
+    l_name2                   VARCHAR2(4000);
+    l_name3                   VARCHAR2(4000);
+    l_name4                   VARCHAR2(4000);
+    l_col_name                arrays.gt_name;
+    l_pos                     PLS_INTEGER;
+    l_add_column_arr          arrays.gt_int_arr;
+    l_indx                    PLS_INTEGER;
   BEGIN
     -- find renaming columns
     FOR i IN 1..in_target_table_rec.column_arr.COUNT LOOP
-      IF in_target_table_rec.column_arr(i).cort_value IS NOT NULL THEN
-        l_cort_value := TRIM(in_target_table_rec.column_arr(i).cort_value);
+      IF in_data_source_rec.data_values.exists(in_target_table_rec.column_arr(i).column_name) THEN
+        l_data_value := TRIM(in_data_source_rec.data_values(in_target_table_rec.column_arr(i).column_name));
+        IF SUBSTR(l_data_value, 1, 1) != '=' THEN
+          l_name1 := NULL;
+          l_name2 := NULL;
+          l_name3 := NULL;
+          l_name4 := NULL;
+          l_pos   := NULL;
 
-        l_name1 := NULL;
-        l_name2 := NULL;
-        l_name3 := NULL;
-        l_name4 := NULL;
-        l_pos   := NULL;
+          BEGIN
+            dbms_utility.name_tokenize(l_data_value, l_name1, l_name2, l_name3, l_name4, l_pos);
+          EXCEPTION
+            WHEN OTHERS THEN
+              CONTINUE;
+          END;
 
-        BEGIN
-          dbms_utility.name_tokenize(l_cort_value, l_name1, l_name2, l_name3, l_name4, l_pos);
-        EXCEPTION
-          WHEN OTHERS THEN
-            NULL;
-        END;
+          IF l_pos = LENGTH(l_data_value) THEN
+            IF l_name1 = io_source_table_rec.owner AND
+               l_name2 = io_source_table_rec.table_name AND 
+               l_name3 IS NOT NULL
+            THEN
+              l_col_name := l_name3;
+            ELSIF l_name2 IS NOT NULL AND
+                  (l_name1 = io_source_table_rec.table_name OR
+                   l_name1 = g_params.alias.get_value) 
+            THEN
+              l_col_name := l_name2;
+            ELSE
+              l_col_name := l_name1;
+            END IF;
 
-        IF l_pos = LENGTH(l_cort_value) THEN
+ 
+            IF in_target_table_rec.column_indx_arr.EXISTS(l_col_name) THEN
+              l_indx := in_target_table_rec.column_indx_arr(l_col_name);
+              IF in_target_table_rec.column_arr(l_indx).segment_column_id IS NULL THEN
+                l_indx := NULL;
+              END IF; 
+            ELSE
+              l_indx := NULL; 
+            END IF;  
 
-          IF l_name1 = io_source_table_rec.owner AND
-             l_name2 = io_source_table_rec.table_name
-          THEN
-            l_col_name := l_name3;
-          ELSIF l_name1 = io_source_table_rec.table_name OR
-                l_name1 = g_params.alias.get_value
-          THEN
-            l_col_name := l_name2;
-          ELSE
-            l_col_name := l_name1;
-          END IF;
-
-          IF io_source_table_rec.column_indx_arr.EXISTS(l_col_name) AND
-             NOT in_target_table_rec.column_indx_arr.EXISTS(l_col_name)
-          THEN
-            l_pos := io_source_table_rec.column_indx_arr(l_col_name);
-            io_source_table_rec.column_arr(l_pos).new_column_name := in_target_table_rec.column_arr(i).column_name;
-            -- update reference by name
-            io_source_table_rec.column_indx_arr.DELETE(l_col_name);
-            io_source_table_rec.column_indx_arr(io_source_table_rec.column_arr(l_pos).new_column_name) := l_pos;
-            debug('Column '||io_source_table_rec.column_arr(l_pos).column_name||': new column name = '||io_source_table_rec.column_arr(l_pos).new_column_name);
-          END IF;
-
+            IF io_source_table_rec.column_indx_arr.EXISTS(l_col_name) AND
+               l_indx IS NULL 
+            THEN
+              l_indx := io_source_table_rec.column_indx_arr(l_col_name);
+              io_source_table_rec.column_arr(l_indx).new_column_name := in_target_table_rec.column_arr(i).column_name;
+              -- update reference by name
+              io_source_table_rec.column_indx_arr.DELETE(l_col_name);
+              io_source_table_rec.column_indx_arr(io_source_table_rec.column_arr(l_indx).new_column_name) := l_indx;
+              debug('Explicit renaming column '||l_col_name||': new column name = '||io_source_table_rec.column_arr(l_indx).new_column_name);
+            END IF;
+            
+          END IF;  
         END IF;
+      ELSE
+        -- find added new segment columns
+        IF in_target_table_rec.column_arr(i).virtual_column = 'NO' AND
+           (in_target_table_rec.column_arr(i).hidden_column = 'NO' OR in_target_table_rec.column_arr(i).user_generated = 'YES') AND
+           NOT io_source_table_rec.column_indx_arr.EXISTS(in_target_table_rec.column_arr(i).column_name) 
+        THEN
+          -- new segment column
+          l_add_column_arr(i) := in_target_table_rec.column_arr(i).segment_column_id; 
+        END IF;   
       END IF;
+      
     END LOOP;
+    
+    -- [Smart rename]
+    -- find removed segment columns
+    -- loop through source columsn to find removed columns
+    FOR i IN 1..io_source_table_rec.column_arr.COUNT LOOP
+      l_col_name := io_source_table_rec.column_arr(i).column_name;
+      
+      
+      IF in_target_table_rec.column_indx_arr.EXISTS(l_col_name) THEN
+        l_indx := in_target_table_rec.column_indx_arr(l_col_name);
+        IF in_target_table_rec.column_arr(l_indx).virtual_column = 'YES' THEN
+          -- ignore if column is virtual
+          l_indx := NULL; 
+        END IF;
+      ELSE
+        l_indx := NULL;
+      END IF;  
+      
+       
+      IF io_source_table_rec.column_arr(i).virtual_column = 'NO' AND
+         io_source_table_rec.column_arr(i).user_generated = 'YES' AND 
+         io_source_table_rec.column_arr(i).new_column_name IS NULL AND -- has not renamed explicitly
+         l_indx IS NULL --and not found in new table
+      THEN
+        debug('column '||l_col_name||' not found in target table');
+        -- check if this is invisible user column
+        IF io_source_table_rec.column_arr(i).hidden_column = 'YES' AND
+           io_source_table_rec.column_arr(i).user_generated = 'YES' AND
+           g_params.compare.exist('IGNORE_INVISIBLE')
+        THEN
+          -- do nothing
+          NULL;
+        ELSIF io_source_table_rec.column_arr(i).unused_flag AND
+           g_params.compare.exist('IGNORE_UNUSED')
+        THEN
+          -- do nothing for hidden columns
+          NULL;
+        ELSE
+          -- this column needs to be dropped
+          -- so check if it is in the list of added columns
+          l_indx := l_add_column_arr.FIRST;
+          WHILE l_indx IS NOT NULL LOOP
+            IF NOT in_data_source_rec.data_values.EXISTS(in_target_table_rec.column_arr(i).column_name) AND
+               cort_comp_pkg.comp_value(
+                 io_source_table_rec.column_arr(i).segment_column_id,
+                 in_target_table_rec.column_arr(l_indx).segment_column_id
+               ) = 0 AND
+               cort_comp_pkg.comp_data_type(
+                 in_source_column_rec => io_source_table_rec.column_arr(i),
+                 in_target_column_rec => in_target_table_rec.column_arr(l_indx)
+               ) = 0 AND
+               cort_comp_pkg.comp_value(
+                 in_val1 => io_source_table_rec.column_arr(i).data_default,
+                 in_val2 => in_target_table_rec.column_arr(l_indx).data_default
+                ) = 0
+            THEN
+               -- column is get renamed
+               io_source_table_rec.column_arr(i).new_column_name := in_target_table_rec.column_arr(l_indx).column_name;
+               -- update reference by name
+               io_source_table_rec.column_indx_arr.DELETE(l_col_name);
+               io_source_table_rec.column_indx_arr(io_source_table_rec.column_arr(l_indx).new_column_name) := i;
+               l_add_column_arr.DELETE(l_indx);
+
+               debug('Smart renaming column '||l_col_name||': new column name = '||in_target_table_rec.column_arr(l_indx).column_name);
+               EXIT;
+            END IF;
+            l_indx := l_add_column_arr.NEXT(l_indx);
+          END LOOP;
+
+        END IF;        
+      END IF; 
+        
+    END LOOP;    
+
   END find_renaming_columns;
 
   -- compare tables
   FUNCTION comp_tables(
-    io_source_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    io_target_table_rec     IN OUT NOCOPY cort_exec_pkg.gt_table_rec,
-    io_frwd_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr, -- forward alter statements
-    io_rlbk_alter_stmt_arr  IN OUT NOCOPY arrays.gt_clob_arr  -- rollback alter statements
+    io_source_table_rec IN OUT NOCOPY gt_table_rec,
+    io_target_table_rec IN OUT NOCOPY gt_table_rec,
+    io_change_arr       IN OUT NOCOPY gt_change_arr
   )
   RETURN PLS_INTEGER
   AS
     l_result               PLS_INTEGER;
     l_comp_result          PLS_INTEGER;
     l_stop_vaue            PLS_INTEGER;
-    l_comp_partitions      BOOLEAN;
   BEGIN
     start_timer;
 
@@ -5499,40 +6552,22 @@ end;';
       l_stop_vaue := cort_comp_pkg.gc_result_exchange;
     END IF;
 
-    -- If teher is at least one force value then always recreate table
-    FOR i IN 1..io_target_table_rec.column_arr.COUNT LOOP
-      IF io_target_table_rec.column_arr(i).cort_value IS NOT NULL AND
-         io_target_table_rec.column_arr(i).cort_value_force
-      THEN
-        debug('There is force cort-value - recreate');
-        l_result := cort_comp_pkg.gc_result_recreate;
-        EXIT;
-      END IF;
-    END LOOP;
-
+    change_status_for_policies(
+      in_table_rec  => io_source_table_rec,
+      in_action     => 'DISABLE',
+      io_change_arr => io_change_arr
+    );
+          
     debug('Compare start - '||l_result);
-    -- compare table attributes
-    IF l_result < l_stop_vaue THEN
-      -- compare main table attributes
-      l_result := cort_comp_pkg.comp_tables(
-                    in_source_table_rec    => io_source_table_rec,
-                    in_target_table_rec    => io_target_table_rec,
-                    io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                    io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
-                  );
-      debug('Compare table attributes - '||l_result);
-    END IF;
-
     -- if table attributes are the same then compare columns
     IF (l_result < l_stop_vaue) OR
        (io_source_table_rec.partitioned = 'YES' AND io_target_table_rec.partitioned = 'YES')
     THEN
       -- compare columns
       l_comp_result := cort_comp_pkg.comp_table_columns(
-                         io_source_table_rec    => io_source_table_rec,
-                         io_target_table_rec    => io_target_table_rec,
-                         io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                         io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+                         io_source_table_rec => io_source_table_rec,
+                         io_target_table_rec => io_target_table_rec,
+                         io_change_arr       => io_change_arr
                        );
       debug('Compare columns - '||l_comp_result);
       l_result := GREATEST(l_result, l_comp_result);
@@ -5546,13 +6581,24 @@ end;';
       l_result := GREATEST(l_result, l_comp_result);
     END IF;
 
+    -- compare table attributes
+    IF l_result < l_stop_vaue THEN
+      -- compare main table attributes
+      l_comp_result := cort_comp_pkg.comp_tables(
+                         in_source_table_rec => io_source_table_rec,
+                         in_target_table_rec => io_target_table_rec,
+                         io_change_arr       => io_change_arr
+                       );
+      debug('Compare table attributes - '||l_comp_result);
+      l_result := GREATEST(l_result, l_comp_result);
+    END IF;
+
     -- constraints
     IF l_result < l_stop_vaue THEN
       l_comp_result := cort_comp_pkg.comp_constraints(
-                         io_source_table_rec      => io_source_table_rec,
-                         io_target_table_rec      => io_target_table_rec,
-                         io_frwd_alter_stmt_arr   => io_frwd_alter_stmt_arr,
-                         io_rlbk_alter_stmt_arr   => io_rlbk_alter_stmt_arr
+                         io_source_table_rec => io_source_table_rec,
+                         io_target_table_rec => io_target_table_rec,
+                         io_change_arr       => io_change_arr
                        );
       debug('Compare constraints - '||l_comp_result);
       l_result := GREATEST(l_result, l_comp_result);
@@ -5561,53 +6607,38 @@ end;';
     IF l_result < l_stop_vaue THEN
 
       l_comp_result := cort_comp_pkg.comp_log_groups(
-                         io_source_table_rec      => io_source_table_rec,
-                         io_target_table_rec      => io_target_table_rec,
-                         io_frwd_alter_stmt_arr   => io_frwd_alter_stmt_arr,
-                         io_rlbk_alter_stmt_arr   => io_rlbk_alter_stmt_arr
+                         io_source_table_rec => io_source_table_rec,
+                         io_target_table_rec => io_target_table_rec,
+                         io_change_arr       => io_change_arr
                        );
       debug('Compare logging groups - '||l_comp_result);
       l_result := GREATEST(l_result, l_comp_result);
     END IF;
-    -- lobs
-    IF l_result < l_stop_vaue THEN
 
-      l_comp_result := cort_comp_pkg.comp_lobs(
-                         in_source_table_rec    => io_source_table_rec,
-                         in_target_table_rec    => io_target_table_rec,
-                         io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                         io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
+    IF io_target_table_rec.partitioning_type IS NOT NULL AND 
+       cort_comp_pkg.comp_partitioning(io_source_table_rec, io_target_table_rec) = 0 
+    THEN 
+      l_comp_result := cort_comp_pkg.comp_partitions(
+                         io_source_table_rec     => io_source_table_rec,
+                         io_target_table_rec     => io_target_table_rec,
+                         io_source_partition_arr => io_source_table_rec.partition_arr,
+                         io_target_partition_arr => io_target_table_rec.partition_arr,
+                         io_change_arr           => io_change_arr
                        );
-      debug('Compare lobs - '||l_comp_result);
-      l_result := GREATEST(l_result, l_comp_result);
-    END IF;
-    -- xml columns
-    IF l_result < l_stop_vaue THEN
-
-      l_comp_result := cort_comp_pkg.comp_xml_columns(
-                         in_source_table_rec    => io_source_table_rec,
-                         in_target_table_rec    => io_target_table_rec,
-                         io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                         io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
-                       );
-      debug('Compare xml cols - '||l_comp_result);
-      l_result := GREATEST(l_result, l_comp_result);
-    END IF;
-    -- xml columns
-    IF l_result < l_stop_vaue THEN
-
-      l_comp_result := cort_comp_pkg.comp_varray_columns(
-                         in_source_table_rec    => io_source_table_rec,
-                         in_target_table_rec    => io_target_table_rec,
-                         io_frwd_alter_stmt_arr => io_frwd_alter_stmt_arr,
-                         io_rlbk_alter_stmt_arr => io_rlbk_alter_stmt_arr
-                       );
-      debug('Compare varray cols - '||l_comp_result);
+      debug('Compare partitions - '||l_comp_result);
       l_result := GREATEST(l_result, l_comp_result);
     END IF;
 
-    debug('Compare result - '||l_result);
 
+    change_status_for_policies(
+      in_table_rec  => io_source_table_rec,
+      in_action     => 'ENABLE',
+      io_change_arr => io_change_arr
+    );
+
+   debug('Compare result - '||l_result);
+
+ 
     stop_timer;
 
     RETURN l_result;
@@ -5632,7 +6663,7 @@ end;';
     -- obtain table lock
     l_sql := 'LOCK TABLE "'||in_owner||'"."'||in_table_name||'" IN EXCLUSIVE MODE NOWAIT';
     BEGIN
-      execute_immediate(l_sql, NULL);
+      execute_immediate(l_sql, FALSE);
       l_result := TRUE;
     EXCEPTION
       WHEN e_table_not_found THEN
@@ -5644,7 +6675,7 @@ end;';
           in_table_name   => in_table_name,
           in_owner        => in_owner,
           in_echo         => TRUE,
-          in_test         => g_params.test.get_bool_value
+          in_test         => g_run_params.test.get_bool_value
         );
         l_result := FALSE;
     END;
@@ -5679,890 +6710,358 @@ end;';
     RETURN l_result;
   END check_locked_table;
 
-  PROCEDURE backup_table(
-    in_table_name    IN VARCHAR2,
-    in_table_owner   IN VARCHAR2,
-    in_sql_rec       IN cort_parse_pkg.gt_sql_rec,
-    io_frwd_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr,
-    io_rlbk_stmt_arr IN OUT NOCOPY arrays.gt_clob_arr
-  )
-  AS
-    l_source_table_rec  gt_table_rec;
-    l_target_table_rec  gt_table_rec;
-  BEGIN
-    start_timer;
-    -- read table attributes
-    read_table_cascade(
-      in_table_name => in_table_name,
-      in_owner      => in_table_owner,
-      in_read_data  => g_params.data.get_value <> 'NONE',
-      out_table_rec => l_source_table_rec
-    );
-    -- create temp table with the same structure
-    cort_comp_pkg.create_clone_table_sql(
-      in_table_rec       => l_source_table_rec,
-      in_simple_mode     => TRUE,
-      io_frwd_stmt_arr   => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr   => io_rlbk_stmt_arr
-    );
-    l_target_table_rec := l_source_table_rec;
-    l_target_table_rec.rename_rec.current_name := l_source_table_rec.rename_rec.temp_name;
-
-    IF g_params.data.get_value <> 'NONE' AND
-       NOT l_source_table_rec.is_table_empty
-    THEN
-      copy_data(
-        in_source_table_rec => l_source_table_rec,
-        in_target_table_rec => l_target_table_rec,
-        in_recreate_mode    => cort_comp_pkg.gc_result_recreate,
-        in_filter_sql       => in_sql_rec.data_filter,
-        io_frwd_stmt_arr    => io_frwd_stmt_arr,
-        io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-      );
-    END IF;
-    copy_privileges(
-      io_source_table_rec => l_source_table_rec,
-      io_target_table_rec => l_target_table_rec,
-      io_frwd_stmt_arr    => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr    => io_rlbk_stmt_arr
-    );
-    cort_comp_pkg.add_stmt(
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr,
-      in_frwd_stmt     => get_drop_table_ddl(
-                            in_table_name => in_table_name,
-                            in_owner      => in_table_owner
-                          ),
-      in_rlbk_stmt     => NULL
-    );
-
-    cort_comp_pkg.rename_object(
-      in_rename_mode   => 'TO_ORIGINAL',
-      io_rename_rec    => l_target_table_rec.rename_rec,
-      io_frwd_stmt_arr => io_frwd_stmt_arr,
-      io_rlbk_stmt_arr => io_rlbk_stmt_arr
-    );
-    -- remove rollback renaming
-    io_rlbk_stmt_arr(io_rlbk_stmt_arr.COUNT) := NULL;
-
-    stop_timer;
-  END backup_table;
-
-  PROCEDURE read_data_source(
-    in_data_source          IN CLOB,
-    out_data_source_tab_rec OUT NOCOPY gt_table_rec
-  )
-  AS
-    l_sql                  CLOB;
-    l_rowid                ROWID;
-    l_object_id            NUMBER;
-    l_table_owner          arrays.gt_name;
-    l_table_name           arrays.gt_name;
-  BEGIN
-    --l_data_source_sql_rec := cort_parse_pkg.parse_sql(io_sql_rec.data_source);
-    --cort_parse_pkg.find_data_source_table
-
-    -- check if custom data source is key-preserve table
-    -- to do that we try to select rowid for any row from this data set. If it is returned then it is key preserved. Otherwise it will raise an exception
-    l_sql := '
-    SELECT /*+ first_rows */ rowid as row_id
-      FROM ('||in_data_source||')
-     WHERE ROWNUM = 1';
-
-    cort_log_pkg.execute(
-      in_text      => l_sql
-    );
-    BEGIN
-      EXECUTE IMMEDIATE l_sql INTO l_rowid;
-    EXCEPTION
-      WHEN OTHERS THEN
-        cort_log_pkg.update_exec_time;
-        cort_log_pkg.error('Error in parsing/executing data source sql',l_sql);
-        l_rowid := NULL;
-    END;
-    cort_log_pkg.update_exec_time;
-
-    -- if rowid is returned then we can identify table name by it
-    IF l_rowid IS NOT NULL THEN
-      l_object_id := dbms_rowid.rowid_object(l_rowid);
-      SELECT owner, object_name
-        INTO l_table_owner, l_table_name
-        FROM all_objects
-       WHERE object_id = l_object_id;
-
-       read_table(
-         in_table_name      => l_table_name,
-         in_owner           => l_table_owner,
-         in_read_data       => FALSE,
-         out_table_rec      => out_data_source_tab_rec
-       );
-       read_partitions(
-         io_table_rec       => out_data_source_tab_rec,
-         in_read_data       => FALSE
-       );
-       read_subpartitions(
-         io_table_rec       => out_data_source_tab_rec,
-         in_read_data       => FALSE
-       );
-    END IF;
-
-  END read_data_source;
-
-  FUNCTION get_partitions_sql(
-    in_old_table_rec         IN gt_table_rec,
-    in_new_table_rec         IN gt_table_rec
-  )
-  RETURN CLOB
-  AS
-    l_partitions_sql        CLOB;
-    l_src_part_table_rec    gt_table_rec;  
-    l_schema                VARCHAR2(128); 
-    l_table_name            VARCHAR2(128); 
-    l_part2                 VARCHAR2(128);
-    l_dblink                VARCHAR2(128); 
-    l_part1_type            VARCHAR2(128);
-    l_object_number         VARCHAR2(128);
-  BEGIN
-    IF g_params.partitions_source.get_value IS NULL THEN -- copy from the object 
-      IF cort_comp_pkg.comp_partitioning(in_old_table_rec, in_new_table_rec) = 0 THEN
-        IF g_params.copy_subpartitions.get_bool_value AND in_old_table_rec.subpartitioning_type <> 'NONE' AND l_src_part_table_rec.subpartitioning_type <> 'NONE' THEN 
-          IF cort_comp_pkg.comp_subpartitioning(in_old_table_rec, l_src_part_table_rec) = 0 THEN
-            -- generate SQL for partitions definitions from source table
-            l_partitions_sql := cort_comp_pkg.get_partitions_sql(
-                                  in_partition_arr    => in_old_table_rec.partition_arr,
-                                  in_subpartition_arr => in_old_table_rec.subpartition_arr 
-                                );
-           ELSE
-             debug('New table has different type of subpartitioning - '||in_new_table_rec.subpartitioning_type);
-           END IF;                 
-        ELSE
-          l_partitions_sql := cort_comp_pkg.get_partitions_sql(
-                                in_partition_arr    => in_old_table_rec.partition_arr,
-                                in_subpartition_arr => l_src_part_table_rec.subpartition_arr -- <- empty collection
-                              );
-        
-        END IF;
-      ELSE
-        debug('New table has different type of partitioning - '||in_new_table_rec.partitioning_type);  
-      END IF;                    
-    ELSIF g_params.partitions_source.get_value <> '""' THEN
-      -- parsing source object name. If it is invalid the exception will be raised 
-      BEGIN
-        dbms_utility.name_resolve(
-          name          => g_params.partitions_source.get_value, 
-          context       => 0,
-          schema        => l_schema, 
-          part1         => l_table_name, 
-          part2         => l_part2,
-          dblink        => l_dblink, 
-          part1_type    => l_part1_type, 
-          object_number => l_object_number
-        );
-      EXCEPTION
-        WHEN OTHERS THEN
-          raise_error('Invalid table name specified in partition_source param'||chr(10)||sqlerrm);
-      END;
-      read_table(
-        in_table_name => l_table_name,
-        in_owner      => l_schema,
-        in_read_data  => FALSE,
-        out_table_rec => l_src_part_table_rec
-      );
-      read_table_columns(
-        io_table_rec => l_src_part_table_rec
-      );
-      -- read source partitions
-      IF cort_comp_pkg.comp_partitioning(in_new_table_rec, l_src_part_table_rec, FALSE) = 0 THEN
-        -- check that all partition key columns data types are matching
-        read_partitions(l_src_part_table_rec, FALSE);
-        IF g_params.copy_subpartitions.get_bool_value AND in_new_table_rec.subpartitioning_type <> 'NONE' AND l_src_part_table_rec.subpartitioning_type <> 'NONE' THEN 
-          IF cort_comp_pkg.comp_subpartitioning(in_new_table_rec, l_src_part_table_rec, FALSE) = 0 THEN 
-            debug('Replace subpartitions: g_params.copy_subpartitions = TRUE');
-            -- read source subpartitions
-            read_subpartitions(l_src_part_table_rec, FALSE);
-          ELSE
-            debug('partition source '||g_params.partitions_source.get_value||' has different type of subpartitioning - '||l_src_part_table_rec.subpartitioning_type);
-          END IF;    
-        END IF;
-      ELSE
-        raise_error('partition source '||g_params.partitions_source.get_value||' has different type of partitioning - '||l_src_part_table_rec.partitioning_type);  
-      END IF;  
-             
-      -- generate SQL for partitions definitions from another table
-      l_partitions_sql := cort_comp_pkg.get_partitions_sql(
-                            in_partition_arr    => l_src_part_table_rec.partition_arr,
-                            in_subpartition_arr => l_src_part_table_rec.subpartition_arr
-                          );
-                 
-    END IF;
-    
-    debug('l_partitions_sql = '||l_partitions_sql);
-   
-    RETURN l_partitions_sql;  
-   
-  END get_partitions_sql;
-  
   -- create or replace table
   PROCEDURE create_or_replace_table(
     in_job_rec       IN cort_jobs%ROWTYPE,
     io_sql_rec       IN OUT NOCOPY cort_parse_pkg.gt_sql_rec
   )
   AS
-    l_new_sql_rec          cort_parse_pkg.gt_sql_rec;
-    l_new_sql              CLOB;
-    l_partitions_sql       CLOB;
-
-    l_old_table_rec        gt_table_rec;
-    l_new_table_rec        gt_table_rec;
-    l_subpart_arr          gt_partition_arr;
-
-    l_create_ddl_arr       arrays.gt_clob_arr;
-    l_drop_ddl_arr         arrays.gt_clob_arr;
-
-    l_frwd_alter_stmt_arr  arrays.gt_clob_arr;
-    l_rlbk_alter_stmt_arr  arrays.gt_clob_arr;
-
-    l_result               PLS_INTEGER;
-
-    l_xml                  XMLTYPE;
-
-    l_revert_name          arrays.gt_name;
-    l_last_ddl_index       PLS_INTEGER;
-
-    l_index_sql_arr        cort_parse_pkg.gt_sql_arr;
-    l_index_sql_rec        cort_parse_pkg.gt_sql_rec;
-    l_index_rec            gt_index_rec;
-
-    l_data_source_sql_rec  cort_parse_pkg.gt_sql_rec;
-    l_data_source_tab_rec  gt_table_rec;
-
-    l_comp_partitions      BOOLEAN;
-    l_comp_result          PLS_INTEGER;
-    l_policy_arr           gt_policy_arr;
+    l_old_table_rec          gt_table_rec;
+    l_new_table_rec          gt_table_rec;
+    l_recreate_arr           gt_change_arr;
+    l_alter_arr              gt_change_arr;
+    l_comp_result            PLS_INTEGER;
+    l_data_source_rec        gt_data_source_rec;
+    l_index_sql_arr          cort_parse_pkg.gt_sql_arr;
+    l_index_rec              gt_index_rec;
   BEGIN
-    -- read exsting policies
-    read_table_policies(
-      in_table_name  => in_job_rec.object_name,
-      in_owner       => in_job_rec.object_owner,
-      out_policy_arr => l_policy_arr
+    cort_job_pkg.update_change_params(
+      in_rec           => in_job_rec,
+      in_change_params => cort_params_pkg.write_to_xml(g_params)
+    );
+    
+    l_data_source_rec := get_data_source_rec(io_sql_rec);
+
+    cort_parse_pkg.parse_table_indexes(
+      in_sql_rec    => io_sql_rec,
+      out_sql_arr   => l_index_sql_arr 
+    );
+ 
+    -- try to obtain exclusive lock
+    IF lock_table(
+         in_table_name  => in_job_rec.object_name,
+         in_owner       => in_job_rec.object_owner
+       )
+    THEN
+      -- read table attributes
+      read_table_cascade(
+        in_table_name => in_job_rec.object_name,
+        in_owner      => in_job_rec.object_owner,
+        in_read_data  => TRUE,
+        in_debug_text => 'OLD_TABLE_REC',
+        out_table_rec => l_old_table_rec
+      );
+
+      -- return scripts for create SQL with renamed objects,substituted partitions and indices  
+      cort_parse_pkg.modify_partition_sql(
+        in_source_table_rec    => CASE WHEN l_data_source_rec.part_source_tab_rec.table_name IS NULL AND io_sql_rec.partitions_count = 1 AND l_old_table_rec.partition_arr.COUNT > 0 AND g_params.partitions_source.get_value IS NULL 
+                                    THEN l_old_table_rec
+                                    ELSE l_data_source_rec.part_source_tab_rec
+                                  END,
+        io_sql_rec             => io_sql_rec 
+      );
+
+
+      -- modify original SQL - replace original names with temp ones.
+      cort_parse_pkg.replace_table_names(
+        in_table_rec => l_old_table_rec,
+        io_sql_rec   => io_sql_rec
+      );
+      
+      debug('Modified SQL with temp names', io_sql_rec.original_sql);
+
+      FOR i in 1..l_index_sql_arr.COUNT LOOP
+        l_index_rec.owner := l_index_sql_arr(i).object_owner;
+        l_index_rec.index_name := l_index_sql_arr(i).object_name;
+        l_index_rec.rename_rec := get_rename_rec(
+                                    in_object_name  => l_index_sql_arr(i).object_name, 
+                                    in_object_owner => l_index_sql_arr(i).object_owner,
+                                    in_object_type  => 'INDEX'
+                                  );
+        debug('Index original DDL', l_index_sql_arr(i).original_sql);
+        cort_parse_pkg.replace_index_names(
+          in_table_rec => l_old_table_rec,
+          in_index_rec => l_index_rec,
+          io_sql_rec   => l_index_sql_arr(i)
+        );
+      END LOOP;   
+      
+    ELSE
+      -- table does not exists. create table
+      
+      cort_parse_pkg.replace_type_synonyms(
+        io_sql_rec    => io_sql_rec
+      );
+
+      l_old_table_rec.rename_rec.temp_name := io_sql_rec.object_name;
+      
+      IF l_data_source_rec.change_result = cort_comp_pkg.gc_result_recreate_as_select THEN
+        l_data_source_rec.change_result := cort_comp_pkg.gc_result_create_as_select;
+      ELSE
+        l_data_source_rec.change_result := cort_comp_pkg.gc_result_create;
+      END IF;
+      
+      -- return scripts for create SQL with renamed objects,substituted partitions and indices  
+      cort_parse_pkg.modify_partition_sql(
+        in_source_table_rec    => l_data_source_rec.part_source_tab_rec,
+        io_sql_rec             => io_sql_rec 
+      );
+      debug('Modified SQL with temp names', io_sql_rec.original_sql);
+    END IF;
+    
+    -- created table
+    add_change(
+      l_recreate_arr,
+      change_rec(
+        in_change_sql => io_sql_rec.original_sql,
+        in_revert_sql => cort_comp_pkg.get_drop_table_ddl(
+                           in_table_name => l_old_table_rec.rename_rec.temp_name,
+                           in_owner      => io_sql_rec.object_owner
+                         ),
+        in_group_type => 'RECREATE TABLE'  
+      )
+    );
+    
+    -- comment table (only if recreate)
+    IF l_old_table_rec.table_name IS NOT NULL THEN
+      add_change(
+        l_recreate_arr, 
+        change_rec(
+          in_change_sql => 'COMMENT ON TABLE "'||l_old_table_rec.owner||'"."'||l_old_table_rec.rename_rec.temp_name||'" IS Q''{CORT temp table for table '||l_old_table_rec.table_name||'}''',
+          in_group_type => 'RECREATE TABLE'
+        )
+      );
+    END IF;  
+
+    -- create indexes
+    FOR i in 1..l_index_sql_arr.COUNT LOOP
+      add_change(
+        l_recreate_arr,
+        change_rec(
+          in_change_sql => l_index_sql_arr(i).original_sql,
+          in_group_type => 'RECREATE TABLE'  
+        )
+      );
+    END LOOP;   
+              
+
+    $IF dbms_db_version.version >= 12 OR dbms_db_version.ver_le_11_2 $THEN
+--          IF NOT g_params.tablespace.is_empty THEN
+    execute_immediate('ALTER SESSION SET DEFERRED_SEGMENT_CREATION=TRUE', NULL);
+--          END IF;
+    $END
+
+    execute_immediate('ALTER SESSION SET SKIP_UNUSABLE_INDEXES = TRUE', NULL);
+
+    -- execute changes without displaying
+    apply_changes(
+      io_change_arr => l_recreate_arr,
+      in_echo       => FALSE
     );
 
     BEGIN
-      -- disable existing policies
-      enable_policies(
-        in_policy_arr => l_policy_arr,
-        in_enable     => false
+      -- read new table attributes
+      read_table_cascade(
+        in_table_name => l_old_table_rec.rename_rec.temp_name,
+        in_owner      => io_sql_rec.object_owner,
+        in_read_data  => FALSE,
+        in_debug_text => 'NEW_TABLE_REC',
+        out_table_rec => l_new_table_rec
       );
-
-      -- try to obtain exclusive lock
-      IF lock_table(
-           in_table_name  => in_job_rec.object_name,
-           in_owner       => in_job_rec.object_owner
-         )
-      THEN
-        -- read table attributes
-        read_table_cascade(
-          in_table_name => in_job_rec.object_name,
-          in_owner      => in_job_rec.object_owner,
-          in_read_data  => TRUE,
-          out_table_rec => l_old_table_rec
+          
+      IF l_old_table_rec.table_name IS NOT NULL THEN
+        copy_table_privileges(
+          in_source_table_rec => l_old_table_rec,
+          io_target_table_rec => l_new_table_rec,
+          io_change_arr       => l_recreate_arr
         );
-        l_old_table_rec.policy_arr := l_policy_arr;
 
-        IF g_params.debug.get_bool_value THEN
-          -- convert table rec into XML
-          cort_xml_pkg.write_to_xml(
-            in_value => l_old_table_rec,
-            out_xml  => l_xml
-          );
+        -- execute changes without displaying to copy privileges
+        apply_changes(
+          io_change_arr => l_recreate_arr,
+          in_echo       => FALSE
+        );
 
-          -- log source table rec
-          cort_log_pkg.debug(
-            in_text     => 'OLD_TABLE_REC',
-            in_details  => l_xml.getClobVal()
-          );
+        -- mark all indexes explicitly used for PK/UK constraints
+        mark_pk_uk_indexes(
+          io_source_table_rec    => l_old_table_rec,
+          in_target_table_rec    => l_new_table_rec
+        );
+
+        -- find columns to rename
+        find_renaming_columns(
+          io_source_table_rec    => l_old_table_rec,
+          in_target_table_rec    => l_new_table_rec,
+          in_data_source_rec     => l_data_source_rec
+        );
+
+
+        -- compare tables
+        IF l_data_source_rec.change_result = cort_comp_pkg.gc_result_nochange THEN
+
+          l_comp_result := comp_tables(
+                             io_source_table_rec => l_old_table_rec,
+                             io_target_table_rec => l_new_table_rec,
+                             io_change_arr       => l_alter_arr
+                           );
+          l_data_source_rec.change_result := GREATEST(l_data_source_rec.change_result, l_comp_result);
         END IF;
-
-        -- modify original SQL - replace original names with temp ones.
-        cort_parse_pkg.replace_names(
-          in_table_rec => l_old_table_rec,
-          io_sql_rec   => io_sql_rec,
-          out_sql      => l_new_sql
-        );
-
-        l_new_sql_rec := cort_parse_pkg.parse_sql(l_new_sql);
-
-        -- parse modified sql
-        cort_parse_pkg.parse_table_sql(
-          io_sql_rec    => l_new_sql_rec,
-          in_table_name => l_old_table_rec.rename_rec.temp_name,
-          in_owner_name => in_job_rec.object_owner
-        );
-
-        -- search and parse "AS SELECT" section
-        cort_parse_pkg.parse_as_select(
-          io_sql_rec => l_new_sql_rec
-        );
-
-        $IF dbms_db_version.version >= 12 OR dbms_db_version.ver_le_11_2 $THEN
-          IF NOT g_params.tablespace.is_empty THEN
-            execute_immediate('ALTER SESSION SET DEFERRED_SEGMENT_CREATION=TRUE', NULL);
-          END IF;
-        $END
-
-        -- save DDL into array before any modification for TEST mode in case of CREATE AS SELECT
-        l_create_ddl_arr(1) := l_new_sql_rec.original_sql;
-        -- save DROP table sql for revert in case go ahead with this change
-        l_drop_ddl_arr(1)   := get_drop_table_ddl(
-                                 in_table_name => l_old_table_rec.rename_rec.temp_name,
-                                 in_owner      => l_old_table_rec.owner
-                               );
-
-        -- if "CREATE AS SELECT"  and test mode enabled
-        IF l_new_sql_rec.as_select_flag AND g_params.test.get_bool_value THEN
-          -- save original SQL for display
-          -- modify sql: make subquery return 0 rows
-          cort_parse_pkg.modify_as_select(
-            io_sql_rec  => l_new_sql_rec
-          );
-        END IF;
-
-        -- Finds index declarations in cort comments
-        cort_parse_pkg.get_cort_indexes(
-          in_sql_rec   => l_new_sql_rec,
-          in_job_rec   => in_job_rec,
-          out_sql_arr  => l_index_sql_arr
-        );
-
-        -- execute modified sql
-        execute_immediate(
-          in_sql  => l_new_sql_rec.original_sql,
-          in_echo => FALSE
-        );
-
-        l_new_sql := null;
-        IF l_index_sql_arr IS NOT NULL THEN
-          start_timer;
-          FOR i IN 1..l_index_sql_arr.COUNT LOOP
-            l_index_sql_rec := l_index_sql_arr(i);
-            -- modify original SQL - replace original names with temp ones.
-            l_index_rec.owner := l_index_sql_rec.object_owner;
-            l_index_rec.index_name := l_index_sql_rec.object_name;
-            l_index_rec.rename_rec.temp_name := get_object_temp_name(
-                                                   in_object_type => 'INDEX',
-                                                   in_owner       => l_index_sql_rec.object_owner,
-                                                   in_prefix      => cort_params_pkg.gc_temp_prefix
-                                                 );
-            debug('Index original DDL', l_index_sql_rec.original_sql);
-
-            cort_parse_pkg.replace_names(
-              in_table_rec => l_old_table_rec,
-              in_index_rec => l_index_rec,
-              io_sql_rec   => l_index_sql_rec,
-              out_sql      => l_new_sql
-            );
-
-            execute_immediate(
-              in_sql  => l_new_sql,
-              in_echo => FALSE
-            );
-
-            cort_comp_pkg.add_stmt(
-              io_frwd_stmt_arr => l_create_ddl_arr,
-              io_rlbk_stmt_arr => l_drop_ddl_arr,
-              in_frwd_stmt     => l_new_sql,
-              in_rlbk_stmt     => get_drop_index_ddl(
-                                     in_index_name => l_index_rec.rename_rec.temp_name,
-                                     in_owner      => l_index_rec.owner
-                                   )
-            );
-          END LOOP;
-          stop_timer;
-        END IF;
-
-        l_last_ddl_index := l_create_ddl_arr.COUNT;
-
-        BEGIN
-          -- read new table attributes
-          read_table_cascade(
-            in_table_name => l_old_table_rec.rename_rec.temp_name,
-            in_owner      => in_job_rec.object_owner,
-            in_read_data  => FALSE,
-            out_table_rec => l_new_table_rec
-          );
-
-          -- Comment temp table
-          cort_comp_pkg.add_stmt(
-            io_frwd_stmt_arr => l_create_ddl_arr,
-            io_rlbk_stmt_arr => l_drop_ddl_arr,
-            in_frwd_stmt     => 'COMMENT ON TABLE "'||l_new_table_rec.owner||'"."'||l_new_table_rec.table_name||'" IS Q''{CORT temp table for table '||l_old_table_rec.table_name||'}''',
-            in_rlbk_stmt     => null
-          );
-          IF g_params.keep_objects.value_exists('PRIVILEGES') THEN
-            copy_privileges(
-              io_source_table_rec => l_old_table_rec,
-              io_target_table_rec => l_new_table_rec,
-              io_frwd_stmt_arr    => l_create_ddl_arr,
-              io_rlbk_stmt_arr    => l_drop_ddl_arr
-            );
-          END IF;
-
-          -- execute changes without displaying
-          apply_changes(
-            in_frwd_alter_stmt_arr => l_create_ddl_arr,
-            in_rlbk_alter_stmt_arr => l_drop_ddl_arr,
-            io_last_ddl_index      => l_last_ddl_index,
-            in_echo                => FALSE
-          );
-
-          -- assign column cort_values
-          cort_parse_pkg.parse_columns(
-            io_sql_rec    => l_new_sql_rec,
-            io_table_rec  => l_new_table_rec
-          );
-
-          -- find valid cort values
-          check_cort_values(
-            io_sql_rec       => io_sql_rec,
-            io_new_table_rec => l_new_table_rec,
-            in_old_table_rec => l_old_table_rec
-          );
-
-          IF g_params.debug.get_bool_value THEN
-            -- convert target table recinto XML
-            cort_xml_pkg.write_to_xml(
-              in_value => l_new_table_rec,
-              out_xml  => l_xml
-            );
-
-            -- log target table rec
-            cort_log_pkg.debug(
-              in_text     => 'NEW_TABLE_REC',
-              in_details  => l_xml.getClobVal()
-            );
-          END IF;
-
-          -- mark all check constraints implicitly created from NOT NULL column constraint
-          mark_notnull_constraints(
-            io_constraint_arr => l_old_table_rec.constraint_arr,
-            io_column_arr     => l_old_table_rec.column_arr
-          );
-          --
-          mark_notnull_constraints(
-            io_constraint_arr => l_new_table_rec.constraint_arr,
-            io_column_arr     => l_new_table_rec.column_arr
-          );
-
-          -- mark all indexes explicitly used for PK/UK constraints
-          mark_pk_uk_indexes(
-            io_source_table_rec    => l_old_table_rec,
-            in_target_table_rec    => l_new_table_rec
-          );
-
-          -- find columns to rename
-          find_renaming_columns(
-            io_source_table_rec    => l_old_table_rec,
-            in_target_table_rec    => l_new_table_rec
-          );
-
-          l_result := cort_comp_pkg.gc_result_nochange;
-
-          IF g_params.change.get_value = 'ALWAYS' THEN
-            l_result := cort_comp_pkg.gc_result_recreate;
-          ELSIF l_new_sql_rec.as_select_flag THEN
-            IF cort_parse_pkg.as_select_from(l_new_sql_rec, l_old_table_rec.table_name) THEN
-              l_result := cort_comp_pkg.gc_result_cas_from_itself;
-            ELSE
-              l_result := cort_comp_pkg.gc_result_create_as_select;
-            END IF;
-            debug('Create as select change type = '||l_result);
-          ELSE
-            -- compare tables
-            l_result := cort_comp_pkg.gc_result_nochange;
-
-            l_result := comp_tables(
-                          io_source_table_rec    => l_old_table_rec,
-                          io_target_table_rec    => l_new_table_rec,
-                          io_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
-                          io_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr
-                        );
-          END IF;
-
-          debug('partitions_source = '||g_params.partitions_source.get_value);
-
-          IF l_new_table_rec.partitioned = 'YES' AND l_new_table_rec.partition_arr.count = 1 AND 
-             (g_params.partitions_source.get_value IS NULL  -- NULL identify copying existing partitions 
-             OR 
-             g_params.partitions_source.get_value <> '""')  -- "" disables copying partitions. Other values identify table name where partitions need to be copied from 
-          THEN
-            IF l_result > cort_comp_pkg.gc_result_alter_move THEN
-              debug('Need to retreive partitions');
-
-              -- need to replace partitions
-              l_partitions_sql := get_partitions_sql(
-                                    in_old_table_rec    => l_old_table_rec,
-                                    in_new_table_rec    => l_new_table_rec
-                                  );
-
-               debug('l_partitions_sql = '||l_partitions_sql);
-              -- compare partitions
-              IF l_partitions_sql IS NOT NULL THEN
-                -- drop temp table
-                execute_immediate(
-                  in_sql  => l_drop_ddl_arr(1),
-                  in_echo => FALSE
-                );
-                -- parse partitioning types, positions
-                cort_parse_pkg.parse_partitioning(
-                  io_sql_rec => l_new_sql_rec
-                );
-                -- replace partitions
-                cort_parse_pkg.replace_partitions_sql(
-                  io_sql_rec       => l_new_sql_rec,
-                  in_partition_sql => l_partitions_sql
-                );
-                -- replace DDL
-                l_create_ddl_arr(1) := l_new_sql_rec.original_sql;
-
-                -- reapply all changes: recraete table, comments policies and indexes
-                apply_changes(
-                  in_frwd_alter_stmt_arr => l_create_ddl_arr,
-                  in_rlbk_alter_stmt_arr => l_drop_ddl_arr,
-                  in_echo                => FALSE
-                );
-                -- read partitions
-                read_partitions(l_new_table_rec, FALSE);
-                -- read subpartitions
-                read_subpartitions(l_new_table_rec, FALSE);
-                l_comp_partitions := FALSE;    
-              ELSE
-                l_comp_partitions := TRUE;    
-              END IF;
-            ELSE
-              l_comp_partitions := FALSE;    
-            END IF;
-          ELSE
-            l_comp_partitions := l_new_table_rec.partitioned = 'YES';    
-          END IF;    
-            
-          IF l_comp_partitions THEN
-            -- Need to run even if we use keep_partitions to match all partitions to ech other
-            l_comp_result := cort_comp_pkg.comp_partitions(
-                               io_source_table_rec     => l_old_table_rec,
-                               io_target_table_rec     => l_new_table_rec,
-                               io_source_partition_arr => l_old_table_rec.partition_arr,
-                               io_target_partition_arr => l_new_table_rec.partition_arr,
-                               io_frwd_alter_stmt_arr  => l_frwd_alter_stmt_arr,
-                               io_rlbk_alter_stmt_arr  => l_rlbk_alter_stmt_arr
-                             );
-          ELSE
-            l_comp_result := 0;
-          END IF;
-          debug('Compare partitions - '||l_comp_result);
-          l_result := GREATEST(l_result, l_comp_result);
-
-          IF io_sql_rec.data_filter IS NOT NULL THEN
-            debug('Data filter is not null so we need to recreate table...');
-            l_result := cort_comp_pkg.gc_result_recreate;
-          END IF;
-
-          IF l_result = cort_comp_pkg.gc_result_part_exchange AND g_params.data.get_value = 'PRELIMINARY_COPY' THEN
-            l_result := cort_comp_pkg.gc_result_recreate;
-          END IF;
-
-          IF l_result IN (cort_comp_pkg.gc_result_nochange, cort_comp_pkg.gc_result_alter, cort_comp_pkg.gc_result_alter_move) THEN
-            -- Start compare indexes
-            debug('Compare indexes...');
-            IF cort_comp_pkg.comp_indexes(
-                 in_source_table_rec    => l_old_table_rec,
-                 in_target_table_rec    => l_new_table_rec,
-                 io_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
-                 io_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr
-               ) <> cort_comp_pkg.gc_result_nochange
-            THEN
-              l_result := cort_comp_pkg.gc_result_alter;
-            END IF;
-          END IF;
-
-          -- reset temp comment
-          execute_immediate(
-            in_sql  => 'COMMENT ON TABLE "'||l_new_table_rec.owner||'"."'||l_new_table_rec.table_name||'" IS Q''{}''',
-            in_echo => FALSE
-          );
-
-        EXCEPTION
-          WHEN OTHERS THEN
-            cort_log_pkg.error('Error. Rolling back...');
-            -- drop temp objects
-            apply_changes_ignore_errors(
-              io_stmt_arr => l_drop_ddl_arr,
-              in_echo     => FALSE,
-              in_reverse  => TRUE
-            );
-            RAISE;
-        END;
-
-        debug('Change type as result of comparison = '||cort_comp_pkg.get_result_name(l_result));
 
         CASE g_params.change.get_value
-          WHEN 'ALWAYS' THEN
-            l_result := cort_comp_pkg.gc_result_recreate;
           WHEN 'RECREATE' THEN
-            IF l_result > cort_comp_pkg.gc_result_nochange THEN
-              l_result := cort_comp_pkg.gc_result_recreate;
+            IF l_data_source_rec.change_result > cort_comp_pkg.gc_result_nochange THEN
+              l_data_source_rec.change_result := cort_comp_pkg.gc_result_recreate;
             END IF;
           WHEN 'ALTER' THEN
-            IF l_result > cort_comp_pkg.gc_result_alter_move THEN
+            IF l_data_source_rec.change_result > cort_comp_pkg.gc_result_alter_move THEN
               raise_error('Changes could not be applied without table recreation');
             END IF;
           ELSE
             NULL;
         END CASE;
 
-        debug('Change type after applying change param = '||cort_comp_pkg.get_result_name(l_result));
-
-        BEGIN
-          CASE
-          WHEN l_result = cort_comp_pkg.gc_result_nochange THEN
-            debug('No changes ... ');
-
-            -- drop temp objects
-            apply_changes_ignore_errors(
-              io_stmt_arr => l_drop_ddl_arr,
-              in_echo     => FALSE,
-              in_reverse  => TRUE
-            );
-
-          WHEN l_result IN (cort_comp_pkg.gc_result_alter, cort_comp_pkg.gc_result_alter_move) THEN
-            debug('Do alters ... change type = '||cort_comp_pkg.get_result_name(l_result));
-
-            -- drop temp objects
-            apply_changes_ignore_errors(
-              io_stmt_arr => l_drop_ddl_arr,
-              in_echo     => FALSE,
-              in_reverse  => TRUE
-            );
-
-            -- altering existing table
-            apply_changes(
-              in_frwd_alter_stmt_arr => l_frwd_alter_stmt_arr,
-              in_rlbk_alter_stmt_arr => l_rlbk_alter_stmt_arr,
-              in_test                => g_params.test.get_bool_value
-            );
-
-            IF NOT g_params.test.get_bool_value THEN
-              cort_aux_pkg.register_change(
-                in_object_owner   => in_job_rec.object_owner,
-                in_object_type    => in_job_rec.object_type,
-                in_object_name    => in_job_rec.object_name,
-                in_job_rec        => in_job_rec,
-                in_sql            => in_job_rec.sql_text,
-                in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                                       in_object_owner   => in_job_rec.object_owner,
-                                       in_object_name    => in_job_rec.object_name,
-                                       in_object_type    => in_job_rec.object_type
-                                     ),
-                in_change_type    => l_result,
-                in_revert_name    => NULL,
-                in_last_ddl_index => l_frwd_alter_stmt_arr.COUNT,
-                in_frwd_stmt_arr  => l_frwd_alter_stmt_arr,
-                in_rlbk_stmt_arr  => l_rlbk_alter_stmt_arr
-              );
-            ELSE  
-              cort_log_pkg.echo('== REVERT DDL ==');
-              FOR i IN REVERSE 1..l_rlbk_alter_stmt_arr.COUNT LOOP
-                cort_log_pkg.echo(
-                  in_text => l_rlbk_alter_stmt_arr(i)
-                );
-                cort_log_pkg.revert(
-                  in_text => l_rlbk_alter_stmt_arr(i)
-                );
-              END LOOP;
-            END IF;
-
-          WHEN l_result IN (cort_comp_pkg.gc_result_exchange, cort_comp_pkg.gc_result_part_exchange, cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_create_as_select, cort_comp_pkg.gc_result_cas_from_itself) THEN
-            debug('Do recreate ... change type = '||cort_comp_pkg.get_result_name(l_result));
-
-            IF io_sql_rec.data_source IS NOT NULL THEN
-              read_data_source(io_sql_rec.data_source, l_data_source_tab_rec);
-            END IF;
-
-            -- drop previous revert table
-            l_revert_name := cort_aux_pkg.get_last_revert_name(
-                                in_object_owner => in_job_rec.object_owner,
-                                in_object_type  => 'TABLE',
-                                in_object_name  => in_job_rec.object_name
-                              );
-            exec_drop_table(
-              in_table_name => l_revert_name,
-              in_owner      => in_job_rec.object_owner,
-              in_test       => g_params.test.get_bool_value
-            );
-
-            -- display all already applied CREATE DDL (without execution)
-            apply_changes(
-              in_frwd_alter_stmt_arr => l_create_ddl_arr,
-              in_rlbk_alter_stmt_arr => l_drop_ddl_arr,
-              in_echo                => TRUE,
-              in_test                => TRUE
-            );
-
-            -- Move data and depending objects and rename temp and original tables
-            recreate_table(
-              io_source_table_rec => l_old_table_rec,
-              io_target_table_rec => l_new_table_rec,
-              io_frwd_stmt_arr    => l_create_ddl_arr,
-              io_rlbk_stmt_arr    => l_drop_ddl_arr,
-              in_job_rec          => in_job_rec,
-              in_data_filter      => io_sql_rec.data_filter,
-              in_recreate_mode    => l_result,
-              out_last_ddl_index  => l_last_ddl_index
-            );
-
-            enable_policies(
-              in_policy_arr => l_policy_arr
-            );
-
-            l_revert_name := l_old_table_rec.rename_rec.cort_name;
-
-            IF NOT g_params.test.get_bool_value THEN
-              cort_aux_pkg.register_change(
-                in_object_owner   => in_job_rec.object_owner,
-                in_object_type    => in_job_rec.object_type,
-                in_object_name    => in_job_rec.object_name,
-                in_job_rec        => in_job_rec,
-                in_sql            => in_job_rec.sql_text,
-                in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                                       in_object_owner   => in_job_rec.object_owner,
-                                       in_object_name    => in_job_rec.object_name,
-                                       in_object_type    => in_job_rec.object_type
-                                     ),
-                in_change_type    => l_result,
-                in_revert_name    => l_revert_name,
-                in_last_ddl_index => l_last_ddl_index,
-                in_frwd_stmt_arr  => l_create_ddl_arr,
-                in_rlbk_stmt_arr  => l_drop_ddl_arr
-              );
-
-              IF g_params.data.get_value = 'DEFERRED_COPY' AND
-                 NOT l_old_table_rec.is_table_empty AND
-                 l_result in (cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_part_exchange)
-              THEN
-                cort_job_pkg.suspend_job(
-                  in_rec => in_job_rec
-                );
-              END IF;
-
-            ELSE
-              cort_log_pkg.echo('== REVERT DDL ==');
-              FOR i IN REVERSE 1..l_drop_ddl_arr.COUNT LOOP
-                cort_log_pkg.echo(
-                  in_text => l_drop_ddl_arr(i)
-                );
-                cort_log_pkg.revert(
-                  in_text => l_drop_ddl_arr(i)
-                );
-              END LOOP;
-              -- drop temp table
-              execute_immediate(
-                in_sql  => l_drop_ddl_arr(1),
-                in_echo => FALSE
-              );
-            END IF;
-          END CASE;
-
-        EXCEPTION
-          WHEN OTHERS THEN
-            cort_log_pkg.error('Error. Rolling back...');
-            -- drop temp table
-            exec_drop_table(
-              in_table_name => l_old_table_rec.rename_rec.temp_name,
-              in_owner      => l_old_table_rec.owner,
-              in_echo       => FALSE
-            );
-            RAISE;
-        END;
-
-      ELSE
-        -- Finds index declarations in cort comments
-        cort_parse_pkg.get_cort_indexes(
-          in_sql_rec   => io_sql_rec,
-          in_job_rec   => in_job_rec,
-          out_sql_arr  => l_index_sql_arr
-        );
-
-              -- search and parse "AS SELECT" section
-        cort_parse_pkg.parse_as_select(
-          io_sql_rec => io_sql_rec
-        );
-
-        -- Table does not exist.
-        -- Just execute SQL as is
-        l_create_ddl_arr(1) := in_job_rec.sql_text;
-        l_drop_ddl_arr(1)   := get_drop_table_ddl(
-                                 in_table_name => in_job_rec.object_name,
-                                 in_owner      => in_job_rec.object_owner
-                               );
-
-        IF l_index_sql_arr IS NOT NULL THEN
-          FOR i IN 1..l_index_sql_arr.COUNT LOOP
-            l_create_ddl_arr(l_create_ddl_arr.COUNT+1) := l_index_sql_arr(i).original_sql;
-            l_drop_ddl_arr(l_drop_ddl_arr.COUNT+1) := get_drop_index_ddl(
-                                                         in_index_name => l_index_sql_arr(i).object_name,
-                                                         in_owner      => l_index_sql_arr(i).object_owner
-                                                       );
-          END LOOP;
+        IF l_data_source_rec.change_result = cort_comp_pkg.gc_result_part_exchange AND g_params.data.get_value = 'PRELIMINARY_COPY' THEN
+          l_data_source_rec.change_result := cort_comp_pkg.gc_result_recreate;
         END IF;
 
-        -- table doesn't exist. Create it as is.
-        apply_changes(
-          in_frwd_alter_stmt_arr => l_create_ddl_arr,
-          in_rlbk_alter_stmt_arr => l_drop_ddl_arr,
-          in_test                => g_params.test.get_bool_value
-        );
-
-        IF NOT g_params.test.get_bool_value THEN
-          -- register table
-          cort_aux_pkg.register_change(
-            in_object_owner   => in_job_rec.object_owner,
-            in_object_type    => in_job_rec.object_type,
-            in_object_name    => in_job_rec.object_name,
-            in_job_rec        => in_job_rec,
-            in_sql            => in_job_rec.sql_text,
-            in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                                   in_object_owner   => in_job_rec.object_owner,
-                                   in_object_name    => in_job_rec.object_name,
-                                   in_object_type    => in_job_rec.object_type
-                                 ),
-            in_change_type    => case when io_sql_rec.as_select_flag then cort_comp_pkg.gc_result_create_as_select else cort_comp_pkg.gc_result_create end,
-            in_revert_name    => NULL,
-            in_last_ddl_index => l_create_ddl_arr.COUNT,
-            in_frwd_stmt_arr  => l_create_ddl_arr,
-            in_rlbk_stmt_arr  => l_drop_ddl_arr
-          );
-        ELSE
-          cort_log_pkg.echo('== REVERT DDL ==');
-          FOR i IN REVERSE 1..l_drop_ddl_arr.COUNT LOOP
-                cort_log_pkg.echo(
-                  in_text => l_drop_ddl_arr(i)
-                );
-                cort_log_pkg.revert(
-                  in_text => l_drop_ddl_arr(i)
-                );
-          END LOOP;
+        debug('Change type after checking change param/data_filter/data_source = '||cort_comp_pkg.get_result_name(l_data_source_rec.change_result));
+            
+        IF l_data_source_rec.change_result IN (cort_comp_pkg.gc_result_nochange, cort_comp_pkg.gc_result_alter, cort_comp_pkg.gc_result_alter_move) THEN
+          -- Start compare indexes
+          l_comp_result := cort_comp_pkg.comp_indexes(
+                             in_source_table_rec  => l_old_table_rec,
+                             in_target_table_rec  => l_new_table_rec,
+                             io_change_arr        => l_alter_arr
+                           );
+          IF l_comp_result > 0 THEN 
+            l_data_source_rec.change_result := GREATEST(l_data_source_rec.change_result, cort_comp_pkg.gc_result_alter);
+          END IF;  
         END IF;
-      END IF;
+      END IF;  
 
-      enable_policies(l_policy_arr);
-
-      cort_session_pkg.enable;
-
-      COMMIT; -- release table lock
     EXCEPTION
       WHEN OTHERS THEN
-        enable_policies(l_policy_arr);
+        cort_log_pkg.error('Error. Rolling back...');
+        -- drop temp table
+        revert_changes(
+          io_change_arr => l_recreate_arr,
+          in_echo       => FALSE
+        );
         RAISE;
     END;
+
+    CASE
+    WHEN l_data_source_rec.change_result = cort_comp_pkg.gc_result_nochange THEN
+      debug('No changes ... ');
+
+      -- drop temp objects
+      revert_changes(
+        io_change_arr => l_recreate_arr,
+        in_echo       => FALSE
+      );
+
+    WHEN l_data_source_rec.change_result IN (cort_comp_pkg.gc_result_alter, cort_comp_pkg.gc_result_alter_move) THEN
+      debug('Do alters ... change type = '||cort_comp_pkg.get_result_name(l_data_source_rec.change_result));
+
+      -- drop temp objects
+      revert_changes(
+        io_change_arr => l_recreate_arr,
+        in_echo       => FALSE
+      );
+
+      -- altering existing table
+      apply_changes(              
+        io_change_arr => l_alter_arr,
+        in_test       => g_run_params.test.get_bool_value
+      );
+
+    WHEN l_data_source_rec.change_result IN (cort_comp_pkg.gc_result_exchange, cort_comp_pkg.gc_result_part_exchange, cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_recreate_as_select, cort_comp_pkg.gc_result_cas_from_itself) THEN
+      debug('Do recreate ... change type = '||cort_comp_pkg.get_result_name(l_data_source_rec.change_result));
+
+      -- display all already applied CREATE DDL (without execution)
+      display_changes(
+        io_change_sql_arr => l_recreate_arr,
+        in_test           => g_run_params.test.get_bool_value
+      );
+      
+      -- Move data and depending objects and rename temp and original tables
+      recreate_table(
+        in_data_source_rec  => l_data_source_rec, 
+        io_source_table_rec => l_old_table_rec,
+        io_target_table_rec => l_new_table_rec,
+        io_change_arr       => l_recreate_arr,
+        in_job_rec          => in_job_rec
+      );
+
+      -- if in test mode  
+      IF g_run_params.test.get_bool_value THEN
+        -- drop temp table
+        revert_changes(
+          io_change_arr => l_recreate_arr,
+          in_echo       => FALSE
+        );
+      END IF;
+    
+    WHEN l_data_source_rec.change_result IN (cort_comp_pkg.gc_result_create, cort_comp_pkg.gc_result_create_as_select) THEN
+      debug('Do create ... change type = '||cort_comp_pkg.get_result_name(l_data_source_rec.change_result));
+
+      -- display all already applied CREATE DDL (without execution)
+      display_changes(
+        io_change_sql_arr => l_recreate_arr,
+        in_test           => g_run_params.test.get_bool_value
+      );
+        
+      IF l_data_source_rec.data_source_sql IS NOT NULL THEN
+        copy_data(
+          in_data_source_rec  => l_data_source_rec,
+          in_source_table_rec => l_old_table_rec,
+          in_target_table_rec => l_new_table_rec,
+          io_change_arr       => l_recreate_arr
+        );  
+        
+        -- altering existing table
+        apply_changes(              
+          io_change_arr => l_recreate_arr,
+          in_test       => g_run_params.test.get_bool_value
+        );
+      END IF;
+        
+      -- if in test mode  
+      IF g_run_params.test.get_bool_value THEN
+        -- drop temp table
+        revert_changes(
+          io_change_arr => l_recreate_arr,
+          in_echo       => FALSE
+        );
+      END IF;
+
+    ELSE -- case
+      -- drop temp table
+      revert_changes(
+        io_change_arr => l_recreate_arr,
+        in_echo       => FALSE
+      );
+      raise_error('Unexpected compare result type = '||l_data_source_rec.change_result);
+    END CASE;
+
+    IF NOT g_run_params.test.get_bool_value THEN
+      cort_aux_pkg.register_change(
+        in_job_rec        => in_job_rec,
+        in_change_type    => l_data_source_rec.change_result,
+        in_revert_name    => case when l_data_source_rec.change_result NOT IN (cort_comp_pkg.gc_result_nochange, cort_comp_pkg.gc_result_alter, cort_comp_pkg.gc_result_alter_move) THEN l_old_table_rec.rename_rec.cort_name END
+      );
+
+      IF g_params.data.get_value = 'DEFERRED_COPY' AND
+         NOT l_old_table_rec.is_table_empty AND
+         l_data_source_rec.change_result in (cort_comp_pkg.gc_result_recreate, cort_comp_pkg.gc_result_part_exchange, cort_comp_pkg.gc_result_create_as_select)
+      THEN
+        cort_job_pkg.suspend_job(
+          in_rec => in_job_rec
+        );
+      END IF;
+    END IF;
+
+    COMMIT; -- release table lock
   END create_or_replace_table;
 
   -- Create or replace sequence
@@ -6571,19 +7070,14 @@ end;';
     io_sql_rec       IN OUT NOCOPY cort_parse_pkg.gt_sql_rec
   )
   AS
-    l_new_sql              CLOB;
-
     l_old_sequence_rec     gt_sequence_rec;
     l_new_sequence_rec     gt_sequence_rec;
 
-    l_frwd_stmt_arr        arrays.gt_clob_arr;
-    l_rlbk_stmt_arr        arrays.gt_clob_arr;
+    l_recreate_arr         gt_change_arr;
+    l_alter_arr            gt_change_arr;
 
     l_result               PLS_INTEGER;
   BEGIN
-    -- disable CORT trigger for current session
-    cort_session_pkg.disable;
-
     -- read sequence attributes
     read_sequence(
       in_sequence_name => in_job_rec.object_name,
@@ -6592,23 +7086,28 @@ end;';
     );
     IF l_old_sequence_rec.sequence_name IS NOT NULL THEN
 
-      read_privileges(
-        in_owner         => l_old_sequence_rec.owner,
-        in_table_name    => l_old_sequence_rec.sequence_name,
-        io_privilege_arr => l_old_sequence_rec.privilege_arr
-      );
-
-      l_new_sql := in_job_rec.sql_text;
-
       -- modify original SQL - replace original names with temp ones.
-      cort_parse_pkg.replace_names(
-        in_sequence_rec => l_old_sequence_rec,
-        io_sql_rec      => io_sql_rec,
-        out_sql         => l_new_sql
+      cort_parse_pkg.replace_seq_names(
+        in_rename_rec => l_old_sequence_rec.rename_rec,
+        io_sql_rec    => io_sql_rec
       );
+
+      l_recreate_arr(1) := 
+        change_rec(
+          in_change_sql => io_sql_rec.original_sql,
+          in_revert_sql => cort_comp_pkg.get_drop_sequence_ddl(
+                             in_sequence_name => l_old_sequence_rec.rename_rec.temp_name,
+                             in_owner         => l_old_sequence_rec.owner
+                           ), 
+          in_group_type => 'RECREATE SEQUENCE'  
+        );
 
       -- execute original sql with replaces names
-      execute_immediate(l_new_sql, FALSE);
+      apply_changes(
+        io_change_arr => l_recreate_arr,
+        in_echo       => FALSE
+      );
+
 
       l_result := cort_comp_pkg.gc_result_nochange;
 
@@ -6620,32 +7119,33 @@ end;';
           out_sequence_rec => l_new_sequence_rec
         );
 
+        copy_sequence_privileges(
+          in_source_sequence_rec => l_old_sequence_rec,
+          io_target_sequence_rec => l_new_sequence_rec,
+          io_change_arr          => l_recreate_arr
+        );
+
         -- compare sequences
         l_result := cort_comp_pkg.comp_sequences(
                       in_source_sequence_rec => l_old_sequence_rec,
                       in_target_sequence_rec => l_new_sequence_rec,
-                      io_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-                      io_rlbk_alter_stmt_arr => l_rlbk_stmt_arr
+                      io_change_arr          => l_alter_arr
                     );
       EXCEPTION
         WHEN OTHERS THEN
-          cort_log_pkg.error('Error. Rolling back...');
-          -- drop temp sequence
-          exec_drop_object(
-            in_object_type  => 'SEQUENCE',
-            in_object_name  => l_new_sequence_rec.rename_rec.current_name,
-            in_object_owner => l_new_sequence_rec.owner,
-            in_echo         => TRUE
+          cort_log_pkg.error('Error. Reverting back...');
+          -- drop temp objects
+          revert_changes(
+            io_change_arr => l_recreate_arr,
+            in_echo       => FALSE
           );
           RAISE;
       END;
 
       -- drop temp sequence
-      exec_drop_object(
-        in_object_type  => 'SEQUENCE',
-        in_object_name  => l_new_sequence_rec.rename_rec.current_name,
-        in_object_owner => l_new_sequence_rec.owner,
-        in_echo         => TRUE
+      revert_changes(
+       io_change_arr => l_recreate_arr,
+        in_echo      => FALSE
       );
 
       CASE
@@ -6655,57 +7155,63 @@ end;';
         -- drop temp sequence
         debug('Do alters ...');
         -- altering existing sequence
-
         apply_changes(
-          in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-          in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-          in_test                => g_params.test.get_bool_value
+          io_change_arr => l_alter_arr,
+          in_test       => g_run_params.test.get_bool_value
         );
 
       WHEN l_result = cort_comp_pkg.gc_result_recreate THEN
         debug('Do recreate ...');
 
-        l_frwd_stmt_arr.DELETE;
-        l_rlbk_stmt_arr.DELETE;
+        l_recreate_arr.DELETE;
 
         cort_comp_pkg.get_privileges_stmt(
-          in_privilege_arr         => l_old_sequence_rec.privilege_arr,
-          io_frwd_alter_stmt_arr   => l_rlbk_stmt_arr,
-          io_rlbk_alter_stmt_arr   => l_frwd_stmt_arr  -- GRANT privs for rollback
+          in_privilege_arr  => l_old_sequence_rec.privilege_arr,
+          io_change_arr     => l_recreate_arr
         );
-
-        FOR i IN 1..l_frwd_stmt_arr.COUNT LOOP
-          l_frwd_stmt_arr(i) := NULL;
+        
+        -- save grant privileges into revert sql
+        FOR i IN 1..l_recreate_arr.COUNT LOOP
+          l_recreate_arr(i).revert_sql := l_recreate_arr(i).change_sql; 
+          l_recreate_arr(i).change_sql := null; 
         END LOOP;
 
-        l_frwd_stmt_arr(l_frwd_stmt_arr.COUNT+1) := get_drop_object_ddl(
-                                                      in_object_type  => 'SEQUENCE',
-                                                      in_object_owner => l_old_sequence_rec.owner,
-                                                      in_object_name  => l_old_sequence_rec.sequence_name
-                                                    );
-        l_rlbk_stmt_arr(l_rlbk_stmt_arr.COUNT+1) := cort_comp_pkg.get_sequence_sql(l_old_sequence_rec);
+        add_change(
+          l_recreate_arr, 
+          change_rec(
+            in_change_sql => cort_comp_pkg.get_drop_object_ddl(
+                               in_object_type  => 'SEQUENCE',
+                               in_object_owner => l_old_sequence_rec.owner,
+                               in_object_name  => l_old_sequence_rec.sequence_name
+                             ),
+            in_revert_sql => cort_comp_pkg.get_sequence_sql(l_old_sequence_rec), 
+            in_group_type => 'RECREATE SEQUENCE'  
+          )
+        );
 
-        l_frwd_stmt_arr(l_frwd_stmt_arr.COUNT+1) := in_job_rec.sql_text;
-        l_rlbk_stmt_arr(l_rlbk_stmt_arr.COUNT+1) := get_drop_object_ddl(
-                                                      in_object_type  => 'SEQUENCE',
-                                                      in_object_owner => l_old_sequence_rec.owner,
-                                                      in_object_name  => l_old_sequence_rec.sequence_name
-                                                    );
-
-        IF g_params.keep_objects.value_exists('PRIVILEGES') THEN
-          cort_comp_pkg.get_privileges_stmt(
-            in_privilege_arr         => l_old_sequence_rec.privilege_arr,
-            io_frwd_alter_stmt_arr   => l_frwd_stmt_arr,
-            io_rlbk_alter_stmt_arr   => l_rlbk_stmt_arr
-          );
-        END IF;
+        add_change(
+          l_recreate_arr, 
+          change_rec(
+            in_change_sql => in_job_rec.sql_text,
+            in_revert_sql => cort_comp_pkg.get_drop_object_ddl(
+                               in_object_type  => 'SEQUENCE',
+                               in_object_owner => l_old_sequence_rec.owner,
+                               in_object_name  => l_old_sequence_rec.sequence_name
+                             ), 
+            in_group_type => 'RECREATE SEQUENCE'  
+          )
+        );
+        
+        cort_comp_pkg.get_privileges_stmt(
+          in_privilege_arr  => l_old_sequence_rec.privilege_arr,
+          io_change_arr     => l_recreate_arr
+        );
 
         -- execute all changes in the queue
         BEGIN
           apply_changes(
-            in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-            in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-            in_test                => g_params.test.get_bool_value
+            io_change_arr => l_recreate_arr,
+            in_test       => g_run_params.test.get_bool_value
           );
         EXCEPTION
           WHEN OTHERS THEN
@@ -6715,44 +7221,34 @@ end;';
 
       END CASE;
 
-      IF NOT g_params.test.get_bool_value THEN
+      IF NOT g_run_params.test.get_bool_value THEN
         cort_aux_pkg.register_change(
-          in_object_owner   => in_job_rec.object_owner,
-          in_object_type    => in_job_rec.object_type,
-          in_object_name    => in_job_rec.object_name,
           in_job_rec        => in_job_rec,
-          in_sql            => in_job_rec.sql_text,
-          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                                 in_object_owner   => in_job_rec.object_owner,
-                                 in_object_name    => in_job_rec.object_name,
-                                 in_object_type    => in_job_rec.object_type
-                               ),
-          in_change_type    => l_result,
-          in_revert_name    => NULL,
-          in_last_ddl_index => NULL,
-          in_frwd_stmt_arr  => l_frwd_stmt_arr,
-          in_rlbk_stmt_arr  => l_rlbk_stmt_arr
+          in_change_type    => l_result
         );
       END IF;
 
     ELSE
       -- Sequence does not exist.
       -- Just execute SQL as is
-      l_frwd_stmt_arr(1) := in_job_rec.sql_text;
-      l_rlbk_stmt_arr(1) := get_drop_sequence_ddl(
+
+      l_recreate_arr(1) := 
+        change_rec(
+          in_change_sql => in_job_rec.sql_text,
+          in_revert_sql => cort_comp_pkg.get_drop_sequence_ddl(
                               in_sequence_name => in_job_rec.object_name,
                               in_owner         => in_job_rec.object_owner
-                            );
+                           ), 
+          in_group_type => 'RECREATE SEQUENCE'  
+        );
 
       -- Sequence doesn't exist. Create it as is.
       apply_changes(
-        in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-        in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-        in_test                => g_params.test.get_bool_value,
-        in_echo                => TRUE
+        io_change_arr => l_recreate_arr,
+        in_test       => g_run_params.test.get_bool_value
       );
 
-      IF NOT g_params.test.get_bool_value THEN
+      IF NOT g_run_params.test.get_bool_value THEN
         -- delete any previous records for given object
         cleanup_history(
           in_object_owner  => in_job_rec.object_owner,
@@ -6761,27 +7257,313 @@ end;';
         );
         -- register sequence
         cort_aux_pkg.register_change(
-          in_object_owner   => in_job_rec.object_owner,
-          in_object_type    => in_job_rec.object_type,
-          in_object_name    => in_job_rec.object_name,
           in_job_rec        => in_job_rec,
-          in_sql            => in_job_rec.sql_text,
-          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                                 in_object_owner   => in_job_rec.object_owner,
-                                 in_object_name    => in_job_rec.object_name,
-                                 in_object_type    => in_job_rec.object_type
-                               ),
-          in_change_type    => cort_comp_pkg.gc_result_create,
-          in_revert_name    => NULL,
-          in_last_ddl_index => NULL,
-          in_frwd_stmt_arr  => l_frwd_stmt_arr,
-          in_rlbk_stmt_arr  => l_rlbk_stmt_arr
+          in_change_type    => cort_comp_pkg.gc_result_create
         );
       END IF;
     END IF;
-    cort_session_pkg.enable;
 
   END create_or_replace_sequence;
+  
+
+  PROCEDURE backup_table(
+    in_table_rec       IN gt_table_rec,
+    io_change_arr      IN OUT NOCOPY gt_change_arr
+  )
+  AS
+    l_table_rec         gt_table_rec;
+    l_data_source_rec   gt_data_source_rec;
+    l_adt_rec           gt_adt_rec;
+    l_object_table_flag BOOLEAN;
+    l_typeinfo_col      arrays.gt_name;
+    l_typeinfo_col_indx PLS_INTEGER;
+  BEGIN
+    start_timer;
+    -- create temp table with the same structure
+    l_table_rec := in_table_rec;
+    l_table_rec.table_name := in_table_rec.rename_rec.temp_name;
+    l_table_rec.rename_rec.current_name := in_table_rec.rename_rec.temp_name;
+
+    l_table_rec.table_type := NULL;
+    l_table_rec.table_type_owner := NULL;
+    l_object_table_flag := l_table_rec.table_type_owner IS NOT NULL AND l_table_rec.table_type IS NOT NULL;
+    FOR i IN 1..l_table_rec.column_arr.COUNT LOOP
+      CASE 
+      -- all object columns
+      WHEN in_table_rec.column_arr(i).adt_flag 
+      THEN
+        IF l_table_rec.column_arr(i).column_name LIKE 'SYS_NC%' THEN
+          l_table_rec.column_arr(i).column_name := cort_params_pkg.gc_rlbk_prefix||to_char(l_table_rec.column_arr(i).internal_column_id, 'fm009')||'_'||l_table_rec.column_arr(i).column_name;
+        END IF;
+        l_table_rec.column_arr(i).hidden_column := 'NO';
+        l_table_rec.column_arr(i).user_generated := 'YES';
+        l_data_source_rec.data_values(l_table_rec.column_arr(i).column_name) := '''"'||l_table_rec.column_arr(i).data_type_owner||'"."'||l_table_rec.column_arr(i).data_type||'"''';
+
+        IF in_table_rec.column_arr(i).substitutable = 'Y' THEN
+          IF in_table_rec.column_arr(i).qualified_col_name = in_table_rec.column_arr(i).column_name THEN
+            l_typeinfo_col := 'SYS_TYPEID("'||in_table_rec.column_arr(i).qualified_col_name||'")';
+          ELSE
+            l_typeinfo_col := 'SYS_TYPEID('||in_table_rec.column_arr(i).qualified_col_name||')';
+          END IF; 
+          IF in_table_rec.column_qualified_indx_arr.EXISTS(l_typeinfo_col) THEN
+            l_typeinfo_col_indx := in_table_rec.column_qualified_indx_arr(l_typeinfo_col);
+          ELSE
+            debug('Column with qualified_col_name = '||l_typeinfo_col||' is not found');
+            l_typeinfo_col_indx := NULL;
+          END IF;
+          IF l_typeinfo_col_indx IS NOT NULL THEN
+            l_adt_rec := get_adt_rec(l_table_rec.column_arr(i).data_type_owner, l_table_rec.column_arr(i).data_type);
+            l_typeinfo_col := cort_params_pkg.gc_rlbk_prefix||to_char(in_table_rec.column_arr(l_typeinfo_col_indx).internal_column_id, 'fm009')||'_SYS_TYPEID';
+            debug('l_typeinfo_col = '||l_typeinfo_col);
+            l_data_source_rec.data_values(l_table_rec.column_arr(i).column_name) := 'DECODE(RAWTOHEX("'||in_table_rec.column_arr(l_typeinfo_col_indx).column_name||'"),'||l_adt_rec.typeid_name||')';
+            l_data_source_rec.data_values(l_typeinfo_col) := 'DECODE(RAWTOHEX("'||in_table_rec.column_arr(l_typeinfo_col_indx).column_name||'"),'||l_adt_rec.typeid_name||')';
+          ELSE
+            l_data_source_rec.data_values(l_table_rec.column_arr(i).column_name) := 'DECODE(RAWTOHEX(SYS_TYPEID("'||in_table_rec.column_arr(i).column_name||'")),'||l_adt_rec.typeid_name||')';
+          END IF;  
+        ELSE
+          l_data_source_rec.data_values(l_table_rec.column_arr(i).column_name) := '''"'||l_table_rec.column_arr(i).data_type_owner||'"."'||l_table_rec.column_arr(i).data_type||'"''';
+        END IF;  
+
+        l_table_rec.column_arr(i).col_comment := cort_params_pkg.gc_prefix||cort_params_pkg.gc_force_value_prefix||l_table_rec.column_arr(i).qualified_col_name;
+/*        
+        IF in_table_rec.column_arr(i).column_name NOT LIKE 'SYS_NC%' OR in_table_rec.column_arr(i).column_name = 'SYS_NC_ROWINFO$' THEN
+          l_table_rec.column_arr(i).col_comment := REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(cort_params_pkg.gc_prefix||cort_params_pkg.gc_cast_object_data_prefix, '%', in_table_rec.column_arr(i).column_name, 1, 1), '%', l_table_rec.column_arr(i).data_type_owner, 1, 1),'%', l_table_rec.column_arr(i).data_type, 1, 1);
+--        ELSE
+          --l_table_rec.column_arr(i).col_comment := REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(cort_params_pkg.gc_prefix||cort_params_pkg.gc_cast_object_data_prefix, '"%"', in_table_rec.column_arr(i).qualified_col_name, 1, 1), '%', l_table_rec.column_arr(i).data_type_owner, 1, 1),'%', l_table_rec.column_arr(i).data_type, 1, 1);
+        END IF;  
+*/
+        l_table_rec.column_arr(i).data_type_owner := NULL;
+        l_table_rec.column_arr(i).data_type := 'VARCHAR2';
+        l_table_rec.column_arr(i).data_length := 4000;
+        l_table_rec.column_arr(i).char_length := 4000;
+        l_table_rec.column_arr(i).virtual_column := 'NO';
+        l_table_rec.column_arr(i).hidden_column := 'NO';
+        l_table_rec.column_arr(i).user_generated := 'YES';
+      
+      WHEN in_table_rec.column_arr(i).data_type = 'RAW' AND in_table_rec.column_arr(i).column_name LIKE 'SYS_NC%' AND 
+           (in_table_rec.column_arr(i).column_name = 'SYS_NC_TYPEID$' OR in_table_rec.column_arr(i).qualified_col_name LIKE 'SYS_TYPEID(%)')
+      THEN      
+        l_table_rec.column_arr(i).column_name := cort_params_pkg.gc_rlbk_prefix||to_char(in_table_rec.column_arr(i).internal_column_id, 'fm009')||'_SYS_TYPEID';
+        -- special case
+        IF in_table_rec.column_arr(i).column_name = 'SYS_NC_TYPEID$' THEN 
+          l_table_rec.column_arr(i).col_comment := cort_params_pkg.gc_prefix||cort_params_pkg.gc_force_value_prefix||'TYPE_NAME("SYS_NC_ROWINFO$")';
+        ELSE
+          l_table_rec.column_arr(i).col_comment := cort_params_pkg.gc_prefix||cort_params_pkg.gc_force_value_prefix||REPLACE(l_table_rec.column_arr(i).qualified_col_name, 'SYS_TYPEID(', 'TYPE_NAME(');
+        END IF;
+
+        l_table_rec.column_arr(i).data_type_owner := NULL;
+        l_table_rec.column_arr(i).data_type := 'VARCHAR2';
+        l_table_rec.column_arr(i).data_length := 4000;
+        l_table_rec.column_arr(i).char_length := 4000;
+        l_table_rec.column_arr(i).virtual_column := 'NO';
+        l_table_rec.column_arr(i).hidden_column := 'NO';
+        l_table_rec.column_arr(i).user_generated := 'YES';
+
+      WHEN in_table_rec.column_arr(i).user_generated = 'NO' AND in_table_rec.column_arr(i).column_name LIKE 'SYS_NC%' 
+      THEN 
+        l_table_rec.column_arr(i).hidden_column := 'NO';
+        l_table_rec.column_arr(i).user_generated := 'YES';
+        l_table_rec.column_arr(i).column_name := cort_params_pkg.gc_rlbk_prefix||to_char(in_table_rec.column_arr(i).internal_column_id, 'fm009')||'_'||in_table_rec.column_arr(i).column_name;
+        l_data_source_rec.data_values(l_table_rec.column_arr(i).column_name) := in_table_rec.column_arr(i).column_name;
+--        l_table_rec.column_arr(i).col_comment := cort_params_pkg.gc_prefix||cort_params_pkg.gc_force_value_prefix||cort_parse_pkg.parse_qualified_col_expr(l_table_rec.column_arr(i).qualified_col_name);
+        l_table_rec.column_arr(i).col_comment := cort_params_pkg.gc_prefix||cort_params_pkg.gc_force_value_prefix||l_table_rec.column_arr(i).qualified_col_name;
+      ELSE 
+        IF l_object_table_flag THEN
+          l_data_source_rec.data_values(l_table_rec.column_arr(i).column_name) := in_table_rec.column_arr(i).column_name;
+--          l_table_rec.column_arr(i).col_comment := cort_params_pkg.gc_prefix||cort_params_pkg.gc_force_value_prefix||cort_parse_pkg.parse_qualified_col_expr(l_table_rec.column_arr(i).qualified_col_name);
+          l_table_rec.column_arr(i).col_comment := cort_params_pkg.gc_prefix||cort_params_pkg.gc_force_value_prefix||l_table_rec.column_arr(i).qualified_col_name;
+        END IF;  
+      END CASE;
+   END LOOP;
+
+
+    cort_comp_pkg.create_table_sql(
+      in_table_rec  => l_table_rec,
+      io_change_arr => io_change_arr
+    );
+    
+    l_data_source_rec.change_result := cort_comp_pkg.gc_result_recreate;
+
+    IF g_params.data.get_value <> 'NONE' AND NOT in_table_rec.is_table_empty THEN
+      copy_data(
+        in_data_source_rec  => l_data_source_rec,
+        in_source_table_rec => in_table_rec,
+        in_target_table_rec => l_table_rec,
+        io_change_arr       => io_change_arr
+      );
+    END IF;
+
+    stop_timer;
+  END backup_table;
+
+  
+  PROCEDURE recreate_type(
+    io_source_type_rec IN OUT NOCOPY gt_type_rec,
+    io_change_arr      IN OUT NOCOPY gt_change_arr,
+    in_job_rec         IN cort_jobs%ROWTYPE
+  )
+  AS
+  BEGIN
+    -- Recreate all depentent tables as pointing on rlbk type
+    IF io_source_type_rec.table_dependency_arr.COUNT > 0 THEN
+      -- recreate dependent object tables as regular "flat" tables
+      FOR i IN 1..io_source_type_rec.table_dependency_arr.COUNT LOOP
+        --recreate table with regular segment columns
+        backup_table(
+          in_table_rec       => io_source_type_rec.table_dependency_arr(i),
+          --in_type_rename_rec => l_clone_type_rec.rename_rec,
+          io_change_arr      => io_change_arr
+        );
+        io_source_type_rec.table_dependency_arr(i).rename_rec.current_name := io_source_type_rec.table_dependency_arr(i).rename_rec.temp_name; 
+      END LOOP;
+
+      apply_changes(              
+        io_change_arr => io_change_arr,
+        in_test       => g_run_params.test.get_bool_value
+      );
+
+      FOR i IN 1..io_source_type_rec.table_dependency_arr.COUNT LOOP
+        add_change(
+          io_change_arr, 
+          change_rec(
+            in_change_sql => cort_comp_pkg.get_drop_table_ddl(
+                                in_table_name => io_source_type_rec.table_dependency_arr(i).table_name,
+                                in_owner      => io_source_type_rec.table_dependency_arr(i).owner
+                              ),
+            in_group_type => 'RENAME TYPE'  
+          )
+        );
+      END LOOP;
+
+      -- drop exiting type with all dependent tables
+      add_change(
+        io_change_arr, 
+        change_rec(
+          in_change_sql => cort_comp_pkg.get_drop_type_ddl(
+                              in_type_name => io_source_type_rec.type_name,
+                              in_owner     => io_source_type_rec.owner,
+                              in_force     => TRUE
+                            ),
+          in_group_type => 'RENAME TYPE'  
+        )
+      );
+      
+      -- rename backed up dependent tables to original name
+      FOR i IN 1..io_source_type_rec.table_dependency_arr.COUNT LOOP
+        cort_comp_pkg.rename_object(
+          in_rename_mode => 'TO_ORIGINAL',
+          io_rename_rec  => io_source_type_rec.table_dependency_arr(i).rename_rec,
+          io_change_arr  => io_change_arr
+        );
+      END LOOP;
+      
+    ELSE
+      -- drop exiting type 
+      add_change(
+        io_change_arr, 
+        change_rec(
+          in_change_sql => cort_comp_pkg.get_drop_type_ddl(
+                              in_type_name => io_source_type_rec.type_name,
+                              in_owner     => io_source_type_rec.owner,
+                              in_force     => TRUE
+                            ),
+          in_group_type => 'RENAME TYPE'  
+        )
+      );
+    END IF;
+
+    apply_changes(              
+      io_change_arr => io_change_arr,
+      in_test       => g_run_params.test.get_bool_value
+    );
+      
+
+    IF cort_options_pkg.gc_rename_types THEN
+
+      -- read "weak" dependencies
+      FOR x IN (SELECT d.*, t.table_name, TRIM(t.cache) as cache, sn.synonym_name
+                  FROM (SELECT DISTINCT d.owner, d.name, d.type
+                          FROM all_dependencies d
+                         WHERE type IN ('TABLE', 'TYPE')
+                         CONNECT BY referenced_owner = PRIOR d.owner
+                                AND referenced_name = PRIOR d.name
+                                AND referenced_type = PRIOR d.type
+                         START WITH referenced_owner = io_source_type_rec.owner
+                                AND referenced_name = io_source_type_rec.type_name
+                                AND referenced_type = 'TYPE'
+                        ) d
+                  LEFT JOIN all_all_tables t
+                    ON t.owner = d.owner
+                   AND t.table_name = d.name
+                   AND d.type = 'TABLE'  
+                  LEFT JOIN all_synonyms sn
+                    ON sn.owner = d.owner
+                   AND sn.table_name = d.name
+                   AND REGEXP_LIKE(sn.table_name, '^'||cort_parse_pkg.get_regexp_const(SUBSTR(sn.synonym_name, 1, arrays.gc_name_max_length-6))||'#[\$-z]+$')
+                   AND sn.table_owner = sn.owner
+                   AND d.type = 'TYPE'
+               ) 
+      LOOP
+        IF x.type = 'TABLE' AND x.table_name IS NOT NULL THEN
+          -- add dummy DDL to reset last DDL timestamp 
+          add_change(
+            io_change_arr, 
+            change_rec(
+              in_change_sql => 'ALTER TABLE "'||x.owner||'"."'||x.table_name||'" '||CASE WHEN x.cache = 'N' THEN 'NOCACHE' ELSE 'CACHE' END,
+              in_group_type => 'RECREATE TYPE'
+            )
+          );
+        END IF;
+        IF x.type = 'TYPE' AND x.synonym_name IS NOT NULL THEN
+          -- drop synonym to trigger depending type recreation   
+          add_change(
+            io_change_arr, 
+            change_rec(
+              in_change_sql => 'DROP SYNONYM "'||x.owner||'"."'||x.synonym_name||'"',
+              in_group_type => 'RECREATE TYPE'
+            )
+          );
+        END IF;
+      END LOOP;
+
+      -- create synonym for temp type
+      add_change(
+        io_change_arr, 
+        change_rec(
+          in_change_sql => 'CREATE OR REPLACE SYNONYM "'||io_source_type_rec.owner||'"."'||io_source_type_rec.type_name||'" FOR "'||io_source_type_rec.rename_rec.object_owner||'"."'||io_source_type_rec.rename_rec.temp_name||'"',
+          in_revert_sql =>  cort_comp_pkg.get_drop_object_ddl('SYNONYM', io_source_type_rec.type_name, io_source_type_rec.owner),
+          in_group_type => 'RECREATE TYPE'
+        )
+      );
+    
+    ELSE
+
+      -- recreate type using original SQL
+      add_change(
+        io_change_arr, 
+        change_rec(
+          in_change_sql => in_job_rec.sql_text,
+          in_group_type => 'RECREATE TYPE'  
+        )
+      );
+
+      -- re-apply privileges
+      cort_comp_pkg.get_privileges_stmt(
+        in_privilege_arr    => io_source_type_rec.privilege_arr,
+        io_change_arr       => io_change_arr
+      );
+
+    END IF;
+    
+ 
+    apply_changes(              
+      io_change_arr => io_change_arr,
+      in_test       => g_run_params.test.get_bool_value
+    );
+
+
+
+  END recreate_type;
 
   -- Create or replace type
   PROCEDURE create_or_replace_type(
@@ -6789,275 +7571,297 @@ end;';
     io_sql_rec       IN OUT NOCOPY cort_parse_pkg.gt_sql_rec
   )
   AS
-    l_new_sql              CLOB;
-
     l_old_type_rec         gt_type_rec;
     l_new_type_rec         gt_type_rec;
-
-    l_frwd_stmt_arr        arrays.gt_clob_arr;
-    l_rlbk_stmt_arr        arrays.gt_clob_arr;
-
-    l_result               PLS_INTEGER;
+    l_recreate_arr         gt_change_arr;
+    l_alter_arr            gt_change_arr;
+    l_change_result               PLS_INTEGER;
   BEGIN
     start_timer;
-
-    -- disable CORT trigger for current session
-    cort_session_pkg.disable;
-
-    -- read sequence attributes
+    
+    -- read type attributes
     read_type(
       in_type_name => in_job_rec.object_name,
       in_owner     => in_job_rec.object_owner,
       out_type_rec => l_old_type_rec
     );
 
+      debug('l_old_type_rec.type_name = '||l_old_type_rec.type_name);
     IF l_old_type_rec.type_name IS NOT NULL THEN
-
-      read_privileges(
-        in_owner         => l_old_type_rec.owner,
-        in_table_name    => l_old_type_rec.type_name,
-        io_privilege_arr => l_old_type_rec.privilege_arr
-      );
+/*      IF l_old_type_rec.adt_rec.synonym_name IS NULL THEN 
+        l_change_result := cort_comp_pkg.gc_result_recreate;
+      ELSE 
+        l_change_result := cort_comp_pkg.gc_result_nochange;
+      END IF;  
+*/
+      l_change_result := cort_comp_pkg.gc_result_nochange;
 
       -- modify original SQL - replace original names with temp ones.
-      cort_parse_pkg.replace_names(
-        in_type_rec => l_old_type_rec,
-        io_sql_rec  => io_sql_rec,
-        out_sql     => l_new_sql
+      cort_parse_pkg.replace_type_names(
+        in_rename_rec => l_old_type_rec.rename_rec,
+        io_sql_rec    => io_sql_rec
+      );
+    ELSIF cort_options_pkg.gc_rename_types THEN
+      l_change_result := cort_comp_pkg.gc_result_create;
+      l_old_type_rec.rename_rec := get_rename_rec(
+                                     in_object_name  => in_job_rec.object_name,
+                                     in_object_owner => in_job_rec.object_owner,
+                                     in_object_type  => 'TYPE'
+                                   );        
+--      l_old_type_rec.adt_rec.synonym_name := in_job_rec.object_name;
+      
+      -- modify original SQL - replace original names with temp ones.
+      cort_parse_pkg.replace_type_names(
+        in_rename_rec => l_old_type_rec.rename_rec,
+        io_sql_rec    => io_sql_rec
       );
 
-      -- execute original sql with replaces names
-      execute_immediate(l_new_sql, FALSE);
+    ELSE
+      l_change_result := cort_comp_pkg.gc_result_create; 
+      l_old_type_rec.rename_rec := get_rename_rec(
+                                     in_object_name  => in_job_rec.object_name,
+                                     in_object_owner => in_job_rec.object_owner,
+                                     in_object_type  => 'TYPE'
+                                   );        
+      l_old_type_rec.rename_rec.temp_name := in_job_rec.object_name;
+    END IF;  
 
+    -- created type
+    add_change(
+      l_recreate_arr,
+      change_rec(
+        in_change_sql => io_sql_rec.original_sql,
+        in_revert_sql => cort_comp_pkg.get_drop_object_ddl(
+                           in_object_type  => 'TYPE', 
+                           in_object_name  => l_old_type_rec.rename_rec.temp_name,
+                           in_object_owner => l_old_type_rec.rename_rec.object_owner
+                         ),
+        in_group_type => 'RECREATE TYPE'  
+      )
+    );
 
-      IF g_params.change.get_value = 'ALWAYS' THEN
-        l_result := cort_comp_pkg.gc_result_recreate;
-      ELSE
-        l_result := cort_comp_pkg.gc_result_nochange;
-      END IF;
+    -- execute changes without displaying
+    apply_changes(
+      io_change_arr => l_recreate_arr,
+      in_echo       => FALSE
+    );
 
-      BEGIN
+    BEGIN
+      
+      IF l_old_type_rec.type_name IS NOT NULL THEN
         -- read new type attributes
         read_type(
           in_type_name => l_old_type_rec.rename_rec.temp_name,
-          in_owner     => in_job_rec.object_owner,
+          in_owner     => l_old_type_rec.rename_rec.object_owner,
           out_type_rec => l_new_type_rec
         );
 
-        IF l_result = cort_comp_pkg.gc_result_nochange THEN
+        copy_type_privileges(
+          in_source_type_rec => l_old_type_rec,
+          io_target_type_rec => l_new_type_rec,
+          io_change_arr      => l_recreate_arr
+        );
+
+        IF l_change_result = cort_comp_pkg.gc_result_nochange THEN
           -- compare types
-          l_result := cort_comp_pkg.comp_types(
-                        in_source_type_rec     => l_old_type_rec,
-                        in_target_type_rec     => l_new_type_rec,
-                        io_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-                        io_rlbk_alter_stmt_arr => l_rlbk_stmt_arr
+          l_change_result := cort_comp_pkg.comp_types(
+                        in_source_type_rec => l_old_type_rec,
+                        in_target_type_rec => l_new_type_rec,
+                        io_change_arr      => l_alter_arr
                       );
         END IF;
-
-      EXCEPTION
-        WHEN OTHERS THEN
-          cort_log_pkg.error('Error. Rolling back...');
-          -- drop temp type
-          exec_drop_object(
-            in_object_type  => 'TYPE',
-            in_object_name  => l_new_type_rec.rename_rec.current_name,
-            in_object_owner => l_new_type_rec.owner,
-            in_echo         => FALSE
-          );
-          RAISE;
-      END;
-      debug('Drop temp object ...');
-
-      -- drop temp type
-      exec_drop_object(
-        in_object_type  => 'TYPE',
-        in_object_name  => l_new_type_rec.rename_rec.current_name,
-        in_object_owner => l_new_type_rec.owner,
-        in_echo         => FALSE
-      );
-
-      debug('Change type as result of comparison = '||cort_comp_pkg.get_result_name(l_result));
+      END IF;
 
       CASE g_params.change.get_value
         WHEN 'ALWAYS' THEN
-          l_result := cort_comp_pkg.gc_result_recreate;
+          l_change_result := cort_comp_pkg.gc_result_recreate;
         WHEN 'RECREATE' THEN
-          IF l_result > cort_comp_pkg.gc_result_nochange THEN
-            l_result := cort_comp_pkg.gc_result_recreate;
+          IF l_change_result > cort_comp_pkg.gc_result_nochange THEN
+            l_change_result := cort_comp_pkg.gc_result_recreate;
           END IF;
         WHEN 'ALTER' THEN
-          IF l_result > cort_comp_pkg.gc_result_alter_move THEN
+          IF l_change_result > cort_comp_pkg.gc_result_alter_move THEN
             raise_error('Changes could not be applied without table recreation');
           END IF;
         ELSE
           NULL;
       END CASE;
 
-      debug('Change type after applying change param = '||cort_comp_pkg.get_result_name(l_result));
-
-      CASE
-      WHEN l_result = cort_comp_pkg.gc_result_nochange THEN
-        debug('Do nothing ...');
-        l_frwd_stmt_arr.DELETE;
-        l_rlbk_stmt_arr.DELETE;
-      WHEN l_result = cort_comp_pkg.gc_result_alter THEN
-        debug('Do alters ...');
-      WHEN l_result = cort_comp_pkg.gc_result_recreate THEN
-        debug('Do recreate ...');
-        l_frwd_stmt_arr.DELETE;
-        l_rlbk_stmt_arr.DELETE;
-
-        FOR i IN 1..l_old_type_rec.dependency_arr.COUNT LOOP
-          debug('dependent object '||l_old_type_rec.dependency_arr(i).type||'   "'||l_old_type_rec.dependency_arr(i).owner||'"."'||l_old_type_rec.dependency_arr(i).name||'"');
-          IF l_old_type_rec.dependency_arr(i).type = 'TABLE' THEN
-            -- check objects_id for NULL is workaround for absence of ALL_RECYCLEBIN view.
-            IF l_old_type_rec.dependency_arr(i).object_id IS NOT NULL THEN
-              IF g_params.data.get_value <> 'NONE' THEN
-                --recreate table as heap organized;
-                backup_table(
-                  in_table_name    => l_old_type_rec.dependency_arr(i).name,
-                  in_table_owner   => l_old_type_rec.dependency_arr(i).owner,
-                  in_sql_rec       => io_sql_rec,
-                  io_frwd_stmt_arr => l_frwd_stmt_arr,
-                  io_rlbk_stmt_arr => l_rlbk_stmt_arr
-                );
-              ELSE
-                cort_comp_pkg.add_stmt(
-                  io_frwd_stmt_arr => l_frwd_stmt_arr,
-                  io_rlbk_stmt_arr => l_rlbk_stmt_arr,
-                  in_frwd_stmt     => get_drop_object_ddl(
-                                        in_object_type  => l_old_type_rec.dependency_arr(i).type,
-                                        in_object_name  => l_old_type_rec.dependency_arr(i).name,
-                                        in_object_owner => l_old_type_rec.dependency_arr(i).owner,
-                                        in_purge        => TRUE
-                                      ),
-                  in_rlbk_stmt     => NULL
-                );
-              END IF;
-            ELSE
-              -- table is in recycle bin. Purge it.
-              cort_comp_pkg.add_stmt(
-                io_frwd_stmt_arr => l_frwd_stmt_arr,
-                io_rlbk_stmt_arr => l_rlbk_stmt_arr,
-                in_frwd_stmt     => 'PURGE TABLE "'||l_old_type_rec.dependency_arr(i).owner||'"."'||l_old_type_rec.dependency_arr(i).name||'"',
-                in_rlbk_stmt     => NULL
-              );
-            END IF;
-          END IF;
-        END LOOP;
-
-       cort_comp_pkg.add_stmt(
-          io_frwd_stmt_arr => l_frwd_stmt_arr,
-          io_rlbk_stmt_arr => l_rlbk_stmt_arr,
-          in_frwd_stmt     => get_drop_type_ddl(
-                                in_type_name => l_old_type_rec.type_name,
-                                in_owner     => l_old_type_rec.owner
-                              ),
-          in_rlbk_stmt     => NULL
+    EXCEPTION
+      WHEN OTHERS THEN
+        cort_log_pkg.error('Error. Rolling back...');
+        -- drop temp objects
+        revert_changes(
+          io_change_arr => l_recreate_arr,
+          in_echo       => FALSE
         );
-
-        cort_comp_pkg.add_stmt(
-          io_frwd_stmt_arr => l_frwd_stmt_arr,
-          io_rlbk_stmt_arr => l_rlbk_stmt_arr,
-          in_frwd_stmt     => in_job_rec.sql_text,
-          in_rlbk_stmt     => NULL
-        );
-
-        IF g_params.keep_objects.value_exists('PRIVILEGES') THEN
-          cort_comp_pkg.get_privileges_stmt(
-            in_privilege_arr         => l_old_type_rec.privilege_arr,
-            io_frwd_alter_stmt_arr   => l_frwd_stmt_arr,
-            io_rlbk_alter_stmt_arr   => l_rlbk_stmt_arr
-          );
-        END IF;
-      END CASE;
-
-      IF l_result != cort_comp_pkg.gc_result_nochange THEN
-        BEGIN
-          -- execute all changes in the queue
-          apply_changes(
-            in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-            in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-            in_test                => g_params.test.get_bool_value,
-            in_echo                => TRUE
-          );
-        EXCEPTION
-          WHEN OTHERS THEN
-            cort_log_pkg.error('Error. Rolling back...');
-            RAISE;
-        END;
-      END IF;
-
-      IF NOT g_params.test.get_bool_value THEN
-        debug('Register ...');
-        cort_aux_pkg.register_change(
-          in_object_owner   => in_job_rec.object_owner,
-          in_object_type    => in_job_rec.object_type,
-          in_object_name    => in_job_rec.object_name,
-          in_job_rec        => in_job_rec,
-          in_sql            => in_job_rec.sql_text,
-          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                                 in_object_owner   => in_job_rec.object_owner,
-                                 in_object_name    => in_job_rec.object_name,
-                                 in_object_type    => in_job_rec.object_type
-                               ),
-          in_change_type    => l_result,
-          in_revert_name    => NULL,
-          in_last_ddl_index => NULL,
-          in_frwd_stmt_arr  => l_frwd_stmt_arr,
-          in_rlbk_stmt_arr  => l_rlbk_stmt_arr
-        );
-      END IF;
-    ELSE
-      debug('Create ...');
-      -- Type does not exist.
-      -- Just execute SQL as is
-      l_frwd_stmt_arr(1) := in_job_rec.sql_text;
-      l_rlbk_stmt_arr(1) := get_drop_type_ddl(
-                              in_type_name => in_job_rec.object_name,
-                              in_owner     => in_job_rec.object_owner
-                            );
-
-      -- Sequence doesn't exist. Create it as is.
-      apply_changes(
-        in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-        in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-        in_test                => g_params.test.get_bool_value,
-        in_echo                => TRUE
+        RAISE;
+    END;
+    
+    CASE
+    WHEN l_change_result = cort_comp_pkg.gc_result_nochange THEN
+      debug('Do nothing ...');
+      -- drop temp objects
+      revert_changes(
+        io_change_arr => l_recreate_arr,
+        in_echo       => FALSE
+      );
+      
+    WHEN l_change_result = cort_comp_pkg.gc_result_alter THEN
+      
+      debug('Do alters ...');
+      -- drop temp objects
+      revert_changes(
+        io_change_arr => l_recreate_arr,
+        in_echo       => FALSE
       );
 
-      IF NOT g_params.test.get_bool_value THEN
-        debug('Register ...');
-        -- delete any previous records for given object
-        cleanup_history(
-          in_object_owner   => in_job_rec.object_owner,
-          in_object_type    => in_job_rec.object_type,
-          in_object_name    => in_job_rec.object_name
+      -- altering existing type
+      apply_changes(              
+        io_change_arr => l_alter_arr,
+        in_test       => g_run_params.test.get_bool_value
+      );
+
+
+    WHEN l_change_result = cort_comp_pkg.gc_result_recreate THEN
+      debug('Do recreate ...');
+
+      IF cort_options_pkg.gc_rename_types THEN
+        -- display all already applied CREATE DDL (without execution)
+        display_changes(
+          io_change_sql_arr => l_recreate_arr,
+          in_test           => g_run_params.test.get_bool_value
         );
-        -- register type
-        cort_aux_pkg.register_change(
-          in_object_owner   => in_job_rec.object_owner,
-          in_object_type    => in_job_rec.object_type,
-          in_object_name    => in_job_rec.object_name,
-          in_job_rec        => in_job_rec,
-          in_sql            => in_job_rec.sql_text,
-          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                                 in_object_owner   => in_job_rec.object_owner,
-                                 in_object_name    => in_job_rec.object_name,
-                                 in_object_type    => in_job_rec.object_type
-                               ),
-          in_change_type    => cort_comp_pkg.gc_result_create,
-          in_revert_name    => NULL,
-          in_last_ddl_index => NULL,
-          in_frwd_stmt_arr  => l_frwd_stmt_arr,
-          in_rlbk_stmt_arr  => l_rlbk_stmt_arr
+      ELSE
+        -- drop temp objects
+        revert_changes(
+          io_change_arr => l_recreate_arr,
+          in_echo       => FALSE
         );
       END IF;
+      
+      -- Move data and depending objects and rename temp and original tables
+      recreate_type(
+        io_source_type_rec => l_old_type_rec,
+        io_change_arr      => l_recreate_arr,
+        in_job_rec         => in_job_rec
+      );
+
+    WHEN l_change_result = cort_comp_pkg.gc_result_create THEN
+
+      -- display all already applied CREATE DDL (without execution)
+      display_changes(
+        io_change_sql_arr => l_recreate_arr,
+        in_test           => g_run_params.test.get_bool_value
+      );
+/*      
+      -- create synonym (only if create new type)
+      IF cort_options_pkg.gc_rename_types THEN
+
+        -- create synonym with original name pointing for type with auto-generated name
+        add_change(
+          l_recreate_arr, 
+          change_rec(
+            in_change_sql => 'CREATE OR REPLACE SYNONYM "'||l_old_type_rec.rename_rec.object_owner||'"."'||l_old_type_rec.adt_rec.synonym_name||'" FOR "'||l_old_type_rec.rename_rec.object_owner||'"."'||l_old_type_rec.rename_rec.temp_name||'"',
+            in_revert_sql => 'DROP SYNONYM "'||l_old_type_rec.rename_rec.object_owner||'"."'||l_old_type_rec.adt_rec.synonym_name||'"',
+            in_group_type => 'RECREATE TYPE'
+          )
+        );
+        
+        -- altering existing table
+        apply_changes(              
+          io_change_arr => l_recreate_arr,
+          in_test       => g_run_params.test.get_bool_value
+        );
+      END IF;
+*/    
+    ELSE
+      -- drop temp objects
+      revert_changes(
+        io_change_arr => l_recreate_arr,
+        in_echo       => FALSE
+      );
+      raise_error('Unexpected compare result type = '||l_change_result);
+    END CASE;
+
+    IF NOT g_run_params.test.get_bool_value THEN
+      cort_aux_pkg.register_change(
+        in_job_rec        => in_job_rec,
+        in_change_type    => l_change_result,
+        in_revert_name    => CASE WHEN cort_options_pkg.gc_rename_types THEN l_old_type_rec.rename_rec.temp_name END 
+      );
     END IF;
-    cort_session_pkg.enable;
 
     stop_timer;
   END create_or_replace_type;
+
+  -- Create or replace type
+  PROCEDURE create_or_replace_type_body(
+    in_job_rec       IN cort_jobs%ROWTYPE,
+    io_sql_rec       IN OUT NOCOPY cort_parse_pkg.gt_sql_rec
+  )
+  AS
+    l_adt_rec               gt_adt_rec;
+    l_rename_rec            gt_rename_rec;
+    l_recreate_arr          gt_change_arr;
+  BEGIN
+    start_timer;
+    
+    l_rename_rec := get_rename_rec(
+                      in_object_name  => in_job_rec.object_name,
+                      in_object_owner => in_job_rec.object_owner,
+                      in_object_type  => in_job_rec.object_type
+                    );
+
+/*    
+    get_adt_rec(
+      in_type_owner => in_job_rec.object_owner,
+      in_type_name  => in_job_rec.object_name,
+      out_adt_rec   => l_adt_rec
+    );      
+*/
+    IF in_job_rec.object_name = l_adt_rec.synonym_name THEN
+    
+      l_rename_rec.current_name := l_adt_rec.synonym_name; 
+      l_rename_rec.temp_name := l_adt_rec.type_name;
+
+      cort_parse_pkg.replace_type_names(
+        in_rename_rec => l_rename_rec,
+        io_sql_rec    => io_sql_rec
+      );
+
+      l_rename_rec.current_name := l_rename_rec.temp_name; 
+
+      debug('modified sql', io_sql_rec.original_sql);
+
+    END IF;
+    
+    io_sql_rec.original_sql := regexp_replace(io_sql_rec.original_sql, '^CREATE\s+TYPE\s+BODY', 'CREATE OR REPLACE TYPE BODY', 1,  1, 'i');
+
+    add_change(
+      l_recreate_arr, 
+      change_rec(
+        in_change_sql => io_sql_rec.original_sql,
+        in_revert_sql => 'DROP TYPE BODY "'||l_rename_rec.object_owner||'"."'||l_rename_rec.current_name||'"',
+        in_group_type => 'RECREATE TYPE BODY'
+      )
+    );
+    -- execute changes without displaying
+    apply_changes(
+      io_change_arr => l_recreate_arr,
+      in_test       => g_run_params.test.get_bool_value
+    );
+
+    IF NOT g_run_params.test.get_bool_value THEN
+      cort_aux_pkg.register_change(
+        in_job_rec        => in_job_rec,
+        in_change_type    => cort_comp_pkg.gc_result_create,
+        in_revert_name    => NULL
+      );
+    END IF;
+
+    stop_timer;
+  END create_or_replace_type_body;
 
   FUNCTION get_job_rec
   RETURN cort_jobs%ROWTYPE
@@ -7071,10 +7875,22 @@ end;';
   )
   AS
   BEGIN
-    cort_params_pkg.read_from_xml(XMLType(in_job_rec.session_params), g_params);
+    cort_params_pkg.reset_params(g_params);
+    cort_params_pkg.reset_run_params(g_run_params);
+    cort_params_pkg.read_from_xml(g_run_params, XMLType(in_job_rec.run_params));
+
     cort_log_pkg.init_log(in_job_rec);
     g_job_rec := in_job_rec;
+    g_temp_objects_arr.DELETE;
+    g_adt_arr.DELETE;
     cort_parse_pkg.cleanup;
+    IF g_run_params.build.get_value() IS NOT NULL THEN
+      dbms_application_info.set_client_info('CORT_BUILD='||g_run_params.build.get_value());
+    END IF;
+    
+    $IF cort_options_pkg.gc_threading $THEN
+    cort_thread_exec_pkg.reset_threading;
+    $END
   END init;
 
   -- Public: create or replace object
@@ -7087,31 +7903,22 @@ end;';
     -- parse original sql and cort-hints and obtain object params
     start_timer;
 
-    l_sql_rec := cort_parse_pkg.parse_sql(in_job_rec.sql_text);
-
+    cort_parse_pkg.parse_sql(in_job_rec.sql_text, l_sql_rec);
+    l_sql_rec.current_schema := in_job_rec.current_schema;
+    
     cort_parse_pkg.parse_create_sql(
       io_sql_rec       => l_sql_rec,
       in_object_type   => in_job_rec.object_type,
       in_object_name   => in_job_rec.object_name,
       in_object_owner  => in_job_rec.object_owner
     );
-
-    -- read cort hints
-    cort_parse_pkg.parse_params(
-      io_sql_rec      => l_sql_rec,
-      io_params_rec   => g_params
-    );
-
-    cort_job_pkg.update_object_params(
-      in_rec           => in_job_rec,
-      in_object_params => cort_params_pkg.rec_to_xml(g_params)
-    );
-
-    IF g_params.test.get_bool_value THEN
+    
+    IF g_run_params.test.get_bool_value THEN
       cort_log_pkg.echo('== TEST OUTPUT ==');
     END IF;
 
-    IF g_params.parallel.get_num_value > 1 THEN
+
+    IF g_run_params.parallel.get_num_value > 1 THEN
       execute_immediate('ALTER SESSION ENABLE PARALLEL DML');
     END IF;
 
@@ -7135,11 +7942,16 @@ end;';
           in_job_rec => in_job_rec,
           io_sql_rec => l_sql_rec
         );
+      WHEN 'TYPE BODY' THEN
+        create_or_replace_type_body(
+          in_job_rec => in_job_rec,
+          io_sql_rec => l_sql_rec
+        );
       ELSE
         raise_error('Unsupported object type');
     END CASE;
 
-    IF g_params.test.get_bool_value THEN
+    IF g_run_params.test.get_bool_value THEN
       cort_log_pkg.echo('== END OF TEST OUTPUT ==');
     END IF;
     stop_timer;
@@ -7152,9 +7964,8 @@ end;';
   AS
     l_sql              CLOB;
     l_object_type      arrays.gt_name;
-    l_meta_object_type arrays.gt_name;
-    l_frwd_stmt_arr    arrays.gt_clob_arr;
-    l_rlbk_stmt_arr    arrays.gt_clob_arr;
+    l_meta_object_type VARCHAR2(50);
+    l_change_arr       gt_change_arr;
     l_exists           BOOLEAN;
     l_change_type      PLS_INTEGER;
   BEGIN
@@ -7208,8 +8019,14 @@ end;';
     ELSE
       NULL;
     END CASE;
-    l_frwd_stmt_arr(1) := in_job_rec.sql_text;
-    l_rlbk_stmt_arr(1) := l_sql;
+    add_change(
+      l_change_arr, 
+      change_rec(
+        in_change_sql => in_job_rec.sql_text,
+        in_revert_sql => l_sql, 
+        in_group_type => 'CREATE OR REPLACE '||in_job_rec.object_type
+      )
+    );
 
     IF NOT l_exists THEN
       -- delete all previous data for given object (if any)
@@ -7224,21 +8041,8 @@ end;';
     END IF;
 
     cort_aux_pkg.register_change(
-      in_object_owner   => in_job_rec.object_owner,
-      in_object_name    => in_job_rec.object_name,
-      in_object_type    => in_job_rec.object_type,
       in_job_rec        => in_job_rec,
-      in_sql            => in_job_rec.sql_text,
-      in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                             in_object_owner   => in_job_rec.object_owner,
-                             in_object_name    => in_job_rec.object_name,
-                             in_object_type    => in_job_rec.object_type
-                           ),
-      in_change_type    => l_change_type,
-      in_revert_name    => NULL,
-      in_last_ddl_index => NULL,
-      in_frwd_stmt_arr  => l_frwd_stmt_arr,
-      in_rlbk_stmt_arr  => l_rlbk_stmt_arr
+      in_change_type    => l_change_type
     );
   END before_create_or_replace;
 
@@ -7248,8 +8052,7 @@ end;';
     in_job_rec       IN cort_jobs%ROWTYPE
   )
   AS
-    l_frwd_stmt_arr    arrays.gt_clob_arr;
-    l_rlbk_stmt_arr    arrays.gt_clob_arr;
+    l_change_arr       gt_change_arr;
     l_table_rec        gt_table_rec;
   BEGIN
     IF NOT cort_aux_pkg.is_object_renamed(
@@ -7264,6 +8067,7 @@ end;';
         in_table_name      => in_job_rec.object_name,
         in_owner           => in_job_rec.object_owner,
         in_read_data       => FALSE,
+        in_debug_text      => 'RENAMING_TABLE_REC', 
         out_table_rec      => l_table_rec
       );
 
@@ -7273,40 +8077,19 @@ end;';
       rename_table_cascade(
         io_table_rec       => l_table_rec,
         in_rename_mode     => 'TO_RENAME',
-        io_frwd_stmt_arr   => l_frwd_stmt_arr,
-        io_rlbk_stmt_arr   => l_rlbk_stmt_arr
+        io_change_arr      => l_change_arr
       );
 
-      BEGIN
-        apply_changes(
-          in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-          in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-          in_test                => g_params.test.get_bool_value
-        );
-      EXCEPTION
-        WHEN OTHERS THEN
-          cort_log_pkg.error('Error. Rolling back...');
-          RAISE;
-      END;
+      apply_changes(
+        io_change_arr => l_change_arr,
+        in_test       => g_run_params.test.get_bool_value
+      );
 
-      IF NOT g_params.test.get_bool_value THEN
+      IF NOT g_run_params.test.get_bool_value THEN
         cort_aux_pkg.register_change(
-          in_object_owner   => in_job_rec.object_owner,
-          in_object_name    => in_job_rec.object_name,
-          in_object_type    => in_job_rec.object_type,
           in_job_rec        => in_job_rec,
-          in_sql            => in_job_rec.sql_text,
-          in_last_ddl_time  => cort_event_exec_pkg.get_object_last_ddl_time(
-                                 in_object_owner   => in_job_rec.object_owner,
-                                 in_object_name    => in_job_rec.object_name,
-                                 in_object_type    => in_job_rec.object_type
-                               ),
           in_change_type    => cort_comp_pkg.gc_result_rename,
-          in_revert_name    => NULL,
-          in_last_ddl_index => NULL,
-          in_rename_name    => in_job_rec.new_name,
-          in_frwd_stmt_arr  => l_frwd_stmt_arr,
-          in_rlbk_stmt_arr  => l_rlbk_stmt_arr
+          in_revert_name    => in_job_rec.new_name
         );
       END IF;
     END IF;
@@ -7322,7 +8105,7 @@ end;';
     execute_immediate(
       in_sql   => in_job_rec.sql_text,
       in_echo  => TRUE,
-      in_test  => cort_exec_pkg.g_params.test.get_bool_value
+      in_test  => g_run_params.test.get_bool_value
     );
 
   END alter_object;
@@ -7336,8 +8119,8 @@ end;';
       in_object_type  => in_job_rec.object_type,
       in_object_name  => in_job_rec.object_name,
       in_object_owner => in_job_rec.object_owner,
-      in_test         => cort_exec_pkg.g_params.test.get_bool_value,
-      in_purge        => FALSE
+      in_test         => g_run_params.test.get_bool_value,
+      in_purge        => g_run_params.purge.get_bool_value
     );
   END drop_object;
 
@@ -7346,20 +8129,19 @@ end;';
     in_job_rec       IN cort_jobs%ROWTYPE
   )
   AS
-    l_metadata_rec      cort_objects%ROWTYPE;
-    l_prev_metadata_rec cort_objects%ROWTYPE;
-    l_rlbk_stmt_arr     arrays.gt_clob_arr;
+    l_prev_change_rec   cort_objects%ROWTYPE;
+    l_change_arr        gt_change_arr;
   BEGIN
-    l_metadata_rec := cort_aux_pkg.get_last_change(
-                        in_object_type  => in_job_rec.object_type,
-                        in_object_name  => in_job_rec.object_name,
-                        in_object_owner => in_job_rec.object_owner
-                      );
+    l_prev_change_rec := cort_aux_pkg.get_last_change(
+                           in_object_type  => in_job_rec.object_type,
+                           in_object_name  => in_job_rec.object_name,
+                           in_object_owner => in_job_rec.object_owner
+                         );
 
-    IF l_metadata_rec.object_name IS NOT NULL THEN
+    IF l_prev_change_rec.object_name IS NOT NULL THEN
 
-      IF g_params.test.get_bool_value THEN
-        cort_log_pkg.echo('reverting of '||l_metadata_rec.object_type||' "'||l_metadata_rec.object_owner||'"."'||l_metadata_rec.object_name||'"');
+      IF g_run_params.test.get_bool_value THEN
+        cort_log_pkg.echo('reverting of '||l_prev_change_rec.object_type||' "'||l_prev_change_rec.object_owner||'"."'||l_prev_change_rec.object_name||'"');
         cort_log_pkg.echo('== TEST OUTPUT ==');
       END IF;
 
@@ -7367,68 +8149,42 @@ end;';
         execute_immediate('ALTER SESSION SET CURRENT_SCHEMA = "'||in_job_rec.current_schema||'"', TRUE);
       END IF;
 
-      IF l_metadata_rec.revert_ddl IS NOT NULL THEN
-        cort_xml_pkg.read_from_xml(
-          in_value => XMLType(l_metadata_rec.revert_ddl),
-          out_arr  => l_rlbk_stmt_arr
-        );
-      END IF;
+      l_change_arr := cort_aux_pkg.get_change_sql(
+                        in_job_id => l_prev_change_rec.job_id
+                      ); 
+  
 
-      IF l_rlbk_stmt_arr.COUNT > 0 THEN
+      IF l_change_arr.COUNT > 0 THEN
 
-        IF l_metadata_rec.revert_name IS NOT NULL AND
+        IF l_prev_change_rec.revert_name IS NOT NULL AND
            NOT object_exists(
-                 in_object_type  => l_metadata_rec.object_type,
-                 in_object_owner => l_metadata_rec.object_owner,
-                 in_object_name  => l_metadata_rec.revert_name
+                 in_object_type  => l_prev_change_rec.object_type,
+                 in_object_owner => l_prev_change_rec.object_owner,
+                 in_object_name  => l_prev_change_rec.revert_name
                )
         THEN
-          raise_error('Unable to revert of the last change for object "'||l_metadata_rec.object_owner||'"."'||l_metadata_rec.object_name||'" because backup object is not available');
+          raise_error('Unable to revert of the last change for object "'||in_job_rec.object_owner||'"."'||in_job_rec.object_name||'" because backup object is not available');
         END IF;
 
-        IF l_metadata_rec.last_ddl_index IS NOT NULL THEN
-          l_rlbk_stmt_arr.DELETE(l_metadata_rec.last_ddl_index+1, l_rlbk_stmt_arr.LAST);
-        END IF;
-
-        --reverse array to execute in reverse order
-        cort_aux_pkg.reverse_array(l_rlbk_stmt_arr);
-
-        apply_changes_ignore_errors(
-          io_stmt_arr => l_rlbk_stmt_arr,
-          in_test     => g_params.test.get_bool_value
+        revert_changes(
+          io_change_arr   => l_change_arr,
+          in_test         => g_run_params.test.get_bool_value
         );
 
       ELSE
         cort_log_pkg.echo('There is no revert information');
       END IF;
 
-      IF NOT g_params.test.get_bool_value THEN
+      IF NOT g_run_params.test.get_bool_value THEN
         cort_aux_pkg.unregister_change(
-          in_object_owner => l_metadata_rec.object_owner,
-          in_object_type  => l_metadata_rec.object_type,
-          in_object_name  => l_metadata_rec.object_name,
-          in_exec_time    => l_metadata_rec.exec_time
+          in_job_id       => l_prev_change_rec.job_id,
+          in_object_owner => l_prev_change_rec.object_owner,
+          in_object_type  => l_prev_change_rec.object_type,
+          in_object_name  => l_prev_change_rec.object_name
         );
-
-        IF l_metadata_rec.object_type = 'TABLE' THEN
-          l_prev_metadata_rec := cort_aux_pkg.get_last_change(
-                                   in_object_type  => l_metadata_rec.object_type,
-                                   in_object_name  => l_metadata_rec.object_name,
-                                   in_object_owner => l_metadata_rec.object_owner
-                                 );
-          -- if reverted first change recreate in the release
-          IF l_prev_metadata_rec.release <> l_metadata_rec.release THEN
-            -- then recreate prev synonym
-            create_prev_synonym(
-              in_synonym_name  => l_prev_metadata_rec.object_name,
-              in_table_name    => l_prev_metadata_rec.object_name,
-              in_table_owner   => l_prev_metadata_rec.object_owner
-            );
-          END IF;
-        END IF;
       END IF;
 
-      IF g_params.test.get_bool_value THEN
+      IF g_run_params.test.get_bool_value THEN
         cort_log_pkg.echo('== END OF TEST OUTPUT ==');
       END IF;
 
@@ -7443,81 +8199,44 @@ end;';
     in_job_rec  in cort_jobs%ROWTYPE
   )
   AS
-    l_frwd_stmt_arr      arrays.gt_clob_arr;
-    l_rlbk_stmt_arr      arrays.gt_clob_arr;
-    l_metadata_rec       cort_objects%ROWTYPE;
-    l_last_ddl_index     PLS_INTEGER;
+    l_change_arr  gt_change_arr;
   BEGIN
+    l_change_arr := cort_aux_pkg.get_change_sql(in_job_rec.job_id);
+    
+    IF g_run_params.test.get_bool_value THEN
+      cort_log_pkg.echo('resuming of '||in_job_rec.object_type||' "'||in_job_rec.object_owner||'"."'||in_job_rec.object_name||'"');
+      cort_log_pkg.echo('== TEST OUTPUT ==');
+    END IF;
 
     BEGIN
-      l_metadata_rec := cort_aux_pkg.get_last_change(
-                          in_object_type  => in_job_rec.object_type,
-                          in_object_name  => in_job_rec.object_name,
-                          in_object_owner => in_job_rec.object_owner
-                        );
+      -- resume execution
+      apply_changes(
+        io_change_arr   => l_change_arr, 
+        in_test         => g_run_params.test.get_bool_value,
+        in_act_on_error => 'RAISE'
+      );  
+    
+      cort_aux_pkg.update_sql(
+        in_change_sql_arr => l_change_arr
+      );
 
-      IF l_metadata_rec.object_name IS NOT NULL THEN
-
-        IF g_params.test.get_bool_value THEN
-          cort_log_pkg.echo('resuming of '||l_metadata_rec.object_type||' "'||l_metadata_rec.object_owner||'"."'||l_metadata_rec.object_name||'"');
-          cort_log_pkg.echo('== TEST OUTPUT ==');
-        END IF;
-
-        cort_xml_pkg.read_from_xml(
-          in_value => XMLType(l_metadata_rec.forward_ddl),
-          out_arr  => l_frwd_stmt_arr
-        );
-        cort_xml_pkg.read_from_xml(
-          in_value => XMLType(l_metadata_rec.revert_ddl),
-          out_arr  => l_rlbk_stmt_arr
-        );
-
-        l_last_ddl_index := l_metadata_rec.last_ddl_index;
-        BEGIN
-          cort_log_pkg.echo('initial l_metadata_rec.last_ddl_index = '||l_metadata_rec.last_ddl_index);
-          apply_changes(
-            in_frwd_alter_stmt_arr => l_frwd_stmt_arr,
-            in_rlbk_alter_stmt_arr => l_rlbk_stmt_arr,
-            in_revert              => FALSE,
-            io_last_ddl_index      => l_last_ddl_index,
-            in_test                => g_params.test.get_bool_value
-          );
-        EXCEPTION
-          WHEN OTHERS THEN
-            l_metadata_rec.last_ddl_index := l_last_ddl_index;
-            cort_log_pkg.echo('l_metadata_rec.last_ddl_index = '||l_metadata_rec.last_ddl_index);
-            cort_aux_pkg.update_change(
-              in_rec => l_metadata_rec
-            );
-            cort_log_pkg.error('Error. Rolling back...');
-            RAISE;
-        END;
-
-        l_metadata_rec.last_ddl_index := NULL;
-
-        cort_aux_pkg.update_change(
-          in_rec => l_metadata_rec
-        );
-        cort_job_pkg.success_job(in_rec => in_job_rec);
-
-        IF g_params.test.get_bool_value THEN
-          cort_log_pkg.echo('== END OF TEST OUTPUT ==');
-        END IF;
-
-      ELSE
-        raise_error('Object '||in_job_rec.object_type||' "'||in_job_rec.object_owner||'"."'||in_job_rec.object_name||'" is not found');
-      END IF;
-
+      cort_job_pkg.complete_job(in_rec => in_job_rec);
     EXCEPTION
       WHEN OTHERS THEN
-        cort_log_pkg.error('Failed resumed job...');
+        cort_aux_pkg.update_sql(
+          in_change_sql_arr => l_change_arr
+        );
         cort_job_pkg.fail_job(
           in_rec             => in_job_rec,
           in_error_message   => sqlerrm
         );
-        dbms_application_info.set_client_info(NULL);
         RAISE;
-    END;
+    END;    
+
+    IF g_run_params.test.get_bool_value THEN
+      cort_log_pkg.echo('== END OF TEST OUTPUT ==');
+    END IF;
+
   END resume_change;
 
   -- Drop revert object when new release is created. Repoint prev synonym to actual table
@@ -7525,32 +8244,150 @@ end;';
     in_job_rec       IN cort_jobs%ROWTYPE
   )
   AS
-    l_metadata_rec      cort_objects%ROWTYPE;
+    l_change_rec      cort_objects%ROWTYPE;
+    l_change_arr      gt_change_arr;
   BEGIN
-    l_metadata_rec := cort_aux_pkg.get_last_change(
-                        in_object_type  => in_job_rec.object_type,
-                        in_object_name  => in_job_rec.object_name,
-                        in_object_owner => in_job_rec.object_owner
-                      );
+    l_change_rec := cort_aux_pkg.get_last_change(
+                      in_object_type  => in_job_rec.object_type,
+                      in_object_name  => in_job_rec.object_name,
+                      in_object_owner => in_job_rec.object_owner
+                    );
 
-    IF l_metadata_rec.object_name IS NOT NULL THEN
+    IF l_change_rec.object_name IS NOT NULL THEN
 
-      IF l_metadata_rec.revert_name IS NOT NULL THEN
+/*      IF l_change_rec.revert_name IS NOT NULL THEN
         exec_drop_object(
           in_object_type  => 'TABLE',
           in_object_name  => l_metadata_rec.revert_name,
           in_object_owner => l_metadata_rec.object_owner
         );
-        create_prev_synonym(
-          in_synonym_name => l_metadata_rec.object_name,
-          in_table_name   => l_metadata_rec.object_name,
-          in_table_owner  => l_metadata_rec.object_owner
-        );
-      END IF;
+        
+      END IF;*/
+      create_prev_synonym(
+        in_owner       => in_job_rec.object_owner,
+        in_table_name  => in_job_rec.object_name,
+        in_revert_name => in_job_rec.object_name,      
+        io_change_arr  => l_change_arr
+      );
+      
+      apply_changes(
+        io_change_arr  => l_change_arr
+      );
     ELSE
       raise_error('Object '||in_job_rec.object_type||' "'||in_job_rec.object_owner||'"."'||in_job_rec.object_name||'" is not found');
     END IF;
   END reset_object;
+
+  -- Generic execution which is called from job
+  PROCEDURE execute_action(
+    in_job_rec IN cort_jobs%ROWTYPE
+  )
+  AS
+  BEGIN
+    CASE in_job_rec.action
+    WHEN 'CREATE_OR_REPLACE' THEN
+      create_or_replace(
+        in_job_rec    => in_job_rec
+      );
+    WHEN 'EXPLAIN_PLAN_FOR' THEN
+      create_or_replace(
+        in_job_rec    => in_job_rec
+      );
+    WHEN 'RESUME_RECREATE' THEN
+      resume_change(
+        in_job_rec    => in_job_rec
+      );
+    WHEN 'REGISTER' THEN
+      before_create_or_replace(
+        in_job_rec    => in_job_rec
+      );
+    WHEN 'RENAME' THEN
+      rename_table(
+        in_job_rec    => in_job_rec
+      );
+    WHEN 'ALTER' THEN
+      alter_object(
+        in_job_rec    => in_job_rec
+      );
+    WHEN 'DROP' THEN
+      drop_object(
+        in_job_rec    => in_job_rec
+      );
+    WHEN 'REVERT' THEN
+      revert_object(
+        in_job_rec    => in_job_rec
+      );
+    WHEN 'RESET' THEN
+      reset_object(
+        in_job_rec    => in_job_rec
+      );
+    END CASE;
+    COMMIT;
+  END execute_action;
+
+
+  -- Generic execution which is called from job
+  PROCEDURE execute_action(
+    in_job_id IN TIMESTAMP
+  )
+  AS
+    l_rec        cort_jobs%ROWTYPE;
+    l_sql        CLOB;
+  BEGIN
+    -- assign job to current session and create JOB SESSION lock
+    l_rec := cort_job_pkg.run_job(
+               in_job_id => in_job_id
+             );
+
+    BEGIN
+      cort_aux_pkg.set_context(l_rec.action||'_'||l_rec.object_type,l_rec.object_name);
+      cort_session_pkg.disable;
+
+      init(
+        in_job_rec => l_rec
+      );
+
+      IF l_rec.sql_text IS NOT NULL THEN
+        dbms_lob.createtemporary(l_sql, true, dbms_lob.call);
+        dbms_lob.copy(l_sql, l_rec.sql_text, dbms_lob.getlength(l_rec.sql_text));
+        l_rec.sql_text := l_sql;
+        dbms_lob.freetemporary(l_sql);
+      END IF;
+
+      execute_action(l_rec);
+
+      cort_aux_pkg.set_context(l_rec.action||'_'||l_rec.object_type,NULL);
+      cort_session_pkg.enable;
+      -- reread job staus 
+      l_rec := cort_job_pkg.get_job_rec(
+                 in_job_id => in_job_id
+               );
+
+      IF l_rec.status = 'RUNNING' THEN
+        cort_job_pkg.complete_job(in_rec => l_rec);
+      END IF;
+      -- release lock 
+      COMMIT;
+    EXCEPTION
+      WHEN OTHERS THEN
+        cort_log_pkg.error('Failed cort_exec_pkg.execute_action');
+        IF sqlcode = -20900 THEN
+          cort_job_pkg.cancel_job(
+            in_rec             => l_rec,
+            in_error_message   => sqlerrm
+          );
+        ELSE
+          cort_job_pkg.fail_job(
+            in_rec             => l_rec,
+            in_error_message   => sqlerrm
+          );
+        END IF;
+        dbms_application_info.set_client_info(NULL);
+        cort_aux_pkg.set_context(l_rec.action||'_'||l_rec.object_type,NULL);
+        cort_session_pkg.enable;
+        RAISE;
+    END;
+  END execute_action;
 
 END cort_exec_pkg;
 /

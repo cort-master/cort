@@ -1,7 +1,7 @@
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   Release | Author(s)         | Comments
   ----------------------------------------------------------------------------------------------------------------------  
   19.00   | Rustam Kafarov    | table for storing details of all executed jobs
+  21.00   | Rustam Kafarov    | session_params renamed to run_params, object_params to change_params. Values for application, build, release moved into run_params XML
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
@@ -40,32 +41,42 @@ END;
 /  
 
 
+
+DECLARE 
+  l_cnt NUMBER;
+BEGIN
+  SELECT count(*) 
+    INTO l_cnt
+    FROM user_sequences 
+   WHERE sequence_name = 'CORT_JOB_SEQ';
+  IF l_cnt > 0 THEN
+    EXECUTE IMMEDIATE 'DROP SEQUENCE CORT_JOB_SEQ';
+  END IF;
+  EXECUTE IMMEDIATE 'CREATE SEQUENCE CORT_JOB_SEQ START WITH 0 CYCLE MINVALUE 0 MAXVALUE 999 NOCACHE';
+END;
+/  
+
+
 CREATE TABLE cort_jobs(
+  job_id              TIMESTAMP(6)    NOT NULL, 
+  job_owner           VARCHAR2(128)   NOT NULL,
+  job_name            VARCHAR2(128)   NOT NULL,
   sid                 VARCHAR2(30)    NOT NULL,
   action              VARCHAR2(30)    NOT NULL,
-  status              VARCHAR2(30)    NOT NULL CHECK(status IN ('RUNNING','PENDING','FAILED','COMPLETED','CANCELED')),
+  status              VARCHAR2(30)    NOT NULL CHECK(status IN ('REGISTERED','RUNNING','PENDING','FAILED','COMPLETED','CANCELED')),
   object_type         VARCHAR2(30)    NOT NULL,
   object_owner        VARCHAR2(128)   NOT NULL,
   object_name         VARCHAR2(128)   NOT NULL,
-  job_owner           VARCHAR2(128)   NOT NULL,
-  job_name            VARCHAR2(128)   NOT NULL,
-  job_time            TIMESTAMP(6) WITH TIME ZONE,
-  job_sid             VARCHAR2(30),
   sql_text            CLOB,
-  new_name            VARCHAR2(128),
+  new_name            VARCHAR2(128),  
   current_schema      VARCHAR2(128),
-  application         VARCHAR2(30),
-  release             VARCHAR2(30),
-  build               VARCHAR2(30),
-  session_params      CLOB, --XMLTYPE,
-  object_params       CLOB, --XMLTYPE,
+  run_params          CLOB, --XMLTYPE,
+  change_params       CLOB, --XMLTYPE,
   output              CLOB,
+  start_time          TIMESTAMP WITH TIME ZONE,
+  end_time            TIMESTAMP WITH TIME ZONE,
   run_time            INTERVAL DAY TO SECOND(9),
-  parent_object_type  VARCHAR2(30),
-  parent_object_owner VARCHAR2(128),
-  parent_object_name  VARCHAR2(128),
-  resume_action       VARCHAR2(30),
-  session_id          NUMBER,
+  parent_job_id       TIMESTAMP(3),
   username            VARCHAR2(128),
   osuser              VARCHAR2(30),
   machine             VARCHAR2(64),
@@ -76,10 +87,10 @@ CREATE TABLE cort_jobs(
   error_backtrace     VARCHAR2(4000),
   error_stack         VARCHAR2(4000),
   call_stack          VARCHAR2(4000),
-  CONSTRAINT cort_jobs_pk PRIMARY KEY (sid, object_owner, object_name) using index
+  CONSTRAINT cort_jobs_pk PRIMARY KEY (job_id) using index
 )
 ;
 
-CREATE UNIQUE INDEX cort_jobs_sid_running_uk ON cort_jobs(decode(status,'RUNNING',sid));
+CREATE UNIQUE INDEX cort_jobs_sid_running_uk ON cort_jobs(decode(status,'RUNNING',sid,'REGISTERED',sid));
 
-CREATE UNIQUE INDEX cort_jobs_active_objects_uk ON cort_jobs(object_owner, object_name, decode(status,'RUNNING',nvl(substr(sid,13),'0'),'PENDING','X',sid));
+CREATE UNIQUE INDEX cort_jobs_active_objects_uk ON cort_jobs(object_owner, object_name, decode(status,'RUNNING','R','PENDING','P','REGISTERED','G',TO_CHAR(job_id, 'YYYYMMDDHH24MISSFF9')));

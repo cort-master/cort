@@ -5,7 +5,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -34,16 +34,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   15.00   | Rustam Kafarov    | Added API for manual execution
   19.00   | Rustam Kafarov    | Revised parameters
   20.00   | Rustam Kafarov    | Added support of long names introduced in Oracle 12.2 
+  21.00   | Rustam Kafarov    | Added get_cort_ddl, install, deinstall, compare_release_numbers routines
   ----------------------------------------------------------------------------------------------------------------------
 */
 
   /* This package will be granted to public */
-
-  -- internal procedure. do not call directly!
-  -- Procedure is called from job
-  PROCEDURE execute_action(
-    in_sid IN VARCHAR2
-  );
 
   -- API to enable/disable CORT permanently
 
@@ -91,19 +86,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   PROCEDURE drop_object(
     in_object_type  IN VARCHAR2,
     in_object_name  IN VARCHAR2,
-    in_object_owner IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+    in_object_owner IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
+    in_purge        IN BOOLEAN DEFAULT NULL -- NULL -  take from session paream
   );
 
   -- Wrapper for tables
   PROCEDURE drop_table(
     in_table_name   IN VARCHAR2,
-    in_table_owner  IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+    in_table_owner  IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
+    in_purge        IN BOOLEAN DEFAULT NULL -- NULL -  take from session paream
   );
 
   -- Warpper for tables
   PROCEDURE drop_revert_table(
-    in_table_name  IN VARCHAR2,
-    in_table_owner IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+    in_table_name   IN VARCHAR2,
+    in_table_owner  IN VARCHAR2 DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),
+    in_purge        IN BOOLEAN DEFAULT NULL -- NULL -  take from session paream
   );
 
   -- disable all foreign keys on given table
@@ -145,7 +143,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   -- finish build
   PROCEDURE end_build;
 
-  -- finish build
+  -- fail build
   PROCEDURE fail_build;
 
   -- rollback all DDL changes made within build
@@ -183,7 +181,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   PROCEDURE install;
   
   -- deinstall cort synonyms, triggers, grants from separate schema 
-  PROCEDURE deinstall;
+  PROCEDURE uninstall;
+  
+  -- compares release numbers and returns -1 if release1 less than release2, +1 if release1 more than release2, otherwise 0
+  FUNCTION compare_release_numbers(in_release1 IN VARCHAR2, in_release2 in VARCHAR2) RETURN NUMBER;
   
 END cort_pkg;
-/
+/ 

@@ -5,7 +5,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -41,7 +41,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   PROCEDURE reset_params;
 
   FUNCTION get_params
-  RETURN cort_params_pkg.gt_params_rec;
+  RETURN cort_params_pkg.gt_run_params_rec;
 
   FUNCTION get_param(
     in_param_name   IN VARCHAR2

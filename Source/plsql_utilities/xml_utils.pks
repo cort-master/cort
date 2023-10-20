@@ -1,10 +1,11 @@
-CREATE OR REPLACE PACKAGE xml_utils 
+CREATE OR REPLACE PACKAGE xml_utils
+AUTHID CURRENT_USER 
 AS
 
 /*
 PL/SQL Utilities - export/import PL/SQL Data Types to/from XML structure 
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -29,8 +30,26 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   Release | Author(s)         | Comments
   ----------------------------------------------------------------------------------------------------------------------  
   14.01   | Rustam Kafarov    | Main functionality
+  21.00   | Rustam Kafarov    | Added support for Oracle versions 18, 19. Compiled as AUTHID CURRENT_USER
   ----------------------------------------------------------------------------------------------------------------------  
 */
+
+  TYPE gt_type_desc_rec IS RECORD (
+    sequence        NUMBER,
+    data_level      NUMBER,
+    argument_name   VARCHAR2(255),
+    position        NUMBER,
+    data_type       VARCHAR(255),
+    type_owner      arrays.gt_name,
+    type_name       arrays.gt_name,
+    type_subname    arrays.gt_name,
+    pls_type        VARCHAR2(255),
+    full_name       VARCHAR2(32767)
+  );
+
+  TYPE gt_type_desc_arr IS TABLE OF gt_type_desc_rec INDEX BY PLS_INTEGER;
+
+
 
   TYPE gt_node_rec IS RECORD(
     dom_node  dbms_xmldom.DOMNode,
@@ -49,6 +68,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     names_indx      arrays.gt_int_indx        
   );
   TYPE gt_nodes_arr IS TABLE OF gt_nodes_rec INDEX BY PLS_INTEGER;
+
+  FUNCTION get_record_structure(
+    in_package_owner  IN VARCHAR2,
+    in_package_name   IN VARCHAR2,
+    in_procedure_name IN VARCHAR2
+  )
+  RETURN gt_type_desc_arr;                             
 
   -- return type index for PL/SQL TABLE index 
   FUNCTION get_type_name(in_index IN PLS_INTEGER)
@@ -120,6 +146,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   RETURN BOOLEAN;
 
+  -- return SQL for convertion XML to PL/SQL record
+  FUNCTION get_xml_to_rec_sql(
+    in_arg_arr     IN gt_type_desc_arr
+  ) 
+  RETURN CLOB;
+
   -- Return SQL for dynamic sql to convert PL/SQL record into XMLType
   FUNCTION get_record_to_xml_sql(
     in_package_owner  IN VARCHAR2,
@@ -128,13 +160,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   RETURN CLOB;
 
-  -- Build and return SQL printing values of PL/SQL record
-  FUNCTION get_print_record_sql(
-    in_package_owner  IN VARCHAR2,
-    in_package_name   IN VARCHAR2,
-    in_getter_name    IN VARCHAR2
-  )
-  RETURN CLOB;
 
   -- Return SQL for dynamic sql to convert XMLType into PL/SQL record
   FUNCTION get_xml_to_record_sql(

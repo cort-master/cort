@@ -2,7 +2,7 @@
 REM   
 REM   CORT - Oracle database DevOps tool
 REM   
-REM   Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+REM   Copyright (C) 2013-2023  Rustam Kafarov
 REM   
 REM   www.cort.tech
 REM   master@cort.tech

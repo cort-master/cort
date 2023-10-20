@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -37,6 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   19.00   | Rustam Kafarov    | All parameters defined in this package  
   20.00   | Rustam Kafarov    | Added support of long names in Oracle 12.2 
                                 Removed param keep_partitions. Added copy_subpartitions, partitions_source, compression 
+  21.00   | Rustam Kafarov    | Simplified API implementation. Split params into run and change specific
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
@@ -51,78 +52,82 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   gc_prefix                  CONSTANT VARCHAR2(1)    := '#';
   gc_value_prefix            CONSTANT VARCHAR2(30)   := '=';
   gc_force_value_prefix      CONSTANT VARCHAR2(30)   := '==';
+  gc_cast_object_data_prefix CONSTANT VARCHAR2(30)   := '<<CAST "%" AS "%"."%">>';
+  
   -- special syntax regexp
   gc_index_regexp            CONSTANT VARCHAR2(500)  := '\s*INDEX\s*=';
-  gc_data_filter_regexp      CONSTANT VARCHAR2(1000) := '\s*DATA_FILTER\s*='; -- additional SQL clause which isattached after FROM <table>. Could consists of simple where filtering or group by clause or even joins. Should work correctly for each segment if threading enabled 
-  gc_data_source_regexp      CONSTANT VARCHAR2(1000) := '\s*DATA_SOURCE\s*='; -- completely customs source replace default <table name>, could have reference on changing table. (how to do threading?????) 
   -- generated object name prefixes
   gc_rlbk_prefix             CONSTANT VARCHAR2(5)    := 'rlbk#';
   gc_temp_prefix             CONSTANT VARCHAR2(5)    := '~tmp#';
   gc_swap_prefix             CONSTANT VARCHAR2(5)    := '~swp#';
   gc_prev_prefix             CONSTANT VARCHAR2(5)    := 'prev#';
   gc_rename_prefix           CONSTANT VARCHAR2(5)    := 'old#';
+  
 
   FUNCTION init(in_line IN NUMBER, in_default IN VARCHAR, in_regexp in VARCHAR2, in_case_sensitive IN BOOLEAN DEFAULT FALSE) RETURN cort_param_obj;
   FUNCTION init(in_line IN NUMBER, in_default IN BOOLEAN) RETURN cort_param_obj;
   FUNCTION init(in_line IN NUMBER, in_default IN NUMBER, in_regexp in VARCHAR2) RETURN cort_param_obj;
-  FUNCTION init(in_line IN NUMBER, in_default IN ARRAY, in_regexp in VARCHAR2) RETURN cort_param_obj;
+  FUNCTION init_dictionary(in_line IN NUMBER) RETURN cort_param_obj;
   
 
-  $IF (dbms_db_version.version = 12 and dbms_db_version.release >= 2) or (dbms_db_version.version > 12) $THEN
-    gc_name_regexp    CONSTANT VARCHAR2(50) := '([A-Za-z][A-Za-z0-9_#$]{0,127})|("[^"]{1,128}")';
+  $IF arrays.gc_long_name_supported $THEN
+    gc_name_regexp    CONSTANT VARCHAR2(100) := '(([A-Za-z][A-Za-z0-9_#\$]{0,127})|("[^"]{1,128}"))';
   $ELSE
-    gc_name_regexp    CONSTANT VARCHAR2(50) := '([A-Za-z][A-Za-z0-9_#$]{0,29})|("[^"]{1,30}")';
+    gc_name_regexp    CONSTANT VARCHAR2(100) := '(([A-Za-z][A-Za-z0-9_#\$]{0,29})|("[^"]{1,30}"))';
   $END
+  gc_ditcitonary_regexp  CONSTANT VARCHAR2(100) := gc_name_regexp||'=.*';
   
-    
-  -- dynamic params, define CORT behavior
-  TYPE gt_params_rec IS RECORD(         
-    application              cort_param_obj := init($$plsql_line, 'DEFAULT',                                            '([A-Za-z][A-Za-z0-9_]{0,19})'), -- application name
-    prev_schema              cort_param_obj := init($$plsql_line, '',                                                   gc_name_regexp), -- previouse schema name
-    alias                    cort_param_obj := init($$plsql_line, 'A',                                                  '([A-Za-z][A-Za-z0-9_#$]{0,29})'),-- default alias used for data migration script
-    parallel                 cort_param_obj := init($$plsql_line, 1,                                                    '[0-9]{1,3}'),  -- parallel degree for internal DML/DDL
---    echo                     cort_param_obj := init($$plsql_line, array('SQL'),                                         'SQL|DEBUG|TIMING'),
+  gc_max_thread_number   NUMBER;
+  
+  -- run parameters
+  -- should be placed in the same hint with OR REPLACE  
+  TYPE gt_run_params_rec IS RECORD(
+--    echo                     cort_param_obj := init($$plsql_line, array('SQL'),                                         'SQL|DEBUG|TIMING|REVERT_SQL'),
     test                     cort_param_obj := init($$plsql_line, FALSE),                                                -- enabling/disabling testing mode
     debug                    cort_param_obj := init($$plsql_line, FALSE),                                                -- enabling/disabling debugging mode
-    change                   cort_param_obj := init($$plsql_line, 'OPTIMISED',                                          'OPTIMISED|ALWAYS|RECREATE|MOVE|ALTER'), -- indicates default CORT behaviour in case of changing structure
-    physical_attr            cort_param_obj := init($$plsql_line, array(),                                              'TABLE|PARTITION|SUBPARTITION|INDEX|INDEX_PARTITION|INDEX_SUBPARTITION|LOB'),-- indicates if physical attributes should not be ignored
-    tablespace               cort_param_obj := init($$plsql_line, array(),                                              'TABLE|PARTITION|SUBPARTITION|INDEX|INDEX_PARTITION|INDEX_SUBPARTITION|LOB'),-- indicates if tablespace should not be ignored
-    compression              cort_param_obj := init($$plsql_line, array('PARTITION','SUBPARTITION'),                    'PARTITION|SUBPARTITION'), -- indicate if compression should not be ignored 
-    data                     cort_param_obj := init($$plsql_line, 'COPY',                                               'COPY|NONE|DEFERRED_COPY|PRELIMINARY_COPY'),-- indicates how data should be copied
-    drop_column              cort_param_obj := init($$plsql_line, 'DROP',                                               'DROP|SET_UNUSED|SET_INVISIBLE|RECREATE'),-- indicates how drop column should be performed
-    compare                  cort_param_obj := init($$plsql_line, array('IGNORE_UNUSED'),                               'IGNORE_UNUSED|IGNORE_INVISIBLE|IGNORE_ORDER'), -- indicates method of comparing columns
-    keep_objects             cort_param_obj := init($$plsql_line, array('REFERENCES','PRIVILEGES','TRIGGERS',
-                                                                        'POLICIES','COMMENTS'),                         'REFERENCES|PRIVILEGES|TRIGGERS|POLICIES|COMMENTS'),-- indicates which objects should be restored when table is recreated
-    validate                 cort_param_obj := init($$plsql_line, FALSE),                                               -- validate references, partitions
-    partitions_source        cort_param_obj := init($$plsql_line, '',                                                   gc_name_regexp||'|""'), -- object name where partitions need to be copied from. By default if only 1 partition is specified all existing partitions are retained.
-    copy_subpartitions       cort_param_obj := init($$plsql_line, TRUE),                                                -- indicates if we need to copy subpartitions along with partitions from partition_source. If FALSE then SUBPARTITION TEMPLATE is used. 
-    -- threading                                   
-    $IF cort_options_pkg.gc_threading $THEN
-    threading                cort_param_obj := init($$plsql_line, 'AUTO',                                               'AUTO|MAX|NONE|[0-9]{1,2}'),
-    $END
+    application              cort_param_obj := init($$plsql_line, 'DEFAULT',                                            '([A-Za-z][A-Za-z0-9_]{0,19})'), -- application name
+    release                  cort_param_obj := init($$plsql_line, '',                                                   '([A-Za-z0-9_\.]{1,10})'), -- release name
+    build                    cort_param_obj := init($$plsql_line, '',                                                   '([A-F0-9]{18,30})'), -- build name
+    threading                cort_param_obj := init($$plsql_line, 'AUTO',                                               'AUTO|MAX|NONE|[0-9]{1,2}'),     -- threading
+    parallel                 cort_param_obj := init($$plsql_line, 1,                                                    '[0-9]{1,3}'),  -- parallel degree for internal DML/DDL
+    async                    cort_param_obj := init($$plsql_line, FALSE),                                               -- run job copy asynchronously
+    require_release          cort_param_obj := init($$plsql_line, FALSE),                                               -- require to prefix all change hints with release number. All unprefixed hints will be ignored
     --dbms_stats params 
     stats                    cort_param_obj := init($$plsql_line, 'AUTO',                                               'AUTO|NONE|COPY|ALL|APPROX_GLOBAL AND PARTITION|GLOBAL|GLOBAL AND PARTITION|PARTITION|SUBPARTITION'), --indicates how statistics should be gathered after recreating
     stats_estimate_pct       cort_param_obj := init($$plsql_line, 0.1,                                                  '(100)|([0-9]{1,2}(.[0-9]{1,6})?)'), -- gathering stats estimation percentage
-    stats_method_opt         cort_param_obj := init($$plsql_line, '{}',                                                 '{[^{}]*}', TRUE) -- stats gathering method wrapped by {} . It is done to identify boundaries of the value
+    stats_method_opt         cort_param_obj := init($$plsql_line, '',                                                   '.*', TRUE), -- stats gathering method 
+    stats_parallel           cort_param_obj := init($$plsql_line, 8,                                                    '[0-9]{1,3}'),  -- parallel degree for dbms_stats
+    purge                    cort_param_obj := init($$plsql_line, FALSE)                                                -- enabling/disabling PURGE option when dropping objects and FORCE option when dropping types 
+  );  
+
+  -- change parameters
+  -- could be prefixed with release number and specified in separate comments from run params
+  TYPE gt_params_rec IS RECORD(
+    alias                    cort_param_obj := init($$plsql_line, 'A',                                                  '([A-Za-z][A-Za-z0-9_#$]{0,29})'),-- default alias used for data migration script
+    short_name               cort_param_obj := init($$plsql_line, '',                                                   '([^"]{1,20})'),-- short name for names longer than 20 to create unique naming for previous versions
+    change                   cort_param_obj := init($$plsql_line, 'OPTIMISED',                                          'OPTIMISED|ALWAYS|RECREATE|MOVE|ALTER'), -- indicates default CORT behaviour in case of changing structure
+    physical_attr            cort_param_obj := init($$plsql_line, '()',                                                 'TABLE|PARTITION|SUBPARTITION|INDEX|INDEX_PARTITION|INDEX_SUBPARTITION|LOB|LOB_PARTITION|LOB_SUBPARTITION'),-- indicates if physical attributes should not be ignored
+    data                     cort_param_obj := init($$plsql_line, 'COPY',                                               'COPY|NONE|DEFERRED_COPY|PRELIMINARY_COPY'),-- indicates how data should be copied
+    compare                  cort_param_obj := init($$plsql_line, '(IGNORE_UNUSED,IGNORE_INVISIBLE)',                   'IGNORE_UNUSED|IGNORE_INVISIBLE|IGNORE_ORDER'), -- indicates method of comparing columns
+    references               cort_param_obj := init($$plsql_line, 'VALIDATE',                                           'VALIDATE|NOVALIDATE|DROP'), -- indicates how to restore FK references from another tables in case of table/PK recreate
+    data_values              cort_param_obj := init_dictionary($$plsql_line),                                            -- columns new values which override default value. Each value should be placed into individual comment
+    data_filter              cort_param_obj := init($$plsql_line, '',                                                   '.*', TRUE), -- filtering condition which could be injected after FROM prev$<table_name> a. Individual comment
+    data_source              cort_param_obj := init($$plsql_line, '',                                                   '.*', TRUE), -- custom source for data which overrides standard source from prev$<table_name> and data_filter. Individual comment 
+    partitions_source        cort_param_obj := init($$plsql_line, '',                                                   gc_name_regexp||'|""', TRUE) -- table name where partitions need to be copied from. By default all existing partitions are retainedif only 1 partition is specified .
   ); 
 
   TYPE gt_params_arr IS TABLE OF cort_param_obj INDEX BY VARCHAR2(30);
   
-  -- setter for dynamic SQL - for intenal use only!!!
-  PROCEDURE set_params_rec(in_params_rec IN gt_params_rec);
-  
-  -- getter for dynamic SQL - for intenal use only!!!
-  FUNCTION get_params_rec
-  RETURN gt_params_rec;
+  -- internal function used for Oracle version < 12.
+  $IF dbms_db_version.version < 12 $THEN
+  FUNCTION get_params_rec RETURN gt_params_rec;
+  PROCEDURE set_params_rec(in_value IN gt_params_rec);
 
-  -- setter for dynamic SQL - for intenal use only!!!
-  PROCEDURE set_params_arr(in_params_arr IN gt_params_arr);
+  FUNCTION get_run_params_rec RETURN gt_run_params_rec;
+  PROCEDURE set_run_params_rec(in_value IN gt_run_params_rec);
+  $END
   
-  -- getter for dynamic SQL - for intenal use only!!!
-  FUNCTION get_params_arr
-  RETURN gt_params_arr;
-  
-  
+
   -- return single parameter by name 
   FUNCTION get_param(
     in_params_rec IN gt_params_rec,
@@ -144,37 +149,74 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     in_param_value IN VARCHAR2
   );
   
+  -- return single parameter by name 
+  FUNCTION get_run_param(
+    in_params_rec IN gt_run_params_rec,
+    in_param_name IN VARCHAR2
+  )
+  RETURN cort_param_obj;
+  
+  -- return single parameter value by name 
+  FUNCTION get_run_param_value(
+    in_params_rec IN gt_run_params_rec,
+    in_param_name IN VARCHAR2
+  )
+  RETURN VARCHAR2;
+  
+  -- set single parameter value by name 
+  PROCEDURE set_run_param_value(
+    io_params_rec  IN OUT NOCOPY gt_run_params_rec,
+    in_param_name  IN VARCHAR2,
+    in_param_value IN VARCHAR2
+  );
+  
+  -- reset all params to default values
+  PROCEDURE reset_params(
+    io_params_rec IN OUT NOCOPY gt_params_rec
+  );
+
+  -- reset all params to default values
+  PROCEDURE reset_run_params(
+    io_params_rec IN OUT NOCOPY gt_run_params_rec
+  );
+
   -- return arrays of param names
   FUNCTION get_param_names RETURN arrays.gt_str_arr;
-  FUNCTION get_param_names_indx RETURN arrays.gt_str_indx;
+  
+  -- return arrays of run param names
+  FUNCTION get_run_param_names RETURN arrays.gt_str_arr;
 
-  FUNCTION rec_to_array(in_params_rec IN gt_params_rec)
-  RETURN gt_params_arr;
+  FUNCTION param_exists(in_param_name IN VARCHAR2) 
+  RETURN BOOLEAN;
 
-  FUNCTION array_to_rec(in_params_arr IN gt_params_arr)
-  RETURN gt_params_rec;
+  FUNCTION run_param_exists(in_param_name IN VARCHAR2) 
+  RETURN BOOLEAN;
 
-  FUNCTION array_to_xml(
-    in_params_arr IN gt_params_arr
-  )
-  RETURN CLOB;
-
-  FUNCTION rec_to_xml(
+  FUNCTION write_to_xml(
     in_params_rec IN gt_params_rec 
   )
   RETURN CLOB;
 
-  PROCEDURE read_from_xml(
-    in_xml        IN XMLType,
-    io_params_arr IN OUT NOCOPY gt_params_arr 
-  );
+  FUNCTION write_to_xml(
+    in_params_rec IN gt_run_params_rec 
+  )
+  RETURN CLOB;
 
   PROCEDURE read_from_xml(
-    in_xml        IN XMLType,
-    io_params_rec IN OUT NOCOPY gt_params_rec
+    io_params_rec IN OUT NOCOPY gt_params_rec,
+    in_xml        IN XMLType
   );
   
+  PROCEDURE read_from_xml(
+    io_params_rec IN OUT NOCOPY gt_run_params_rec,
+    in_xml        IN XMLType
+  );
+
+  -- for debug purposes only 
   PROCEDURE print_params(in_params_rec IN gt_params_rec);
 
+  -- for debug purposes only 
+  PROCEDURE print_params(in_params_rec IN gt_run_params_rec);
+  
 END cort_params_pkg;
 /

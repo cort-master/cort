@@ -4,7 +4,7 @@ AS
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -32,36 +32,21 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   17.00   | Rustam Kafarov    | Replaced TIMESTAMP with timestamp_tz_unconstrained
   18.01   | Rustam Kafarov    | Added set_params. Removed init_params
   19.00   | Rustam Kafarov    | Revised parameters 
+  21.00   | Rustam Kafarov    | Left only run specific parametes to set on session level 
   ----------------------------------------------------------------------------------------------------------------------  
 */
 
-  g_session_params_rec      cort_params_pkg.gt_params_rec;
+  g_session_params_rec      cort_params_pkg.gt_run_params_rec;
 
   /* Public */
 
   PROCEDURE reset_params
   AS
-    l_default_params_rec      cort_params_pkg.gt_params_rec;
-    l_param_arr               arrays.gt_str_arr; 
-    l_default_arr             arrays.gt_lstr_arr;
-    l_param_names_indx        arrays.gt_str_indx;
   BEGIN
-    SELECT param_name, default_value
-      BULK COLLECT 
-      INTO l_param_arr, l_default_arr 
-      FROM cort_user_params;
-     
-    l_param_names_indx := cort_params_pkg.get_param_names_indx;
-     
-    FOR i IN 1..l_param_arr.COUNT LOOP
-      IF l_param_names_indx.EXISTS(l_param_arr(i)) THEN
-        cort_params_pkg.set_param_value(l_default_params_rec, l_param_arr(i), l_default_arr(i));
-      END IF;  
-    END LOOP;
-    g_session_params_rec := l_default_params_rec;
+    cort_params_pkg.reset_run_params(g_session_params_rec);   
   END reset_params;
   
-  FUNCTION get_params RETURN cort_params_pkg.gt_params_rec
+  FUNCTION get_params RETURN cort_params_pkg.gt_run_params_rec
   AS 
   BEGIN
     RETURN g_session_params_rec;
@@ -73,7 +58,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   RETURN cort_param_obj
   AS
   BEGIN
-    RETURN cort_params_pkg.get_param(g_session_params_rec, in_param_name);  
+    RETURN cort_params_pkg.get_run_param(g_session_params_rec, in_param_name);  
   END get_param;
   
   -- getter for session params
@@ -83,7 +68,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   RETURN VARCHAR2
   AS
   BEGIN
-    RETURN cort_params_pkg.get_param_value(g_session_params_rec, in_param_name);  
+    RETURN cort_params_pkg.get_run_param_value(g_session_params_rec, in_param_name);  
   END get_param_value;
   
   -- setter for session params
@@ -93,7 +78,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
   )
   AS
   BEGIN
-    cort_params_pkg.set_param_value(g_session_params_rec, in_param_name, in_param_value);  
+    cort_params_pkg.set_run_param_value(g_session_params_rec, in_param_name, in_param_value);  
   END set_param_value;
 
   -- functionm wrapper for TEST param

@@ -4,7 +4,7 @@ AS
 /*
 PL/SQL Utilities - Predefined PL/SQL Collection types 
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -36,11 +36,17 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
   $IF (dbms_db_version.version = 12 and dbms_db_version.release >= 2) or (dbms_db_version.version > 12) $THEN
-    SUBTYPE gt_name IS VARCHAR2(128);
-    c_name_max_length constant pls_integer := 128;
+    gc_long_name_supported    CONSTANT BOOLEAN := TRUE;
+    gc_name_max_length        CONSTANT PLS_INTEGER := 128;
+    gc_full_name_max_length   CONSTANT PLS_INTEGER := 261;
+    SUBTYPE gt_name           IS VARCHAR2(128);
+    SUBTYPE gt_full_name      IS VARCHAR2(261);
   $ELSE
-    SUBTYPE gt_name IS VARCHAR2(30);
-    c_name_max_length constant pls_integer := 30;
+    gc_long_name_supported    CONSTANT BOOLEAN := FALSE;
+    gc_name_max_length        CONSTANT PLS_INTEGER := 30;
+    gc_full_name_max_length   CONSTANT PLS_INTEGER := 65;
+    SUBTYPE gt_name           IS VARCHAR2(30);
+    SUBTYPE gt_full_name      IS VARCHAR2(65);
   $END
 
   TYPE gt_name_arr           IS TABLE OF gt_name                            INDEX BY PLS_INTEGER;

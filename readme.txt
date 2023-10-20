@@ -1,9 +1,6 @@
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013 Softcraft Ltd - Rustam Kafarov
-
-www.cort.tech
-master@cort.tech
+Copyright (C) 2013-2023  Rustam Kafarov
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -23,6 +20,9 @@ Contact information:
 web:   wwww.cort.tech
 email: master@cort.tech
 
+Dependancies: 
 
-This product is distributed along with CORT but could be distributed and used separately. This product is  dispributed under GNU GPLv3 Lincese as well.
+ - PL/SQL Utilities 
+
+   This product is distributed along with CORT but could be distributed and used separately. This product is  dispributed under GNU GPLv3 Lincese as well.
 

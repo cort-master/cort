@@ -1,7 +1,7 @@
 /*
 CORT - Oracle database DevOps tool
 
-Copyright (C) 2013  Softcraft Ltd - Rustam Kafarov
+Copyright (C) 2013-2023  Rustam Kafarov
 
 www.cort.tech
 master@cort.tech
@@ -28,16 +28,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 CREATE OR REPLACE VIEW cort_recent_objects
 AS
-SELECT a.object_owner, a.object_name, a.object_type, a.exec_time, a.sid, a.sql_text, a.last_ddl_time, a.application, a.release, a.build, a.change_type, a.metadata, a.forward_ddl, a.revert_ddl, a.revert_name, a.last_ddl_index, a.rename_name, 
-       j.job_name, j.job_time, j.session_params, j.output, j.session_id, j.username, j.osuser, j.machine, j.terminal, j.module
+SELECT a.object_owner, a.object_name, a.object_type, a.job_id, a.last_ddl_text, a.last_ddl_time, a.application, a.release, a.build, a.change_type, a.revert_name, a.prev_synonym, 
+       j.job_name, j.run_params, j.change_params, j.output, j.username, j.osuser, j.machine, j.terminal, j.module
   FROM (SELECT a.*, 
-               MAX(exec_time) OVER (PARTITION BY  object_owner, object_name, object_type) AS last_exec_time  
+               MAX(job_id) OVER (PARTITION BY  object_owner, object_name, object_type) AS last_job_id  
           FROM cort_objects a) a
   LEFT JOIN cort_jobs j
-    ON j.sid = a.sid
+    ON j.job_id = a.job_id
    AND j.object_owner = a.object_owner
    AND j.object_name = a.object_name 
    AND j.object_type = a.object_type  
    AND j.status = 'COMPLETED'        
- WHERE exec_time = last_exec_time; 
+ WHERE a.job_id = last_job_id; 
   

@@ -78,7 +78,9 @@ PROMPT
 @@tables/cort_params.sql
 @@tables/cort_releases.sql
 @@tables/cort_stat.sql
+@@tables/cort_type_synonyms.sql
 @@tables/plan_table.sql
+
 
 -- Types
 @@cort_param_obj.tps
